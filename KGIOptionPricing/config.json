@@ -1,0 +1,55 @@
+{
+  "KGI_USER_ID": "A128905009",
+  "KGI_PASSWORD": "Itim3482",
+  "TradeCom_Host": "itrade.kgi.com.tw",
+  "TradeCom_Port": 8000,
+  "TradeCom_BrokerID": "F004000",
+  "TradeCom_Account": "9819113",
+  "QuoteServer": {
+    "Host": "quoteapi.kgi.com.tw",
+    "Port": 443,
+    "SourceID": "API",
+    "Token": "b6eb"
+  },
+  "RiskDataOutputPath": ".\\RiskData.json",
+  "RISK_FREE_RATE": 0.0,
+  "AutoExportIntervalSeconds": 15,
+  "spreadconfig": [
+    {
+      "minBid": 0.0,
+      "maxBid": 100.0,
+      "percentage": 0.12,
+      "minSpread": 3.0
+    },
+    {
+      "minBid": 100.0,
+      "maxBid": 400.0,
+      "percentage": 0.08,
+      "minSpread": 12.0
+    },
+    {
+      "minBid": 400.0,
+      "maxBid": 800.0,
+      "percentage": 0.07,
+      "minSpread": 32.0
+    },
+    {
+      "minBid": 800.0,
+      "maxBid": 1000.0,
+      "percentage": 0.06,
+      "minSpread": 56.0
+    },
+    {
+      "minBid": 1000.0,
+      "maxBid": 6000.0,
+      "percentage": 0.04,
+      "minSpread": 60.0
+    },
+    {
+      "minBid": 6000.0,
+      "maxBid": 999999.0,
+      "percentage": 0.0,
+      "fixedSpread": 300.0
+    }
+  ]
+}

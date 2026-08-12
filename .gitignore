@@ -1,0 +1,19 @@
+## Visual Studio / C# standard ignore
+.vs/
+bin/
+obj/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.userprefs
+*.pidb
+*.appx
+*.appxbundle
+*.appxupload
+
+# Ignore large generated zip/hex files
+*.zip
+*_hex.txt
+*_part_*.txt
+temp_package.zip
