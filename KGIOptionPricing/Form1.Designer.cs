@@ -1,16 +1,12 @@
+using System.Drawing;
+using System.Windows.Forms;
+
 namespace KGIOptionPricing
 {
     partial class Form1
     {
-        /// <summary>
-        ///  Required designer variable.
-        /// </summary>
         private System.ComponentModel.IContainer components = null;
 
-        /// <summary>
-        ///  Clean up any resources being used.
-        /// </summary>
-        /// <param name="disposing">true if managed resources should be disposed; otherwise, false.</param>
         protected override void Dispose(bool disposing)
         {
             if (disposing && (components != null))
@@ -22,382 +18,521 @@ namespace KGIOptionPricing
 
         #region Windows Form Designer generated code
 
-        /// <summary>
-        ///  Required method for Designer support - do not modify
-        ///  the contents of this method with the code editor.
-        /// </summary>
         private void InitializeComponent()
         {
-            _formsPlot = new ScottPlot.WinForms.FormsPlot();
-            _dgvTQuote = new DataGridView();
-            colCallDelta = new DataGridViewTextBoxColumn();
-            colCallIV = new DataGridViewTextBoxColumn();
-            colCallBid = new DataGridViewTextBoxColumn();
-            colCallAsk = new DataGridViewTextBoxColumn();
-            colCallLast = new DataGridViewTextBoxColumn();
-            colStrike = new DataGridViewTextBoxColumn();
-            colPutLast = new DataGridViewTextBoxColumn();
-            colPutBid = new DataGridViewTextBoxColumn();
-            colPutAsk = new DataGridViewTextBoxColumn();
-            colPutIV = new DataGridViewTextBoxColumn();
-            colPutDelta = new DataGridViewTextBoxColumn();
-            _cboExpiration = new ComboBox();
-            _cboModel = new ComboBox();
-            _lblStatus = new Label();
-            _lblTradeStatus = new Label();
-            _btnSave = new Button();
-            _chkAutoSaveMorning = new CheckBox();
-            _dtpAutoSaveMorning = new DateTimePicker();
-            _chkAutoSaveNight = new CheckBox();
-            _dtpAutoSaveNight = new DateTimePicker();
-            _chkShift = new CheckBox();
-            topPanel = new Panel();
-            lblSelect = new Label();
-            lblModel = new Label();
-            splitContainer = new SplitContainer();
-            ((System.ComponentModel.ISupportInitialize)_dgvTQuote).BeginInit();
-            topPanel.SuspendLayout();
-            ((System.ComponentModel.ISupportInitialize)splitContainer).BeginInit();
-            splitContainer.Panel1.SuspendLayout();
-            splitContainer.Panel2.SuspendLayout();
-            splitContainer.SuspendLayout();
+            menuStrip = new MenuStrip();
+            tsmFile = new ToolStripMenuItem();
+            tsmExit = new ToolStripMenuItem();
+            tsmPricing = new ToolStripMenuItem();
+            tsmOptionPricing = new ToolStripMenuItem();
+            tsmOrderPlacement = new ToolStripMenuItem();
+            tsmReports = new ToolStripMenuItem();
+            tsmOrderReport = new ToolStripMenuItem();
+            tsmDealReport = new ToolStripMenuItem();
+            tsmPosition = new ToolStripMenuItem();
+            tsmMarginEquity = new ToolStripMenuItem();
+            toolStrip = new ToolStrip();
+            btnTsPricing = new ToolStripButton();
+            btnTsOrderPlacement = new ToolStripButton();
+            toolStripSeparator1 = new ToolStripSeparator();
+            btnTsOrderReport = new ToolStripButton();
+            btnTsDealReport = new ToolStripButton();
+            btnTsPosition = new ToolStripButton();
+            btnTsMargin = new ToolStripButton();
+            pnlStatus = new Panel();
+            cardRiskData = new Panel();
+            lblRiskDataStatus = new Label();
+            lblRiskDataTitle = new Label();
+            cardFutures = new Panel();
+            lblFuturesPrice = new Label();
+            lblFuturesTitle = new Label();
+            cardTrade = new Panel();
+            lblTradeStatus = new Label();
+            lblTradeTitle = new Label();
+            cardQuote = new Panel();
+            lblQuoteStatus = new Label();
+            lblQuoteTitle = new Label();
+            pnlLogHeader = new Panel();
+            chkAutoScroll = new CheckBox();
+            btnClearLog = new Button();
+            lblLogTitle = new Label();
+            rtbLog = new RichTextBox();
+            pnlLog = new Panel();
+            menuStrip.SuspendLayout();
+            toolStrip.SuspendLayout();
+            pnlStatus.SuspendLayout();
+            cardRiskData.SuspendLayout();
+            cardFutures.SuspendLayout();
+            cardTrade.SuspendLayout();
+            cardQuote.SuspendLayout();
+            pnlLogHeader.SuspendLayout();
+            pnlLog.SuspendLayout();
             SuspendLayout();
             // 
-            // _formsPlot
+            // menuStrip
             // 
-            _formsPlot.BackColor = Color.FromArgb(18, 18, 18);
-            _formsPlot.Dock = DockStyle.Fill;
-            _formsPlot.Location = new Point(0, 0);
-            _formsPlot.Name = "_formsPlot";
-            _formsPlot.Size = new Size(681, 710);
-            _formsPlot.TabIndex = 0;
+            menuStrip.BackColor = Color.FromArgb(32, 32, 35);
+            menuStrip.Items.AddRange(new ToolStripItem[] { tsmFile, tsmPricing, tsmReports });
+            menuStrip.Location = new Point(0, 0);
+            menuStrip.Name = "menuStrip";
+            menuStrip.Size = new Size(1100, 24);
+            menuStrip.TabIndex = 0;
             // 
-            // _dgvTQuote
+            // tsmFile
             // 
-            _dgvTQuote.AllowUserToAddRows = false;
-            _dgvTQuote.AllowUserToDeleteRows = false;
-            _dgvTQuote.AllowUserToResizeRows = false;
-            _dgvTQuote.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
-            _dgvTQuote.BackgroundColor = Color.FromArgb(18, 18, 18);
-            _dgvTQuote.BorderStyle = BorderStyle.None;
-            _dgvTQuote.CellBorderStyle = DataGridViewCellBorderStyle.SingleHorizontal;
-            _dgvTQuote.ColumnHeadersBorderStyle = DataGridViewHeaderBorderStyle.None;
-            _dgvTQuote.ColumnHeadersHeight = 35;
-            _dgvTQuote.ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.DisableResizing;
-            _dgvTQuote.Columns.AddRange(new DataGridViewColumn[] { colCallDelta, colCallIV, colCallBid, colCallAsk, colCallLast, colStrike, colPutLast, colPutBid, colPutAsk, colPutIV, colPutDelta });
-            _dgvTQuote.Dock = DockStyle.Fill;
-            _dgvTQuote.EnableHeadersVisualStyles = false;
-            _dgvTQuote.GridColor = Color.FromArgb(45, 45, 48);
-            _dgvTQuote.Location = new Point(0, 0);
-            _dgvTQuote.MultiSelect = false;
-            _dgvTQuote.Name = "_dgvTQuote";
-            _dgvTQuote.ReadOnly = true;
-            _dgvTQuote.RowHeadersVisible = false;
-            _dgvTQuote.RowTemplate.Height = 28;
-            _dgvTQuote.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
-            _dgvTQuote.Size = new Size(677, 710);
-            _dgvTQuote.TabIndex = 0;
+            tsmFile.DropDownItems.AddRange(new ToolStripItem[] { tsmExit });
+            tsmFile.ForeColor = Color.White;
+            tsmFile.Name = "tsmFile";
+            tsmFile.Size = new Size(58, 20);
+            tsmFile.Text = "檔案 (&F)";
             // 
-            // colCallDelta
+            // tsmExit
             // 
-            colCallDelta.HeaderText = "Call Delta";
-            colCallDelta.Name = "colCallDelta";
-            colCallDelta.ReadOnly = true;
+            tsmExit.Name = "tsmExit";
+            tsmExit.Size = new Size(118, 22);
+            tsmExit.Text = "結束離開";
+            tsmExit.Click += tsmExit_Click;
             // 
-            // colCallIV
+            // tsmPricing
             // 
-            colCallIV.HeaderText = "Call IV";
-            colCallIV.Name = "colCallIV";
-            colCallIV.ReadOnly = true;
+            tsmPricing.DropDownItems.AddRange(new ToolStripItem[] { tsmOptionPricing, tsmOrderPlacement });
+            tsmPricing.ForeColor = Color.White;
+            tsmPricing.Name = "tsmPricing";
+            tsmPricing.Size = new Size(82, 20);
+            tsmPricing.Text = "交易與報價 (&M)";
             // 
-            // colCallBid
+            // tsmOptionPricing
             // 
-            colCallBid.HeaderText = "Call Bid";
-            colCallBid.Name = "colCallBid";
-            colCallBid.ReadOnly = true;
+            tsmOptionPricing.Name = "tsmOptionPricing";
+            tsmOptionPricing.Size = new Size(211, 22);
+            tsmOptionPricing.Text = "📊 選擇權定價與 T 報價鏈";
+            tsmOptionPricing.Click += btnTsPricing_Click;
             // 
-            // colCallAsk
+            // tsmOrderPlacement
             // 
-            colCallAsk.HeaderText = "Call Ask";
-            colCallAsk.Name = "colCallAsk";
-            colCallAsk.ReadOnly = true;
+            tsmOrderPlacement.Name = "tsmOrderPlacement";
+            tsmOrderPlacement.Size = new Size(211, 22);
+            tsmOrderPlacement.Text = "🎯 智能下單匣";
+            tsmOrderPlacement.Click += btnTsOrderPlacement_Click;
             // 
-            // colCallLast
+            // tsmReports
             // 
-            colCallLast.HeaderText = "Call Last";
-            colCallLast.Name = "colCallLast";
-            colCallLast.ReadOnly = true;
+            tsmReports.DropDownItems.AddRange(new ToolStripItem[] { tsmOrderReport, tsmDealReport, tsmPosition, tsmMarginEquity });
+            tsmReports.ForeColor = Color.White;
+            tsmReports.Name = "tsmReports";
+            tsmReports.Size = new Size(80, 20);
+            tsmReports.Text = "帳務回報 (&A)";
             // 
-            // colStrike
+            // tsmOrderReport
             // 
-            colStrike.HeaderText = "Strike";
-            colStrike.Name = "colStrike";
-            colStrike.ReadOnly = true;
+            tsmOrderReport.Name = "tsmOrderReport";
+            tsmOrderReport.Size = new Size(163, 22);
+            tsmOrderReport.Text = "📋 委託回報";
+            tsmOrderReport.Click += btnTsOrderReport_Click;
             // 
-            // colPutLast
+            // tsmDealReport
             // 
-            colPutLast.HeaderText = "Put Last";
-            colPutLast.Name = "colPutLast";
-            colPutLast.ReadOnly = true;
+            tsmDealReport.Name = "tsmDealReport";
+            tsmDealReport.Size = new Size(163, 22);
+            tsmDealReport.Text = "💰 成交回報";
+            tsmDealReport.Click += btnTsDealReport_Click;
             // 
-            // colPutBid
+            // tsmPosition
             // 
-            colPutBid.HeaderText = "Put Bid";
-            colPutBid.Name = "colPutBid";
-            colPutBid.ReadOnly = true;
+            tsmPosition.Name = "tsmPosition";
+            tsmPosition.Size = new Size(163, 22);
+            tsmPosition.Text = "🎯 未平倉部位";
+            tsmPosition.Click += btnTsPosition_Click;
             // 
-            // colPutAsk
+            // tsmMarginEquity
             // 
-            colPutAsk.HeaderText = "Put Ask";
-            colPutAsk.Name = "colPutAsk";
-            colPutAsk.ReadOnly = true;
+            tsmMarginEquity.Name = "tsmMarginEquity";
+            tsmMarginEquity.Size = new Size(163, 22);
+            tsmMarginEquity.Text = "🏦 權益數與保證金";
+            tsmMarginEquity.Click += btnTsMargin_Click;
             // 
-            // colPutIV
+            // toolStrip
             // 
-            colPutIV.HeaderText = "Put IV";
-            colPutIV.Name = "colPutIV";
-            colPutIV.ReadOnly = true;
+            toolStrip.BackColor = Color.FromArgb(24, 24, 26);
+            toolStrip.GripStyle = ToolStripGripStyle.Hidden;
+            toolStrip.ImageScalingSize = new Size(24, 24);
+            toolStrip.Items.AddRange(new ToolStripItem[] { btnTsPricing, btnTsOrderPlacement, toolStripSeparator1, btnTsOrderReport, btnTsDealReport, btnTsPosition, btnTsMargin });
+            toolStrip.Location = new Point(0, 24);
+            toolStrip.Name = "toolStrip";
+            toolStrip.Padding = new Padding(10, 4, 10, 4);
+            toolStrip.Size = new Size(1100, 43);
+            toolStrip.TabIndex = 1;
             // 
-            // colPutDelta
+            // btnTsPricing
             // 
-            colPutDelta.HeaderText = "Put Delta";
-            colPutDelta.Name = "colPutDelta";
-            colPutDelta.ReadOnly = true;
+            btnTsPricing.Font = new Font("Segoe UI", 10F, FontStyle.Bold);
+            btnTsPricing.ForeColor = Color.White;
+            btnTsPricing.ImageTransparentColor = Color.Magenta;
+            btnTsPricing.Margin = new Padding(0, 1, 5, 2);
+            btnTsPricing.Name = "btnTsPricing";
+            btnTsPricing.Padding = new Padding(6, 4, 6, 4);
+            btnTsPricing.Size = new Size(149, 32);
+            btnTsPricing.Text = "📊 選擇權定價 (T鏈)";
+            btnTsPricing.Click += btnTsPricing_Click;
             // 
-            // _cboExpiration
+            // btnTsOrderPlacement
             // 
-            _cboExpiration.BackColor = Color.FromArgb(45, 45, 48);
-            _cboExpiration.DropDownStyle = ComboBoxStyle.DropDownList;
-            _cboExpiration.FlatStyle = FlatStyle.Flat;
-            _cboExpiration.ForeColor = Color.White;
-            _cboExpiration.FormattingEnabled = true;
-            _cboExpiration.Location = new Point(140, 16);
-            _cboExpiration.Name = "_cboExpiration";
-            _cboExpiration.Size = new Size(200, 25);
-            _cboExpiration.TabIndex = 1;
-            _cboExpiration.SelectedIndexChanged += CboExpiration_SelectedIndexChanged;
+            btnTsOrderPlacement.Font = new Font("Segoe UI", 10F, FontStyle.Bold);
+            btnTsOrderPlacement.ForeColor = Color.FromArgb(0, 210, 255);
+            btnTsOrderPlacement.ImageTransparentColor = Color.Magenta;
+            btnTsOrderPlacement.Margin = new Padding(5, 1, 5, 2);
+            btnTsOrderPlacement.Name = "btnTsOrderPlacement";
+            btnTsOrderPlacement.Padding = new Padding(6, 4, 6, 4);
+            btnTsOrderPlacement.Size = new Size(118, 32);
+            btnTsOrderPlacement.Text = "🎯 智能下單匣";
+            btnTsOrderPlacement.Click += btnTsOrderPlacement_Click;
             // 
-            // _cboModel
+            // toolStripSeparator1
             // 
-            _cboModel.BackColor = Color.FromArgb(45, 45, 48);
-            _cboModel.DropDownStyle = ComboBoxStyle.DropDownList;
-            _cboModel.FlatStyle = FlatStyle.Flat;
-            _cboModel.ForeColor = Color.White;
-            _cboModel.FormattingEnabled = true;
-            _cboModel.Location = new Point(430, 16);
-            _cboModel.Name = "_cboModel";
-            _cboModel.Size = new Size(100, 25);
-            _cboModel.TabIndex = 3;
-            _cboModel.SelectedIndexChanged += CboModel_SelectedIndexChanged;
+            toolStripSeparator1.Name = "toolStripSeparator1";
+            toolStripSeparator1.Size = new Size(6, 35);
             // 
-            // _lblStatus
+            // btnTsOrderReport
             // 
-            _lblStatus.AutoSize = true;
-            _lblStatus.ForeColor = Color.LimeGreen;
-            _lblStatus.Location = new Point(160, 61);
-            _lblStatus.Name = "_lblStatus";
-            _lblStatus.Size = new Size(124, 19);
-            _lblStatus.TabIndex = 10;
-            _lblStatus.Text = "Status: Initializing...";
+            btnTsOrderReport.Font = new Font("Segoe UI", 10F, FontStyle.Bold);
+            btnTsOrderReport.ForeColor = Color.White;
+            btnTsOrderReport.ImageTransparentColor = Color.Magenta;
+            btnTsOrderReport.Margin = new Padding(5, 1, 5, 2);
+            btnTsOrderReport.Name = "btnTsOrderReport";
+            btnTsOrderReport.Padding = new Padding(6, 4, 6, 4);
+            btnTsOrderReport.Size = new Size(106, 32);
+            btnTsOrderReport.Text = "📋 委託回報";
+            btnTsOrderReport.Click += btnTsOrderReport_Click;
             // 
-            // _lblTradeStatus
+            // btnTsDealReport
             // 
-            _lblTradeStatus.AutoSize = true;
-            _lblTradeStatus.ForeColor = Color.Orange;
-            _lblTradeStatus.Location = new Point(20, 61);
-            _lblTradeStatus.Name = "_lblTradeStatus";
-            _lblTradeStatus.Size = new Size(114, 19);
-            _lblTradeStatus.TabIndex = 11;
-            _lblTradeStatus.Text = "[TradeCom: 離線]";
+            btnTsDealReport.Font = new Font("Segoe UI", 10F, FontStyle.Bold);
+            btnTsDealReport.ForeColor = Color.White;
+            btnTsDealReport.ImageTransparentColor = Color.Magenta;
+            btnTsDealReport.Margin = new Padding(5, 1, 5, 2);
+            btnTsDealReport.Name = "btnTsDealReport";
+            btnTsDealReport.Padding = new Padding(6, 4, 6, 4);
+            btnTsDealReport.Size = new Size(106, 32);
+            btnTsDealReport.Text = "💰 成交回報";
+            btnTsDealReport.Click += btnTsDealReport_Click;
             // 
-            // _btnSave
+            // btnTsPosition
             // 
-            _btnSave.BackColor = Color.FromArgb(45, 45, 48);
-            _btnSave.FlatStyle = FlatStyle.Flat;
-            _btnSave.ForeColor = Color.White;
-            _btnSave.Location = new Point(540, 15);
-            _btnSave.Name = "_btnSave";
-            _btnSave.Size = new Size(70, 30);
-            _btnSave.TabIndex = 4;
-            _btnSave.Text = "Save IV";
-            _btnSave.UseVisualStyleBackColor = false;
-            _btnSave.Click += BtnSave_Click;
+            btnTsPosition.Font = new Font("Segoe UI", 10F, FontStyle.Bold);
+            btnTsPosition.ForeColor = Color.White;
+            btnTsPosition.ImageTransparentColor = Color.Magenta;
+            btnTsPosition.Margin = new Padding(5, 1, 5, 2);
+            btnTsPosition.Name = "btnTsPosition";
+            btnTsPosition.Padding = new Padding(6, 4, 6, 4);
+            btnTsPosition.Size = new Size(120, 32);
+            btnTsPosition.Text = "🎯 未平倉部位";
+            btnTsPosition.Click += btnTsPosition_Click;
             // 
-            // _chkAutoSaveMorning
+            // btnTsMargin
             // 
-            _chkAutoSaveMorning.AutoSize = true;
-            _chkAutoSaveMorning.Checked = true;
-            _chkAutoSaveMorning.CheckState = CheckState.Checked;
-            _chkAutoSaveMorning.ForeColor = Color.White;
-            _chkAutoSaveMorning.Location = new Point(644, 20);
-            _chkAutoSaveMorning.Name = "_chkAutoSaveMorning";
-            _chkAutoSaveMorning.Size = new Size(139, 23);
-            _chkAutoSaveMorning.TabIndex = 5;
-            _chkAutoSaveMorning.Text = "Auto Save(Day) @";
-            _chkAutoSaveMorning.UseVisualStyleBackColor = true;
-            _chkAutoSaveMorning.CheckedChanged += _chkAutoSaveMorning_CheckedChanged;
+            btnTsMargin.Font = new Font("Segoe UI", 10F, FontStyle.Bold);
+            btnTsMargin.ForeColor = Color.White;
+            btnTsMargin.ImageTransparentColor = Color.Magenta;
+            btnTsMargin.Margin = new Padding(5, 1, 5, 2);
+            btnTsMargin.Name = "btnTsMargin";
+            btnTsMargin.Padding = new Padding(6, 4, 6, 4);
+            btnTsMargin.Size = new Size(106, 32);
+            btnTsMargin.Text = "🏦 權益查詢";
+            btnTsMargin.Click += btnTsMargin_Click;
             // 
-            // _dtpAutoSaveMorning
+            // pnlStatus
             // 
-            _dtpAutoSaveMorning.Enabled = false;
-            _dtpAutoSaveMorning.Format = DateTimePickerFormat.Time;
-            _dtpAutoSaveMorning.Location = new Point(799, 20);
-            _dtpAutoSaveMorning.Name = "_dtpAutoSaveMorning";
-            _dtpAutoSaveMorning.ShowUpDown = true;
-            _dtpAutoSaveMorning.Size = new Size(90, 25);
-            _dtpAutoSaveMorning.TabIndex = 6;
-            _dtpAutoSaveMorning.Value = new DateTime(2026, 8, 5, 13, 35, 0, 0);
-            _dtpAutoSaveMorning.ValueChanged += _dtpAutoSaveMorning_ValueChanged;
+            pnlStatus.BackColor = Color.FromArgb(20, 20, 22);
+            pnlStatus.Controls.Add(cardRiskData);
+            pnlStatus.Controls.Add(cardFutures);
+            pnlStatus.Controls.Add(cardTrade);
+            pnlStatus.Controls.Add(cardQuote);
+            pnlStatus.Dock = DockStyle.Top;
+            pnlStatus.Location = new Point(0, 67);
+            pnlStatus.Name = "pnlStatus";
+            pnlStatus.Padding = new Padding(12);
+            pnlStatus.Size = new Size(1100, 105);
+            pnlStatus.TabIndex = 2;
             // 
-            // _chkAutoSaveNight
+            // cardRiskData
             // 
-            _chkAutoSaveNight.AutoSize = true;
-            _chkAutoSaveNight.Checked = true;
-            _chkAutoSaveNight.CheckState = CheckState.Checked;
-            _chkAutoSaveNight.ForeColor = Color.White;
-            _chkAutoSaveNight.Location = new Point(644, 54);
-            _chkAutoSaveNight.Name = "_chkAutoSaveNight";
-            _chkAutoSaveNight.Size = new Size(149, 23);
-            _chkAutoSaveNight.TabIndex = 7;
-            _chkAutoSaveNight.Text = "Auto Save(Night) @";
-            _chkAutoSaveNight.UseVisualStyleBackColor = true;
-            _chkAutoSaveNight.CheckedChanged += _chkAutoSaveNight_CheckedChanged;
+            cardRiskData.BackColor = Color.FromArgb(32, 32, 36);
+            cardRiskData.Controls.Add(lblRiskDataStatus);
+            cardRiskData.Controls.Add(lblRiskDataTitle);
+            cardRiskData.Location = new Point(810, 12);
+            cardRiskData.Name = "cardRiskData";
+            cardRiskData.Size = new Size(260, 80);
+            cardRiskData.TabIndex = 3;
             // 
-            // _dtpAutoSaveNight
+            // lblRiskDataStatus
             // 
-            _dtpAutoSaveNight.Enabled = false;
-            _dtpAutoSaveNight.Format = DateTimePickerFormat.Time;
-            _dtpAutoSaveNight.Location = new Point(799, 55);
-            _dtpAutoSaveNight.Name = "_dtpAutoSaveNight";
-            _dtpAutoSaveNight.ShowUpDown = true;
-            _dtpAutoSaveNight.Size = new Size(90, 25);
-            _dtpAutoSaveNight.TabIndex = 8;
-            _dtpAutoSaveNight.Value = new DateTime(2026, 8, 5, 4, 30, 0, 0);
-            _dtpAutoSaveNight.ValueChanged += _dtpAutoSaveNight_ValueChanged;
+            lblRiskDataStatus.AutoSize = true;
+            lblRiskDataStatus.Font = new Font("Segoe UI", 11F, FontStyle.Bold);
+            lblRiskDataStatus.ForeColor = Color.DarkGray;
+            lblRiskDataStatus.Location = new Point(15, 42);
+            lblRiskDataStatus.Name = "lblRiskDataStatus";
+            lblRiskDataStatus.Size = new Size(95, 20);
+            lblRiskDataStatus.TabIndex = 1;
+            lblRiskDataStatus.Text = "定時 15 秒更新";
             // 
-            // _chkShift
+            // lblRiskDataTitle
             // 
-            _chkShift.AutoSize = true;
-            _chkShift.ForeColor = Color.White;
-            _chkShift.Location = new Point(540, 55);
-            _chkShift.Name = "_chkShift";
-            _chkShift.Size = new Size(87, 23);
-            _chkShift.TabIndex = 9;
-            _chkShift.Text = "ATM Shift";
-            _chkShift.UseVisualStyleBackColor = true;
+            lblRiskDataTitle.AutoSize = true;
+            lblRiskDataTitle.Font = new Font("Segoe UI", 9.5F);
+            lblRiskDataTitle.ForeColor = Color.DarkGray;
+            lblRiskDataTitle.Location = new Point(15, 14);
+            lblRiskDataTitle.Name = "lblRiskDataTitle";
+            lblRiskDataTitle.Size = new Size(130, 17);
+            lblRiskDataTitle.TabIndex = 0;
+            lblRiskDataTitle.Text = "⚡ 風控資料匯出狀態";
             // 
-            // topPanel
+            // cardFutures
             // 
-            topPanel.BackColor = Color.FromArgb(28, 28, 30);
-            topPanel.Controls.Add(lblSelect);
-            topPanel.Controls.Add(_cboExpiration);
-            topPanel.Controls.Add(lblModel);
-            topPanel.Controls.Add(_cboModel);
-            topPanel.Controls.Add(_btnSave);
-            topPanel.Controls.Add(_chkAutoSaveMorning);
-            topPanel.Controls.Add(_dtpAutoSaveMorning);
-            topPanel.Controls.Add(_chkAutoSaveNight);
-            topPanel.Controls.Add(_dtpAutoSaveNight);
-            topPanel.Controls.Add(_chkShift);
-            topPanel.Controls.Add(_lblTradeStatus);
-            topPanel.Controls.Add(_lblStatus);
-            topPanel.Dock = DockStyle.Top;
-            topPanel.Location = new Point(0, 0);
-            topPanel.Name = "topPanel";
-            topPanel.Padding = new Padding(10);
-            topPanel.Size = new Size(1362, 90);
-            topPanel.TabIndex = 0;
+            cardFutures.BackColor = Color.FromArgb(32, 32, 36);
+            cardFutures.Controls.Add(lblFuturesPrice);
+            cardFutures.Controls.Add(lblFuturesTitle);
+            cardFutures.Location = new Point(544, 12);
+            cardFutures.Name = "cardFutures";
+            cardFutures.Size = new Size(250, 80);
+            cardFutures.TabIndex = 2;
             // 
-            // lblSelect
+            // lblFuturesPrice
             // 
-            lblSelect.AutoSize = true;
-            lblSelect.ForeColor = Color.FromArgb(200, 200, 200);
-            lblSelect.Location = new Point(20, 20);
-            lblSelect.Name = "lblSelect";
-            lblSelect.Size = new Size(111, 19);
-            lblSelect.TabIndex = 0;
-            lblSelect.Text = "Select Expiration:";
+            lblFuturesPrice.AutoSize = true;
+            lblFuturesPrice.Font = new Font("Segoe UI", 15F, FontStyle.Bold);
+            lblFuturesPrice.ForeColor = Color.Gold;
+            lblFuturesPrice.Location = new Point(15, 38);
+            lblFuturesPrice.Name = "lblFuturesPrice";
+            lblFuturesPrice.Size = new Size(24, 28);
+            lblFuturesPrice.TabIndex = 1;
+            lblFuturesPrice.Text = "--";
             // 
-            // lblModel
+            // lblFuturesTitle
             // 
-            lblModel.AutoSize = true;
-            lblModel.ForeColor = Color.FromArgb(200, 200, 200);
-            lblModel.Location = new Point(360, 20);
-            lblModel.Name = "lblModel";
-            lblModel.Size = new Size(68, 19);
-            lblModel.TabIndex = 2;
-            lblModel.Text = "IV Model:";
+            lblFuturesTitle.AutoSize = true;
+            lblFuturesTitle.Font = new Font("Segoe UI", 9.5F);
+            lblFuturesTitle.ForeColor = Color.DarkGray;
+            lblFuturesTitle.Location = new Point(15, 14);
+            lblFuturesTitle.Name = "lblFuturesTitle";
+            lblFuturesTitle.Size = new Size(104, 17);
+            lblFuturesTitle.TabIndex = 0;
+            lblFuturesTitle.Text = "📈 台指期貨現價";
             // 
-            // splitContainer
+            // cardTrade
             // 
-            splitContainer.BackColor = Color.FromArgb(45, 45, 48);
-            splitContainer.Dock = DockStyle.Fill;
-            splitContainer.Location = new Point(0, 90);
-            splitContainer.Name = "splitContainer";
+            cardTrade.BackColor = Color.FromArgb(32, 32, 36);
+            cardTrade.Controls.Add(lblTradeStatus);
+            cardTrade.Controls.Add(lblTradeTitle);
+            cardTrade.Location = new Point(278, 12);
+            cardTrade.Name = "cardTrade";
+            cardTrade.Size = new Size(250, 80);
+            cardTrade.TabIndex = 1;
             // 
-            // splitContainer.Panel1
+            // lblTradeStatus
             // 
-            splitContainer.Panel1.Controls.Add(_formsPlot);
+            lblTradeStatus.AutoSize = true;
+            lblTradeStatus.Font = new Font("Segoe UI", 13F, FontStyle.Bold);
+            lblTradeStatus.ForeColor = Color.Orange;
+            lblTradeStatus.Location = new Point(15, 40);
+            lblTradeStatus.Name = "lblTradeStatus";
+            lblTradeStatus.Size = new Size(107, 25);
+            lblTradeStatus.TabIndex = 1;
+            lblTradeStatus.Text = "🟠 連線中...";
             // 
-            // splitContainer.Panel2
+            // lblTradeTitle
             // 
-            splitContainer.Panel2.Controls.Add(_dgvTQuote);
-            splitContainer.Size = new Size(1362, 710);
-            splitContainer.SplitterDistance = 681;
-            splitContainer.TabIndex = 1;
+            lblTradeTitle.AutoSize = true;
+            lblTradeTitle.Font = new Font("Segoe UI", 9.5F);
+            lblTradeTitle.ForeColor = Color.DarkGray;
+            lblTradeTitle.Location = new Point(15, 14);
+            lblTradeTitle.Name = "lblTradeTitle";
+            lblTradeTitle.Size = new Size(174, 17);
+            lblTradeTitle.TabIndex = 0;
+            lblTradeTitle.Text = "🔑 凱基交易 (TradeCom API)";
+            // 
+            // cardQuote
+            // 
+            cardQuote.BackColor = Color.FromArgb(32, 32, 36);
+            cardQuote.Controls.Add(lblQuoteStatus);
+            cardQuote.Controls.Add(lblQuoteTitle);
+            cardQuote.Location = new Point(12, 12);
+            cardQuote.Name = "cardQuote";
+            cardQuote.Size = new Size(250, 80);
+            cardQuote.TabIndex = 0;
+            // 
+            // lblQuoteStatus
+            // 
+            lblQuoteStatus.AutoSize = true;
+            lblQuoteStatus.Font = new Font("Segoe UI", 13F, FontStyle.Bold);
+            lblQuoteStatus.ForeColor = Color.Orange;
+            lblQuoteStatus.Location = new Point(15, 40);
+            lblQuoteStatus.Name = "lblQuoteStatus";
+            lblQuoteStatus.Size = new Size(107, 25);
+            lblQuoteStatus.TabIndex = 1;
+            lblQuoteStatus.Text = "🟠 連線中...";
+            // 
+            // lblQuoteTitle
+            // 
+            lblQuoteTitle.AutoSize = true;
+            lblQuoteTitle.Font = new Font("Segoe UI", 9.5F);
+            lblQuoteTitle.ForeColor = Color.DarkGray;
+            lblQuoteTitle.Location = new Point(15, 14);
+            lblQuoteTitle.Name = "lblQuoteTitle";
+            lblQuoteTitle.Size = new Size(179, 17);
+            lblQuoteTitle.TabIndex = 0;
+            lblQuoteTitle.Text = "📡 凱基行情 (QuoteCom API)";
+            // 
+            // pnlLogHeader
+            // 
+            pnlLogHeader.BackColor = Color.FromArgb(26, 26, 28);
+            pnlLogHeader.Controls.Add(chkAutoScroll);
+            pnlLogHeader.Controls.Add(btnClearLog);
+            pnlLogHeader.Controls.Add(lblLogTitle);
+            pnlLogHeader.Dock = DockStyle.Top;
+            pnlLogHeader.Location = new Point(0, 172);
+            pnlLogHeader.Name = "pnlLogHeader";
+            pnlLogHeader.Padding = new Padding(10, 0, 10, 0);
+            pnlLogHeader.Size = new Size(1100, 38);
+            pnlLogHeader.TabIndex = 3;
+            // 
+            // chkAutoScroll
+            // 
+            chkAutoScroll.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+            chkAutoScroll.AutoSize = true;
+            chkAutoScroll.Checked = true;
+            chkAutoScroll.CheckState = CheckState.Checked;
+            chkAutoScroll.ForeColor = Color.White;
+            chkAutoScroll.Location = new Point(885, 9);
+            chkAutoScroll.Name = "chkAutoScroll";
+            chkAutoScroll.Size = new Size(98, 23);
+            chkAutoScroll.TabIndex = 2;
+            chkAutoScroll.Text = "自動滾動日誌";
+            chkAutoScroll.UseVisualStyleBackColor = true;
+            // 
+            // btnClearLog
+            // 
+            btnClearLog.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+            btnClearLog.BackColor = Color.FromArgb(45, 45, 48);
+            btnClearLog.FlatStyle = FlatStyle.Flat;
+            btnClearLog.ForeColor = Color.White;
+            btnClearLog.Location = new Point(995, 4);
+            btnClearLog.Name = "btnClearLog";
+            btnClearLog.Size = new Size(95, 30);
+            btnClearLog.TabIndex = 1;
+            btnClearLog.Text = "🧹 清空 Log";
+            btnClearLog.UseVisualStyleBackColor = false;
+            btnClearLog.Click += btnClearLog_Click;
+            // 
+            // lblLogTitle
+            // 
+            lblLogTitle.AutoSize = true;
+            lblLogTitle.Font = new Font("Segoe UI", 10F, FontStyle.Bold);
+            lblLogTitle.ForeColor = Color.White;
+            lblLogTitle.Location = new Point(12, 9);
+            lblLogTitle.Name = "lblLogTitle";
+            lblLogTitle.Size = new Size(147, 19);
+            lblLogTitle.TabIndex = 0;
+            lblLogTitle.Text = "📜 即時系統 Log 監控";
+            // 
+            // rtbLog
+            // 
+            rtbLog.BackColor = Color.FromArgb(14, 14, 16);
+            rtbLog.BorderStyle = BorderStyle.None;
+            rtbLog.Dock = DockStyle.Fill;
+            rtbLog.Font = new Font("Consolas", 10F);
+            rtbLog.ForeColor = Color.FromArgb(220, 220, 220);
+            rtbLog.Location = new Point(0, 0);
+            rtbLog.Name = "rtbLog";
+            rtbLog.ReadOnly = true;
+            rtbLog.ScrollBars = RichTextBoxScrollBars.Vertical;
+            rtbLog.Size = new Size(1100, 440);
+            rtbLog.TabIndex = 0;
+            rtbLog.Text = "";
+            // 
+            // pnlLog
+            // 
+            pnlLog.Controls.Add(rtbLog);
+            pnlLog.Dock = DockStyle.Fill;
+            pnlLog.Location = new Point(0, 210);
+            pnlLog.Name = "pnlLog";
+            pnlLog.Size = new Size(1100, 440);
+            pnlLog.TabIndex = 4;
             // 
             // Form1
             // 
             AutoScaleDimensions = new SizeF(7F, 17F);
             AutoScaleMode = AutoScaleMode.Font;
             BackColor = Color.FromArgb(18, 18, 18);
-            ClientSize = new Size(1362, 800);
-            Controls.Add(splitContainer);
-            Controls.Add(topPanel);
-            Font = new Font("Segoe UI", 10F);
-            ForeColor = Color.White;
+            ClientSize = new Size(1100, 650);
+            Controls.Add(pnlLog);
+            Controls.Add(pnlLogHeader);
+            Controls.Add(pnlStatus);
+            Controls.Add(toolStrip);
+            Controls.Add(menuStrip);
+            Font = new Font("Segoe UI", 10F, FontStyle.Regular, GraphicsUnit.Point);
+            MainMenuStrip = menuStrip;
             Name = "Form1";
-            Text = "TXO Volatility Smile Pro";
-            Load += Form1_Load_1;
-            ((System.ComponentModel.ISupportInitialize)_dgvTQuote).EndInit();
-            topPanel.ResumeLayout(false);
-            topPanel.PerformLayout();
-            splitContainer.Panel1.ResumeLayout(false);
-            splitContainer.Panel2.ResumeLayout(false);
-            ((System.ComponentModel.ISupportInitialize)splitContainer).EndInit();
-            splitContainer.ResumeLayout(false);
+            StartPosition = FormStartPosition.CenterScreen;
+            Text = "KGIOptionPricing - 凱基期權定價與造市交易系統";
+            menuStrip.ResumeLayout(false);
+            menuStrip.PerformLayout();
+            toolStrip.ResumeLayout(false);
+            toolStrip.PerformLayout();
+            pnlStatus.ResumeLayout(false);
+            cardRiskData.ResumeLayout(false);
+            cardRiskData.PerformLayout();
+            cardFutures.ResumeLayout(false);
+            cardFutures.PerformLayout();
+            cardTrade.ResumeLayout(false);
+            cardTrade.PerformLayout();
+            cardQuote.ResumeLayout(false);
+            cardQuote.PerformLayout();
+            pnlLogHeader.ResumeLayout(false);
+            pnlLogHeader.PerformLayout();
+            pnlLog.ResumeLayout(false);
             ResumeLayout(false);
+            PerformLayout();
         }
 
         #endregion
 
-        private ScottPlot.WinForms.FormsPlot _formsPlot;
-        private System.Windows.Forms.DataGridView _dgvTQuote;
-        private System.Windows.Forms.ComboBox _cboExpiration;
-        private System.Windows.Forms.ComboBox _cboModel;
-        private System.Windows.Forms.Label _lblStatus;
-        private System.Windows.Forms.Label _lblTradeStatus;
-        private System.Windows.Forms.Button _btnSave;
-        private System.Windows.Forms.CheckBox _chkAutoSaveMorning;
-        private System.Windows.Forms.DateTimePicker _dtpAutoSaveMorning;
-        private System.Windows.Forms.CheckBox _chkAutoSaveNight;
-        private System.Windows.Forms.DateTimePicker _dtpAutoSaveNight;
-        private System.Windows.Forms.CheckBox _chkShift;
-        
-        private System.Windows.Forms.Panel topPanel;
-        private System.Windows.Forms.Label lblSelect;
-        private System.Windows.Forms.Label lblModel;
-        private System.Windows.Forms.SplitContainer splitContainer;
-        private System.Windows.Forms.DataGridViewTextBoxColumn colCallDelta;
-        private System.Windows.Forms.DataGridViewTextBoxColumn colCallIV;
-        private System.Windows.Forms.DataGridViewTextBoxColumn colCallBid;
-        private System.Windows.Forms.DataGridViewTextBoxColumn colCallAsk;
-        private System.Windows.Forms.DataGridViewTextBoxColumn colCallLast;
-        private System.Windows.Forms.DataGridViewTextBoxColumn colStrike;
-        private System.Windows.Forms.DataGridViewTextBoxColumn colPutLast;
-        private System.Windows.Forms.DataGridViewTextBoxColumn colPutBid;
-        private System.Windows.Forms.DataGridViewTextBoxColumn colPutAsk;
-        private System.Windows.Forms.DataGridViewTextBoxColumn colPutIV;
-        private System.Windows.Forms.DataGridViewTextBoxColumn colPutDelta;
+        private MenuStrip menuStrip;
+        private ToolStripMenuItem tsmFile;
+        private ToolStripMenuItem tsmExit;
+        private ToolStripMenuItem tsmPricing;
+        private ToolStripMenuItem tsmOptionPricing;
+        private ToolStripMenuItem tsmOrderPlacement;
+        private ToolStripMenuItem tsmReports;
+        private ToolStripMenuItem tsmOrderReport;
+        private ToolStripMenuItem tsmDealReport;
+        private ToolStripMenuItem tsmPosition;
+        private ToolStripMenuItem tsmMarginEquity;
+        private ToolStrip toolStrip;
+        private ToolStripButton btnTsPricing;
+        private ToolStripButton btnTsOrderPlacement;
+        private ToolStripSeparator toolStripSeparator1;
+        private ToolStripButton btnTsOrderReport;
+        private ToolStripButton btnTsDealReport;
+        private ToolStripButton btnTsPosition;
+        private ToolStripButton btnTsMargin;
+        private Panel pnlStatus;
+        private Panel cardQuote;
+        private Label lblQuoteTitle;
+        private Label lblQuoteStatus;
+        private Panel cardTrade;
+        private Label lblTradeTitle;
+        private Label lblTradeStatus;
+        private Panel cardFutures;
+        private Label lblFuturesTitle;
+        private Label lblFuturesPrice;
+        private Panel cardRiskData;
+        private Label lblRiskDataTitle;
+        private Label lblRiskDataStatus;
+        private Panel pnlLogHeader;
+        private Label lblLogTitle;
+        private Button btnClearLog;
+        private CheckBox chkAutoScroll;
+        private RichTextBox rtbLog;
+        private Panel pnlLog;
     }
 }

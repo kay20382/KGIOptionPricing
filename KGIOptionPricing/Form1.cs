@@ -1,137 +1,91 @@
 using System;
 using System.Collections.Generic;
+using System.Drawing;
+using System.IO;
 using System.Linq;
 using System.Windows.Forms;
-using ScottPlot;
-using ScottPlot.WinForms;
-using Color = System.Drawing.Color;
-using Font = System.Drawing.Font;
-using Point = System.Drawing.Point;
-using Size = System.Drawing.Size;
-using Label = System.Windows.Forms.Label;
-using FontStyle = System.Drawing.FontStyle;
+using KGIOptionPricing.OrderManagement.Core;
 
 namespace KGIOptionPricing
 {
+    /// <summary>
+    /// 系統主控制台：負責中央服務生命週期管理、API 登入狀態監控、即時日誌以及獨立浮動子視窗的調度。
+    /// </summary>
     public partial class Form1 : Form
     {
-        private System.Windows.Forms.Timer _autoSaveTimer;
-        private bool _hasSavedMorning = false;
-        private bool _hasSavedNight = false;
-        private bool _isFirstLoad = true;
+        private static readonly log4net.ILog log = log4net.LogManager.GetLogger(typeof(Form1));
 
+        // Core Services
         private KGIQuoteService _quoteService;
         private IMPVStorageManager _storageManager;
         private MarketDataService _marketDataService;
         private TradingCalendar _calendar;
         private KGITradeService _tradeService;
-        private System.Windows.Forms.Timer _riskDataTimer;
+        private OrderManager _orderManager;
         private SpreadConfigEvaluator _spreadEvaluator;
+        private System.Windows.Forms.Timer _riskDataTimer;
         private string _riskDataOutputPath = "C:\\temp\\RiskData.json";
+        private Dictionary<string, OptionChain> _currentChains = new Dictionary<string, OptionChain>();
 
-        private Dictionary<string, OptionChain> _currentChains;
+        // Floating Subforms (Singleton Instances)
+        private OptionPricingForm? _pricingForm;
+        private OrderPlacementForm? _orderPlacementForm;
+        private OrderReportForm? _orderReportForm;
+        private DealReportForm? _dealReportForm;
+        private PositionForm? _positionForm;
+        private MarginEquityForm? _marginEquityForm;
 
         public Form1()
         {
+            log.Info("Form Init");
             InitializeComponent();
-            ApplyCustomStyles();
             InitializeServices();
         }
-        private void Form1_Load_1(object sender, EventArgs e)
-        {
-
-        }
-        private void ApplyCustomStyles()
-        {
-            // Advanced Font and Style configurations
-            this.Font = new Font("Segoe UI", 10F, FontStyle.Regular, System.Drawing.GraphicsUnit.Point);
-            _dgvTQuote.ColumnHeadersDefaultCellStyle.Font = new Font("Segoe UI", 9F, FontStyle.Bold);
-            _dgvTQuote.DefaultCellStyle.Font = new Font("Consolas", 10F);
-            colStrike.DefaultCellStyle.Font = new Font("Consolas", 10F, FontStyle.Bold);
-            colStrike.DefaultCellStyle.BackColor = Color.FromArgb(0, 0, 100); // Dark Blue
-            colStrike.DefaultCellStyle.ForeColor = Color.Gold;
-
-            // Load Enums for IV Model
-            foreach (var method in Enum.GetValues(typeof(SmoothingMethod)))
-            {
-                _cboModel.Items.Add(method.ToString());
-            }
-            if (_cboModel.Items.Count > 0)
-                _cboModel.SelectedItem = SmoothingMethod.CubicSpline.ToString(); // Default to CubicSpline
-
-            // Wire UI Event
-            _chkShift.CheckedChanged += (s, e) => UpdateChart();
-
-            // Configure Dark Theme for the ScottPlot
-            _formsPlot.Plot.FigureBackground.Color = ScottPlot.Color.FromHex("#121212");
-            _formsPlot.Plot.DataBackground.Color = ScottPlot.Color.FromHex("#121212");
-            _formsPlot.Plot.Axes.Color(ScottPlot.Color.FromHex("#d7d7d7"));
-            _formsPlot.Plot.Grid.LineColor = ScottPlot.Color.FromHex("#2d2d2d");
-            _formsPlot.Plot.Title("Implied Volatility Curve");
-            _formsPlot.Plot.XLabel("Strike Price");
-            _formsPlot.Plot.YLabel("Implied Volatility (%)");
-        }
-
 
         private void InitializeServices()
         {
             _calendar = new TradingCalendar();
+            log.Info("QuoteService Init");
             _quoteService = new KGIQuoteService();
+            _quoteService.SetCalendar(_calendar);
+
+            log.Info("IMPV Object Init");
             _storageManager = new IMPVStorageManager();
+
+            log.Info("MarketDataService Init");
             _marketDataService = new MarketDataService(_quoteService, _storageManager);
 
-            _quoteService.SetCalendar(_calendar);
+            // 行情日誌與狀態事件
+            _quoteService.OnLogMessage += (msg) =>
+            {
+                AppendLog($"[Quote API] {msg}", Color.LightSkyBlue);
+                if (msg.Contains("連線成功") || msg.Contains("就緒") || msg.Contains("Login Success"))
+                {
+                    UpdateQuoteStatus("🟢 已連線就緒", Color.LimeGreen);
+                }
+                else if (msg.Contains("失敗") || msg.Contains("斷線") || msg.Contains("中斷"))
+                {
+                    UpdateQuoteStatus("🔴 連線中斷", Color.Crimson);
+                }
+            };
 
             _quoteService.OnOptionsDataUpdated += (chains) =>
             {
                 _currentChains = chains;
-                if (this.IsHandleCreated)
+                if (chains.Values.Any(c => c.UnderlyingPrice > 0))
                 {
-                    this.Invoke(new Action(() =>
-                    {
-                        if (_isFirstLoad && _currentChains.Values.Any(c => c.UnderlyingPrice > 0))
-                        {
-                            _storageManager.LoadLatestSnapshot(_currentChains.Values);
-                            _isFirstLoad = false;
-                        }
-
-                        bool cboChanged = false;
-                        foreach (var key in chains.Keys)
-                        {
-                            if (!_cboExpiration.Items.Contains(key))
-                            {
-                                _cboExpiration.Items.Add(key);
-                                cboChanged = true;
-                            }
-                        }
-
-                        if (cboChanged && _cboExpiration.Items.Count > 0 && _cboExpiration.SelectedIndex == -1)
-                        {
-                            _cboExpiration.SelectedIndex = 0;
-                        }
-
-                        UpdateChart();
-                    }));
+                    double futPrice = chains.Values.First(c => c.UnderlyingPrice > 0).UnderlyingPrice;
+                    UpdateFuturesPrice(futPrice);
                 }
             };
 
-            _quoteService.OnLogMessage += (msg) =>
-            {
-                if (this.IsHandleCreated)
-                {
-                    this.BeginInvoke(new Action(() => { _lblStatus.Text = msg; }));
-                }
-            };
-
-            _autoSaveTimer = new System.Windows.Forms.Timer();
-            _autoSaveTimer.Interval = 10*60*1000;
-            _autoSaveTimer.Tick += AutoSaveTimer_Tick;
-
-            // Initialize TradeCom Service & Risk Exporter from Config
+            // TradeCom Service & Risk Exporter from Config
+            log.Info("TradeService Init");
             InitializeTradeService();
 
             this.Load += Form1_Load;
             this.FormClosing += Form1_FormClosing;
+            log.Info("Initialize Finish");
         }
 
         private void InitializeTradeService()
@@ -147,17 +101,19 @@ namespace KGIOptionPricing
 
             try
             {
-                if (System.IO.File.Exists("config.json"))
+                if (File.Exists("config.json"))
                 {
-                    string json = System.IO.File.ReadAllText("config.json");
+                    string json = File.ReadAllText("config.json");
                     using var doc = System.Text.Json.JsonDocument.Parse(json);
                     var root = doc.RootElement;
+
+                    _calendar.LoadConfigFromJson(root);
 
                     if (root.TryGetProperty("KGI_USER_ID", out var idElem)) userId = idElem.GetString() ?? userId;
                     if (root.TryGetProperty("KGI_PASSWORD", out var pwdElem)) password = pwdElem.GetString() ?? password;
                     if (root.TryGetProperty("TradeCom_Host", out var hostElem)) host = hostElem.GetString() ?? host;
-                    if (root.TryGetProperty("TradeCom_BrokerID", out var brokerIDElem)) host = hostElem.GetString() ?? brokerID;
-                    if (root.TryGetProperty("TradeCom_Account", out var accountElem)) host = hostElem.GetString() ?? account;
+                    if (root.TryGetProperty("TradeCom_BrokerID", out var brokerIDElem)) brokerID = brokerIDElem.GetString() ?? brokerID;
+                    if (root.TryGetProperty("TradeCom_Account", out var accountElem)) account = accountElem.GetString() ?? account;
                     if (root.TryGetProperty("TradeCom_Port", out var portElem)) port = (ushort)portElem.GetInt32();
                     if (root.TryGetProperty("RiskDataOutputPath", out var pathElem)) _riskDataOutputPath = pathElem.GetString() ?? _riskDataOutputPath;
                     if (root.TryGetProperty("AutoExportIntervalSeconds", out var intervalElem)) intervalSec = intervalElem.GetInt32();
@@ -171,43 +127,36 @@ namespace KGIOptionPricing
             catch { }
 
             _spreadEvaluator = new SpreadConfigEvaluator(spreadRules);
-            _tradeService = new KGITradeService(host, port, userId, password,brokerID,account);
+            _tradeService = new KGITradeService(host, port, userId, password, brokerID, account);
+            _orderManager = new OrderManager(_tradeService);
+
+            _tradeService.OnLogMessage += (msg) =>
+            {
+                AppendLog($"[Trade API] {msg}", Color.LightYellow);
+            };
+
             _tradeService.OnStatusChanged += (statusText, isConn) =>
             {
-                if (this.IsHandleCreated)
-                {
-                    this.BeginInvoke(new Action(() =>
-                    {
-                        _lblTradeStatus.Text = $"[TradeCom: {statusText}]";
-                        _lblTradeStatus.ForeColor = isConn ? Color.LimeGreen : Color.Orange;
-                    }));
-                }
+                UpdateTradeStatus(isConn ? $"🟢 {statusText}" : $"🔴 {statusText}", isConn ? Color.LimeGreen : Color.Crimson);
             };
 
-            // 2. 收到 INVENTORY_TRADER (P001616) 並解析完成後，自動執行風險計算與匯出
             _tradeService.OnPositionsUpdated += (positions) =>
             {
-                if (this.IsHandleCreated)
-                {
-                    this.BeginInvoke(new Action(() =>
-                    {
-                        ExportRiskData(positions);
-                    }));
-                }
+                ExportRiskData(positions);
             };
 
-            _riskDataTimer = new System.Windows.Forms.Timer();
-            _riskDataTimer.Interval = Math.Max(1000, intervalSec * 1000);
-            _riskDataTimer.Tick += (s, e) => 
+            _riskDataTimer = new System.Windows.Forms.Timer
+            {
+                Interval = Math.Max(1000, intervalSec * 1000)
+            };
+            _riskDataTimer.Tick += (s, e) =>
             {
                 if (_tradeService != null && _tradeService.IsLoggedIn)
                 {
-                    // 1. 定時向 TradeServer 查詢部位 (發送 RetrivePositionSum)
-                    _tradeService.RequestPositions();
+                    _tradeService.RequestPositions("I");
                 }
                 else
                 {
-                    // 若尚未登入完成，則使用現有持倉重新導出風控資料
                     ExportRiskData();
                 }
             };
@@ -220,340 +169,190 @@ namespace KGIOptionPricing
                 double futuresPrice = _marketDataService != null ? _marketDataService.CurrentFuturesPrice : 21000.0;
                 var positionsToExport = positions ?? _tradeService.CurrentPositions;
 
-                // 3. 配合 3-Tier 隱含波動率 (IV) 判定機制與 currentChains 計算
-                // 4. 寫入 RiskData JSON 檔案
                 RiskDataExporter.ExportToJsonFile(_riskDataOutputPath, positionsToExport, _currentChains, futuresPrice, _spreadEvaluator);
+
+                if (IsHandleCreated && !IsDisposed)
+                {
+                    BeginInvoke(new Action(() =>
+                    {
+                        lblRiskDataStatus.Text = $"已匯出 ({DateTime.Now:HH:mm:ss})";
+                        lblRiskDataStatus.ForeColor = Color.LimeGreen;
+                    }));
+                }
             }
         }
 
         private void Form1_Load(object? sender, EventArgs e)
         {
+            AppendLog($"[系統啟動] KGIOptionPricing 核心管理員啟動中... ({DateTime.Now:yyyy/MM/dd HH:mm:ss})", Color.Gold);
             _quoteService.Connect();
             _marketDataService.Start();
-            _autoSaveTimer.Start();
             _tradeService.Start();
             _riskDataTimer.Start();
         }
 
         private void Form1_FormClosing(object? sender, FormClosingEventArgs e)
         {
-            try { _autoSaveTimer?.Stop(); } catch { }
-            try { _riskDataTimer?.Stop(); } catch { }
+            log.Info("[Form1] Application closing, stopping services...");
+            try { _riskDataTimer?.Stop(); _riskDataTimer?.Dispose(); } catch { }
             try { _marketDataService?.Stop(); } catch { }
             try { _tradeService?.Stop(); } catch { }
             try { _quoteService?.Disconnect(); } catch { }
+
+            // 關閉所有子視窗
+            try { _pricingForm?.Close(); } catch { }
+            try { _orderPlacementForm?.Close(); } catch { }
+            try { _orderReportForm?.Close(); } catch { }
+            try { _dealReportForm?.Close(); } catch { }
+            try { _positionForm?.Close(); } catch { }
+            try { _marginEquityForm?.Close(); } catch { }
+
+            log4net.LogManager.Shutdown();
+            Environment.Exit(0);
         }
 
-        private void BtnSave_Click(object sender, EventArgs e)
+        #region UI State & Logging
+
+        private void UpdateQuoteStatus(string text, Color color)
         {
-            if (_currentChains != null && _currentChains.Values.Count > 0)
+            if (IsDisposed || !IsHandleCreated) return;
+            BeginInvoke(new Action(() =>
             {
-                try
+                lblQuoteStatus.Text = text;
+                lblQuoteStatus.ForeColor = color;
+            }));
+        }
+
+        private void UpdateTradeStatus(string text, Color color)
+        {
+            if (IsDisposed || !IsHandleCreated) return;
+            BeginInvoke(new Action(() =>
+            {
+                lblTradeStatus.Text = text;
+                lblTradeStatus.ForeColor = color;
+            }));
+        }
+
+        private void UpdateFuturesPrice(double price)
+        {
+            if (IsDisposed || !IsHandleCreated) return;
+            BeginInvoke(new Action(() =>
+            {
+                lblFuturesPrice.Text = price > 0 ? $"{price:N0}" : "--";
+            }));
+        }
+
+        private void AppendLog(string message, Color? color = null)
+        {
+            if (IsDisposed || !IsHandleCreated) return;
+            BeginInvoke(new Action(() =>
+            {
+                string timestamp = DateTime.Now.ToString("HH:mm:ss.fff");
+                string logLine = $"[{timestamp}] {message}\n";
+
+                rtbLog.SelectionStart = rtbLog.TextLength;
+                rtbLog.SelectionLength = 0;
+                rtbLog.SelectionColor = color ?? Color.LightGray;
+                rtbLog.AppendText(logLine);
+                rtbLog.SelectionColor = rtbLog.ForeColor;
+
+                if (chkAutoScroll.Checked)
                 {
-                    _storageManager.SaveSnapshot(_currentChains.Values);
-                    _lblStatus.Text = $"Status: Saved at {DateTime.Now:HH:mm:ss}";
+                    rtbLog.ScrollToCaret();
                 }
-                catch { }
+            }));
+        }
+
+        private void btnClearLog_Click(object? sender, EventArgs e)
+        {
+            rtbLog.Clear();
+        }
+
+        #endregion
+
+        #region Floating Subforms Dispatcher (Option B - 獨立浮動視窗)
+
+        private void ShowOrActivateForm<T>(ref T? formInstance, Func<T> factory) where T : Form
+        {
+            if (formInstance == null || formInstance.IsDisposed)
+            {
+                formInstance = factory();
+                formInstance.Show(this); // 浮動顯示
+            }
+            else
+            {
+                if (formInstance.WindowState == FormWindowState.Minimized)
+                {
+                    formInstance.WindowState = FormWindowState.Normal;
+                }
+                formInstance.Activate();
+                formInstance.BringToFront();
             }
         }
 
-
-        private void _chkAutoSaveMorning_CheckedChanged(object? sender, EventArgs e)
+        public void OpenOrderPlacementForm()
         {
-            _dtpAutoSaveMorning.Enabled = !_chkAutoSaveMorning.Checked;
-            if (_chkAutoSaveMorning.Checked == true && DateTime.Now.TimeOfDay < _dtpAutoSaveMorning.Value.TimeOfDay.Subtract(TimeSpan.FromMinutes(1)))
-                _hasSavedMorning = false;
+            ShowOrActivateForm(ref _orderPlacementForm, () => new OrderPlacementForm(_orderManager, _tradeService, _marketDataService, this));
         }
 
-        private void _dtpAutoSaveMorning_ValueChanged(object? sender, EventArgs e)
+        public void OpenOrderReportForm()
         {
-            if (DateTime.Now.TimeOfDay < _dtpAutoSaveMorning.Value.TimeOfDay.Subtract(TimeSpan.FromMinutes(1)))
-                _hasSavedMorning = false;
+            ShowOrActivateForm(ref _orderReportForm, () => new OrderReportForm(_orderManager, _tradeService));
         }
 
-        private void _chkAutoSaveNight_CheckedChanged(object? sender, EventArgs e)
+        public void OpenOrderPlacementWithOption(string symbol, string? month = null, string? callPut = null, double? strike = null, BuySell? bs = null, double? price = null)
         {
-            _dtpAutoSaveNight.Enabled = !_chkAutoSaveNight.Checked;
-            if (_chkAutoSaveNight.Checked == true && DateTime.Now.TimeOfDay < _dtpAutoSaveNight.Value.TimeOfDay.Subtract(TimeSpan.FromMinutes(1)))
-                _hasSavedNight = false;
+            OpenOrderPlacementForm();
+            _orderPlacementForm?.SetDomesticOption(symbol, month, callPut, strike, bs, price);
         }
 
-        private void _dtpAutoSaveNight_ValueChanged(object? sender, EventArgs e)
+        public void OpenOrderPlacementWithFuture(string prod = "TXF", string? month = null, BuySell? bs = null, double? price = null)
         {
-            if (DateTime.Now.TimeOfDay < _dtpAutoSaveNight.Value.TimeOfDay.Subtract(TimeSpan.FromMinutes(1)))
-                _hasSavedNight = false;
+            OpenOrderPlacementForm();
+            _orderPlacementForm?.SetDomesticFuture(prod, month, bs, price);
         }
 
-        private void AutoSaveTimer_Tick(object sender, EventArgs e)
+        public void OpenOrderPlacementWithForeign(string exchange, string symbol, string month, BuySell? bs = null, double? price = null)
         {
-            // Morning Check
-            if (DateTime.Now.TimeOfDay < _dtpAutoSaveMorning.Value.TimeOfDay.Subtract(TimeSpan.FromMinutes(1)))
-            {
-                _hasSavedMorning = false;
-            }
-
-            if (_chkAutoSaveMorning.Checked && !_hasSavedMorning)
-            {
-                if (DateTime.Now.TimeOfDay >= _dtpAutoSaveMorning.Value.TimeOfDay)
-                {
-                    BtnSave_Click(this, EventArgs.Empty);
-                    _hasSavedMorning = true;
-                }
-            }
-
-            // Night Check
-            //if (DateTime.Now.TimeOfDay < _dtpAutoSaveNight.Value.TimeOfDay.Subtract(TimeSpan.FromMinutes(1)))
-            //{
-            //    _hasSavedNight = false;
-            //}
-
-            //if (_chkAutoSaveNight.Checked && !_hasSavedNight)
-            //{
-            //    if (DateTime.Now.TimeOfDay >= _dtpAutoSaveNight.Value.TimeOfDay)
-            //    {
-            //        BtnSave_Click(this, EventArgs.Empty);
-            //        _hasSavedNight = true;
-            //    }
-            //}
+            OpenOrderPlacementForm();
+            _orderPlacementForm?.SetForeignFuture(exchange, symbol, month, bs, price);
         }
 
-        private void CboExpiration_SelectedIndexChanged(object sender, EventArgs e)
+        private void btnTsPricing_Click(object? sender, EventArgs e)
         {
-            UpdateChart();
+            ShowOrActivateForm(ref _pricingForm, () => new OptionPricingForm(_quoteService, _storageManager, _marketDataService, _calendar));
         }
 
-        private void CboModel_SelectedIndexChanged(object sender, EventArgs e)
+        private void btnTsOrderPlacement_Click(object? sender, EventArgs e)
         {
-            if (_cboModel.SelectedItem != null && _currentChains != null)
-            {
-                if (Enum.TryParse(_cboModel.SelectedItem.ToString(), out SmoothingMethod selectedMethod))
-                {
-                    foreach (var chain in _currentChains.Values)
-                    {
-                        chain.VolatilityCurve.Method = selectedMethod;
-                    }
-                    UpdateChart();
-                }
-            }
+            OpenOrderPlacementForm();
         }
 
-        private void UpdateChart()
+        private void btnTsOrderReport_Click(object? sender, EventArgs e)
         {
-            if (_cboExpiration.SelectedItem == null || _currentChains == null) return;
-
-            string selectedKey = _cboExpiration.SelectedItem.ToString();
-
-            if (_currentChains.TryGetValue(selectedKey, out OptionChain chain))
-            {
-                _formsPlot.Plot.Clear();
-
-                // Display Futures Price in Title
-                _formsPlot.Plot.Title($"Implied Volatility Curve (Futures Price: {chain.UnderlyingPrice:F0})");
-
-                // Draw a vertical line for the Futures Price
-                var vline = _formsPlot.Plot.Add.VerticalLine(chain.UnderlyingPrice);
-                vline.Color = ScottPlot.Color.FromHex("#FFD700"); // Gold
-                vline.LinePattern = LinePattern.Dashed;
-                vline.LineWidth = 2;
-
-                var allOptions = chain.Calls.Concat(chain.Puts)
-                                      .Where(o => o.ImpliedVolatility > 0 && o.ImpliedVolatility <= 2.0)
-                                      .OrderBy(o => o.StrikePrice)
-                                      .ToList();
-
-                if (allOptions.Count == 0) return;
-
-                // Scatter Plot for Raw IMPV (Use OTM Option for Volatility: Call for K >= S, Put for K <= S)
-                var rawData = allOptions.GroupBy(o => o.StrikePrice)
-                                        .Select(g => new
-                                        {
-                                            K = g.Key,
-                                            V = g.Where(o => (o.IsCall && o.StrikePrice >= chain.UnderlyingPrice) || (!o.IsCall && o.StrikePrice <= chain.UnderlyingPrice))
-                                                 .Select(o => o.ImpliedVolatility)
-                                                 .DefaultIfEmpty(g.Average(o => o.ImpliedVolatility))
-                                                 .Average()
-                                        })
-                                        .ToList();
-
-                double[] strikes = rawData.Select(x => x.K).ToArray();
-                double[] impvs = rawData.Select(x => x.V).ToArray();
-
-                var scatter = _formsPlot.Plot.Add.ScatterPoints(strikes, impvs);
-                scatter.MarkerSize = 8;
-                scatter.Color = ScottPlot.Color.FromHex("#00BFFF"); // DeepSkyBlue
-
-                // Smoothed Curve Line (using VolatilityCurve object)
-                double minStrike = strikes.Min();
-                double maxStrike = strikes.Max();
-                int curvePoints = 100;
-                double[] curveX = new double[curvePoints];
-                double[] curveY = new double[curvePoints];
-
-                for (int i = 0; i < curvePoints; i++)
-                {
-                    double k = minStrike + i * (maxStrike - minStrike) / (curvePoints - 1);
-                    curveX[i] = k;
-                    curveY[i] = chain.VolatilityCurve.GetSmoothedVolatility(k);
-                }
-
-                var line = _formsPlot.Plot.Add.ScatterLine(curveX, curveY);
-                line.LineWidth = 3;
-                line.Color = ScottPlot.Color.FromHex("#FF6347"); // Tomato Red
-                line.LinePattern = LinePattern.Solid;
-
-                // Yesterday's Curve
-                var yestOptions = allOptions.Where(o => o.PreviousCloseIMPV > 0).ToList();
-                if (yestOptions.Count > 0)
-                {
-                    double ivShift = 0;
-                    if (_chkShift.Checked)
-                    {
-                        var atmOption = yestOptions.OrderBy(o => Math.Abs(o.StrikePrice - chain.UnderlyingPrice)).FirstOrDefault();
-                        if (atmOption != null)
-                        {
-                            ivShift = atmOption.SmoothedIMPV - atmOption.PreviousCloseIMPV;
-                        }
-                    }
-
-                    // Group by strike to avoid duplicate X values (Call/Put at same strike)
-                    var yestData = yestOptions.GroupBy(o => o.StrikePrice)
-                                              .Select(g => new
-                                              {
-                                                  K = g.Key,
-                                                  V = Math.Max(0.001, g.Average(o => o.PreviousCloseIMPV) + ivShift)
-                                              })
-                                              .OrderBy(x => x.K)
-                                              .ToList();
-
-                    double[] yestX = yestData.Select(x => x.K).ToArray();
-                    double[] yestY = yestData.Select(x => x.V).ToArray();
-
-                    var yestLine = _formsPlot.Plot.Add.ScatterLine(yestX, yestY);
-                    yestLine.LineWidth = 2;
-                    yestLine.Color = ScottPlot.Color.FromHex("#AAAAAA"); // Light Gray
-                    yestLine.LinePattern = LinePattern.Dashed;
-                }
-
-                ScottPlot.TickGenerators.NumericAutomatic tickGenY = new ScottPlot.TickGenerators.NumericAutomatic();
-                tickGenY.LabelFormatter = x => x.ToString("P2");
-                _formsPlot.Plot.Axes.Left.TickGenerator = tickGenY;
-
-                _formsPlot.Plot.Axes.AutoScale();
-                _formsPlot.Refresh();
-
-                // Update T-Quote DataGridView
-                UpdateTQuote(chain);
-            }
+            OpenOrderReportForm();
         }
 
-        private void UpdateTQuote(OptionChain chain)
+        private void btnTsDealReport_Click(object? sender, EventArgs e)
         {
-            var strikes = chain.Calls.Select(c => c.StrikePrice)
-                                     .Union(chain.Puts.Select(p => p.StrikePrice))
-                                     .OrderBy(s => s)
-                                     .ToList();
-
-            // We only show strikes that have some quote data to avoid massive empty tables
-            var validStrikes = strikes.Where(k =>
-                (chain.Calls.FirstOrDefault(c => c.StrikePrice == k)?.HasLastPrice ?? false) ||
-                (chain.Puts.FirstOrDefault(p => p.StrikePrice == k)?.HasLastPrice ?? false)
-            ).ToList();
-
-            if (validStrikes.Count == 0) validStrikes = strikes; // Fallback if no quotes
-
-            // Save scroll position
-            int scrollIndex = _dgvTQuote.FirstDisplayedScrollingRowIndex;
-
-            // Suspend layout to prevent flickering
-            _dgvTQuote.SuspendLayout();
-
-            // Match row count
-            if (_dgvTQuote.Rows.Count != validStrikes.Count)
-            {
-                _dgvTQuote.Rows.Clear();
-                if (validStrikes.Count > 0)
-                {
-                    _dgvTQuote.Rows.Add(validStrikes.Count);
-                }
-            }
-
-            double underlying = chain.UnderlyingPrice;
-            double atmStrike = validStrikes.OrderBy(k => Math.Abs(k - underlying)).FirstOrDefault();
-
-            for (int i = 0; i < validStrikes.Count; i++)
-            {
-                double k = validStrikes[i];
-                var call = chain.Calls.FirstOrDefault(c => c.StrikePrice == k);
-                var put = chain.Puts.FirstOrDefault(p => p.StrikePrice == k);
-
-                double otmIV = (k >= chain.UnderlyingPrice) ?
-                    (call?.ImpliedVolatility ?? 0) :
-                    (put?.ImpliedVolatility ?? 0);
-                string ivString = otmIV > 0 ? otmIV.ToString("P2") : "-";
-
-                var row = _dgvTQuote.Rows[i];
-
-                // Call side
-                row.Cells[0].Value = call?.Delta.ToString("F2") ?? "-";
-                row.Cells[1].Value = ivString;
-                row.Cells[2].Value = (call?.TheoreticalBid > 0) ? call.TheoreticalBid.ToString("F1") : "-";
-                row.Cells[3].Value = (call?.TheoreticalAsk > 0) ? call.TheoreticalAsk.ToString("F1") : "-";
-                row.Cells[4].Value = (call?.LastPrice > 0) ? call.LastPrice.ToString("F1") : "-";
-
-                // Strike
-                row.Cells[5].Value = k.ToString("F0");
-
-                // Put side
-                row.Cells[6].Value = (put?.LastPrice > 0) ? put.LastPrice.ToString("F1") : "-";
-                row.Cells[7].Value = (put?.TheoreticalBid > 0) ? put.TheoreticalBid.ToString("F1") : "-";
-                row.Cells[8].Value = (put?.TheoreticalAsk > 0) ? put.TheoreticalAsk.ToString("F1") : "-";
-                row.Cells[9].Value = ivString;
-                row.Cells[10].Value = put?.Delta.ToString("F2") ?? "-";
-
-                // Highlight ATM row and Strike column
-                if (k == atmStrike)
-                {
-                    row.DefaultCellStyle.BackColor = Color.FromArgb(0, 100, 0); // Dark Green for ATM
-                    row.DefaultCellStyle.ForeColor = Color.White;
-                    row.Cells[5].Style.BackColor = Color.FromArgb(0, 100, 0);
-                }
-                else
-                {
-                    row.DefaultCellStyle.BackColor = Color.FromArgb(18, 18, 18);
-                    row.DefaultCellStyle.ForeColor = Color.FromArgb(220, 220, 220);
-                    row.Cells[5].Style.BackColor = Color.FromArgb(0, 0, 100); // Dark Blue for non-ATM strike
-                }
-            }
-
-            _dgvTQuote.ResumeLayout();
-
-            // Restore scroll position
-            if (scrollIndex >= 0 && scrollIndex < _dgvTQuote.Rows.Count)
-            {
-                try
-                {
-                    _dgvTQuote.FirstDisplayedScrollingRowIndex = scrollIndex;
-                }
-                catch { }
-            }
+            ShowOrActivateForm(ref _dealReportForm, () => new DealReportForm(_orderManager, _tradeService));
         }
 
-        protected override void OnFormClosing(FormClosingEventArgs e)
+        private void btnTsPosition_Click(object? sender, EventArgs e)
         {
-            //if (_currentChains != null && _currentChains.Values.Count > 0)
-            //{
-            //    try
-            //    {
-            //        _storageManager.SaveSnapshot(_currentChains.Values);
-            //    }
-            //    catch { } // Prevent crash during close if file is locked
-            //}
-
-            _marketDataService.Stop();
-            _quoteService.Disconnect();
-            base.OnFormClosing(e);
+            ShowOrActivateForm(ref _positionForm, () => new PositionForm(_tradeService, _orderManager, _marketDataService));
         }
 
-   
+        private void btnTsMargin_Click(object? sender, EventArgs e)
+        {
+            ShowOrActivateForm(ref _marginEquityForm, () => new MarginEquityForm(_tradeService));
+        }
+
+        private void tsmExit_Click(object? sender, EventArgs e)
+        {
+            Close();
+        }
+
+        #endregion
     }
 }

@@ -2,6 +2,9 @@ using System;
 
 namespace KGIOptionPricing
 {
+    /// <summary>
+    /// Black-Scholes 選擇權定價模型數學庫，包含定價、Greeks (Delta, Gamma, Theta, Vega, Rho) 與隱含波動率計算。
+    /// </summary>
     public static class BlackScholesMath
     {
         private const double ONE_OVER_SQRT_2PI = 0.39894228040143267793994605993438;

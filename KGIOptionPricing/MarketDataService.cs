@@ -4,12 +4,19 @@ using System.Timers;
 
 namespace KGIOptionPricing
 {
+    /// <summary>
+    /// 市場資料服務：定時驅動報價更新、計算 Greeks 與 IV 曲線平滑。
+    /// </summary>
     public class MarketDataService
     {
+        private static readonly log4net.ILog log = log4net.LogManager.GetLogger(typeof(MarketDataService));
+
         private System.Timers.Timer _timer;
         private KGIQuoteService _quoteService;
         private IMPVStorageManager _storageManager;
         
+        public KGIQuoteService QuoteService => _quoteService;
+        public Dictionary<string, OptionChain> OptionChains => _quoteService.OptionChains;
         public double CurrentFuturesPrice { get; set; } = 45000; // Default fallback price, updated from KGI Quote
         public DateTime CurrentDate => DateTime.Now;
 
@@ -33,6 +40,7 @@ namespace KGIOptionPricing
         public void Stop()
         {
             _timer.Stop();
+            _timer.Dispose();
         }
 
         private void OnTimerElapsed(object? sender, ElapsedEventArgs e)
@@ -47,7 +55,7 @@ namespace KGIOptionPricing
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[MarketDataService Error] {ex.Message}");
+                log.Error($"[MarketDataService Error] {ex.Message}", ex);
             }
         }
     }

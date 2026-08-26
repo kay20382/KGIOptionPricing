@@ -5,11 +5,18 @@ using System.Linq;
 using Intelligence;
 using Package;
 using System.Diagnostics;
+using log4net;
 
 namespace KGIOptionPricing
 {
+    /// <summary>
+    /// KGI 報價服務：負責連接 KGI 報價 API，下載商品檔、訂閱選擇權並即時更新報價。
+    /// </summary>
     public class KGIQuoteService
     {
+        private static readonly ILog log = LogManager.GetLogger(typeof(KGIQuoteService));
+        private static readonly System.Collections.Concurrent.ConcurrentBag<object> _antiGcCrasher = new System.Collections.Concurrent.ConcurrentBag<object>();
+
         public event Action<string>? OnLogMessage;
         public event Action<Dictionary<string, OptionChain>>? OnOptionsDataUpdated;
 
@@ -25,6 +32,7 @@ namespace KGIOptionPricing
         public double RiskFreeRate { get; set; } = 0.02;
         
         private Dictionary<string, OptionChain> _optionChains = new Dictionary<string, OptionChain>();
+        public Dictionary<string, OptionChain> OptionChains => _optionChains;
         private ConcurrentDictionary<string, PI20080> _lastQuotes = new ConcurrentDictionary<string, PI20080>();
         private ConcurrentDictionary<string, double> _lastMatchPrices = new ConcurrentDictionary<string, double>();
         
@@ -124,21 +132,23 @@ namespace KGIOptionPricing
             {
                 if (_quote != null)
                 {
-                    _quote.Logout();
-                    _quote.Dispose();
+                    // 移除 _quote.Logout() 與 Dispose() 避免 COM DLL 內部 NullReferenceException
                 }
 
                 _quote = new QuoteCom(Host, Port, SourceID, Token);
+                _antiGcCrasher.Add(_quote); // 刻意 Leak，阻止 GC 回收 QuoteCom 與內部的 Login 物件
                 _quote.OnGetStatus += Quote_OnGetStatus;
                 _quote.OnRcvMessage += Quote_OnRcvMessage;
                 _quote.OnRecoverStatus += Quote_OnRecoverStatus;
                 
                 _quote.Connect(Host, Port);
                 
+                log.Info($"[KGI API] 正在連線到 {Host}:{Port}...");
                 OnLogMessage?.Invoke($"[KGI API] 正在連線到 {Host}:{Port}...");
             }
             catch (Exception ex)
             {
+                log.Error($"[KGI API Error] Connection failed: {ex.Message}", ex);
                 OnLogMessage?.Invoke($"[KGI API Error] Connection failed: {ex.Message}");
             }
         }
@@ -154,10 +164,12 @@ namespace KGIOptionPricing
 
             if (status == COM_STATUS.CONNECT_READY)
             {
+                log.Info("[KGI API] Connect ready, attempting login...");
                 _quote?.Login(UserID, Password, ' ');
             }
             else if (status == COM_STATUS.SUBSCRIBE && message == "TW.INFO")
             {
+                log.Info("[KGI API] 收到 TW.INFO，開始下載國內商品檔...");
                 OnLogMessage?.Invoke("[KGI API] 收到 TW.INFO，開始下載國內商品檔...");
                 _quote?.LoadTaifexProductXML();
             }
@@ -167,7 +179,9 @@ namespace KGIOptionPricing
         {
             if (status == RECOVER_STATUS.RS_DONE && topic == "ProductBaseSv1802.xml")
             {
+                log.Info("[KGI API] 國內商品檔下載完成，開始解析 TXO 合約...");
                 OnLogMessage?.Invoke("[KGI API] 國內商品檔下載完成，開始解析 TXO 合約...");
+                // for testing
                 BuildTXOChains();
             }
         }
@@ -290,8 +304,8 @@ namespace KGIOptionPricing
         {
             if (_quote != null)
             {
+                // 由於 DLL 已經被修補 (Patched)，我們現在可以安全地呼叫 Logout 與釋放資源
                 try { _quote.Logout(); } catch { }
-                try { _quote.Dispose(); } catch { }
                 try { System.Runtime.InteropServices.Marshal.FinalReleaseComObject(_quote); } catch { }
                 _quote = null;
             }

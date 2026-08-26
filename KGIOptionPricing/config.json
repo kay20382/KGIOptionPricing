@@ -12,8 +12,29 @@
     "Token": "b6eb"
   },
   "RiskDataOutputPath": ".\\RiskData.json",
+  "QuoteDisplayMode": 0,
   "RISK_FREE_RATE": 0.0,
-  "AutoExportIntervalSeconds": 15,
+  "AutoExportIntervalSeconds": 15000,
+  "TTM_Config": {
+    "Method": "ExactSeconds",
+    "DaysInYear": 240.0,
+    "MinTValue": 0.001,
+    "ExpirationTime": "13:30:00",
+    "IntradayWeights": [
+      {
+        "Name": "DaySession",
+        "StartTime": "08:45:00",
+        "EndTime": "13:45:00",
+        "Weight": 0.50
+      },
+      {
+        "Name": "NightSession",
+        "StartTime": "15:00:00",
+        "EndTime": "05:00:00",
+        "Weight": 0.50
+      }
+    ]
+  },
   "spreadconfig": [
     {
       "minBid": 0.0,

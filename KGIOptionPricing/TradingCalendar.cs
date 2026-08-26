@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
+using System.Text.Json;
 
 namespace KGIOptionPricing
 {
@@ -7,11 +9,99 @@ namespace KGIOptionPricing
     {
         private HashSet<DateTime> holidays;
         public double DaysInYear { get; set; } = 240.0;
+        public double MinTValue { get; set; } = 0.001;
+        public TimeSpan ExpirationTime { get; set; } = new TimeSpan(13, 30, 0);
+
+        public enum TtmMethod
+        {
+            Daily,
+            ExactSeconds
+        }
+
+        public TtmMethod Method { get; set; } = TtmMethod.ExactSeconds;
+
+        public class IntradayWeight
+        {
+            public string Name { get; set; } = string.Empty;
+            public TimeSpan StartTime { get; set; }
+            public TimeSpan EndTime { get; set; }
+            public double Weight { get; set; }
+
+            public bool CrossesMidnight => StartTime > EndTime;
+        }
+
+        public List<IntradayWeight> IntradayWeights { get; set; } = new List<IntradayWeight>()
+        {
+            new IntradayWeight { Name = "DaySession", StartTime = new TimeSpan(8, 45, 0), EndTime = new TimeSpan(13, 45, 0), Weight = 0.5 },
+            new IntradayWeight { Name = "NightSession", StartTime = new TimeSpan(15, 0, 0), EndTime = new TimeSpan(5, 0, 0), Weight = 0.5 }
+        };
 
         public TradingCalendar()
         {
             holidays = new HashSet<DateTime>();
             LoadHolidaysFromFile("holidays.txt");
+        }
+
+        public void LoadConfigFromJson(JsonElement root)
+        {
+            try
+            {
+                if (root.TryGetProperty("TTM_Config", out var ttmElem) && ttmElem.ValueKind == JsonValueKind.Object)
+                {
+                    if (ttmElem.TryGetProperty("Method", out var mElem) && !string.IsNullOrWhiteSpace(mElem.GetString()))
+                    {
+                        string mStr = mElem.GetString()!;
+                        if (Enum.TryParse<TtmMethod>(mStr, true, out var parsedMethod))
+                        {
+                            Method = parsedMethod;
+                        }
+                    }
+
+                    if (ttmElem.TryGetProperty("DaysInYear", out var diyElem) && diyElem.TryGetDouble(out double diyVal))
+                    {
+                        DaysInYear = diyVal > 0 ? diyVal : 240.0;
+                    }
+
+                    if (ttmElem.TryGetProperty("MinTValue", out var mtvElem) && mtvElem.TryGetDouble(out double mtvVal))
+                    {
+                        MinTValue = mtvVal >= 0 ? mtvVal : 0.001;
+                    }
+
+                    if (ttmElem.TryGetProperty("ExpirationTime", out var expElem) && TimeSpan.TryParse(expElem.GetString(), out TimeSpan expTs))
+                    {
+                        ExpirationTime = expTs;
+                    }
+
+                    if (ttmElem.TryGetProperty("IntradayWeights", out var weightsElem) && weightsElem.ValueKind == JsonValueKind.Array)
+                    {
+                        var newWeights = new List<IntradayWeight>();
+                        foreach (var wObj in weightsElem.EnumerateArray())
+                        {
+                            string name = wObj.TryGetProperty("Name", out var nEl) ? nEl.GetString() ?? "" : "";
+                            TimeSpan start = wObj.TryGetProperty("StartTime", out var sEl) && TimeSpan.TryParse(sEl.GetString(), out var st) ? st : TimeSpan.Zero;
+                            TimeSpan end = wObj.TryGetProperty("EndTime", out var eEl) && TimeSpan.TryParse(eEl.GetString(), out var et) ? et : TimeSpan.Zero;
+                            double wVal = wObj.TryGetProperty("Weight", out var wEl) && wEl.TryGetDouble(out var wv) ? wv : 0.0;
+
+                            newWeights.Add(new IntradayWeight
+                            {
+                                Name = name,
+                                StartTime = start,
+                                EndTime = end,
+                                Weight = wVal
+                            });
+                        }
+
+                        if (newWeights.Count > 0)
+                        {
+                            IntradayWeights = newWeights;
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[Calendar Config Error] {ex.Message}");
+            }
         }
 
         private void LoadHolidaysFromFile(string filePath)
@@ -36,24 +126,6 @@ namespace KGIOptionPricing
             }
         }
 
-        public void AddHoliday(DateTime holiday)
-        {
-            holidays.Add(holiday.Date);
-        }
-
-        public void AddHolidays(IEnumerable<DateTime> dates)
-        {
-            foreach (var d in dates)
-            {
-                holidays.Add(d.Date);
-            }
-        }
-
-        public void RemoveHoliday(DateTime holiday)
-        {
-            holidays.Remove(holiday.Date);
-        }
-
         public bool IsTradingDay(DateTime date)
         {
             if (date.DayOfWeek == DayOfWeek.Saturday || date.DayOfWeek == DayOfWeek.Sunday)
@@ -65,118 +137,138 @@ namespace KGIOptionPricing
             return true;
         }
 
-        public enum TtmMethod
+        public double CalculateTTM(DateTime startNow, DateTime endDate)
         {
-            CalendarDays,
-            TradingDays,
-            ExactSeconds,
-            WeightedIntraday
-        }
+            DateTime exactExpDateTime = endDate.Date.Add(ExpirationTime);
+            if (startNow >= exactExpDateTime) return MinTValue;
 
-        public TtmMethod Method { get; set; } = TtmMethod.TradingDays;
+            double daysRemaining = 0.0;
 
-        public class IntradayWeight
-        {
-            public TimeSpan StartTime { get; set; }
-            public TimeSpan EndTime { get; set; }
-            public double Weight { get; set; }
-
-            public bool CrossesMidnight => StartTime > EndTime;
-        }
-
-        public List<IntradayWeight> IntradayWeights { get; set; } = new List<IntradayWeight>()
-        {
-            new IntradayWeight { StartTime = new TimeSpan(8, 45, 0), EndTime = new TimeSpan(13, 45, 0), Weight = 0.5 },
-            new IntradayWeight { StartTime = new TimeSpan(15, 0, 0), EndTime = new TimeSpan(9, 30, 0), Weight = 0.1 }, // Crosses midnight
-            new IntradayWeight { StartTime = new TimeSpan(9, 30, 0), EndTime = new TimeSpan(5, 0, 0), Weight = 0.4 }   // Example config
-        };
-
-        public double CalculateTTM(DateTime startDate, DateTime endDate)
-        {
-            if (startDate.Date > endDate.Date) return 0.0;
-
-            double ttm = 0.0;
-            switch (Method)
+            if (Method == TtmMethod.Daily)
             {
-                case TtmMethod.CalendarDays:
-                    ttm = (endDate.Date - startDate.Date).TotalDays / 365.0;
-                    break;
-
-                case TtmMethod.ExactSeconds:
-                    // Assume 13:30 expiration for TXO
-                    DateTime exactEndTime = endDate.Date.AddHours(13).AddMinutes(30);
-                    ttm = (exactEndTime - startDate).TotalSeconds / (365.0 * 24 * 60 * 60);
-                    break;
-
-                case TtmMethod.WeightedIntraday:
-                    ttm = CalculateWeightedIntradayTTM(startDate, endDate) / DaysInYear;
-                    break;
-
-                case TtmMethod.TradingDays:
-                default:
-                    int tradingDays = 0;
-                    DateTime current = startDate.Date;
-                    DateTime end = endDate.Date;
-                    while (current < end)
-                    {
-                        if (IsTradingDay(current)) tradingDays++;
-                        current = current.AddDays(1);
-                    }
-                    ttm = tradingDays / DaysInYear;
-                    break;
+                int tradingDays = 0;
+                DateTime current = startNow.Date;
+                while (current < endDate.Date)
+                {
+                    if (IsTradingDay(current)) tradingDays++;
+                    current = current.AddDays(1);
+                }
+                daysRemaining = tradingDays;
+            }
+            else
+            {
+                daysRemaining = CalculateExactSecondsRemainingDays(startNow, exactExpDateTime);
             }
 
-            // Provide a minimum non-zero TTM on expiration day to prevent Black-Scholes IV calculation failure
-            if (ttm <= 0.0)
-            {
-                ttm = 0.001; // Small fraction of a year (roughly 0.25 of a trading day)
-            }
-
-            return ttm;
+            double ttm = daysRemaining / DaysInYear;
+            return Math.Max(ttm, MinTValue);
         }
 
-        private double CalculateWeightedIntradayTTM(DateTime start, DateTime end)
+        private double CalculateExactSecondsRemainingDays(DateTime startNow, DateTime exactExpDateTime)
         {
-            // A simplified heuristic: count full trading days + partial day weighting.
-            // For a robust intraday curve, we iterate minute by minute or exact overlap.
-            // To keep performance high, we'll calculate exact seconds of overlap for each interval.
-            double totalWeight = 0;
-            DateTime current = start;
+            double totalWeightDays = 0.0;
 
-            // Step by 1 minute
-            while (current < end)
+            // 1. Calculate remaining weight for TODAY (startNow -> 24:00)
+            if (IsTradingDay(startNow.Date))
+            {
+                totalWeightDays += CalculateDayRemainingWeight(startNow);
+            }
+
+            // 2. Calculate full trading days (tomorrow -> day before expiration)
+            DateTime current = startNow.Date.AddDays(1);
+            DateTime expDateOnly = exactExpDateTime.Date;
+            while (current < expDateOnly)
             {
                 if (IsTradingDay(current))
                 {
-                    TimeSpan tod = current.TimeOfDay;
-                    foreach (var w in IntradayWeights)
-                    {
-                        bool inInterval = false;
-                        if (w.CrossesMidnight)
-                        {
-                            inInterval = (tod >= w.StartTime || tod < w.EndTime);
-                        }
-                        else
-                        {
-                            inInterval = (tod >= w.StartTime && tod < w.EndTime);
-                        }
+                    totalWeightDays += 1.0;
+                }
+                current = current.AddDays(1);
+            }
 
-                        if (inInterval)
+            // 3. Calculate expiration day weight (00:00 -> exactExpDateTime)
+            if (startNow.Date <= expDateOnly && IsTradingDay(expDateOnly))
+            {
+                if (startNow.Date == expDateOnly)
+                {
+                    totalWeightDays = CalculateIntervalWeight(startNow, exactExpDateTime);
+                }
+                else
+                {
+                    DateTime expDayStart = expDateOnly;
+                    totalWeightDays += CalculateIntervalWeight(expDayStart, exactExpDateTime);
+                }
+            }
+
+            return totalWeightDays;
+        }
+
+        private double CalculateDayRemainingWeight(DateTime startNow)
+        {
+            DateTime endOfDay = startNow.Date.AddDays(1);
+            return CalculateIntervalWeight(startNow, endOfDay);
+        }
+
+        private double CalculateIntervalWeight(DateTime intervalStart, DateTime intervalEnd)
+        {
+            if (intervalStart >= intervalEnd) return 0.0;
+
+            double weightSum = 0.0;
+            TimeSpan startTime = intervalStart.TimeOfDay;
+            TimeSpan endTime = intervalEnd.TimeOfDay;
+
+            foreach (var w in IntradayWeights)
+            {
+                if (w.Weight <= 0) continue;
+
+                if (!w.CrossesMidnight)
+                {
+                    double totalSec = (w.EndTime - w.StartTime).TotalSeconds;
+                    if (totalSec <= 0) continue;
+
+                    TimeSpan overlapStart = startTime > w.StartTime ? startTime : w.StartTime;
+                    TimeSpan overlapEnd = endTime < w.EndTime ? endTime : w.EndTime;
+
+                    if (overlapStart < overlapEnd)
+                    {
+                        double overlapSec = (overlapEnd - overlapStart).TotalSeconds;
+                        weightSum += (overlapSec / totalSec) * w.Weight;
+                    }
+                }
+                else
+                {
+                    double part1TotalSec = (TimeSpan.FromHours(24) - w.StartTime).TotalSeconds;
+                    double part2TotalSec = w.EndTime.TotalSeconds;
+                    double totalSec = part1TotalSec + part2TotalSec;
+                    if (totalSec <= 0) continue;
+
+                    // Overlap with Part 1 (15:00 -> 24:00)
+                    if (startTime < TimeSpan.FromHours(24) && endTime > w.StartTime)
+                    {
+                        TimeSpan oStart = startTime > w.StartTime ? startTime : w.StartTime;
+                        TimeSpan oEnd = endTime;
+                        if (oStart < oEnd)
                         {
-                            // Weight per minute (assuming weight is for the whole interval block)
-                            double totalMinutes = w.CrossesMidnight 
-                                ? (TimeSpan.FromHours(24) - w.StartTime + w.EndTime).TotalMinutes
-                                : (w.EndTime - w.StartTime).TotalMinutes;
-                            
-                            totalWeight += w.Weight / totalMinutes;
-                            break;
+                            double oSec = (oEnd - oStart).TotalSeconds;
+                            weightSum += (oSec / totalSec) * w.Weight;
+                        }
+                    }
+
+                    // Overlap with Part 2 (00:00 -> 05:00)
+                    if (startTime < w.EndTime)
+                    {
+                        TimeSpan oStart = startTime;
+                        TimeSpan oEnd = endTime < w.EndTime ? endTime : w.EndTime;
+                        if (oStart < oEnd)
+                        {
+                            double oSec = (oEnd - oStart).TotalSeconds;
+                            weightSum += (oSec / totalSec) * w.Weight;
                         }
                     }
                 }
-                current = current.AddMinutes(1);
             }
 
-            return totalWeight;
+            return weightSum;
         }
     }
 }

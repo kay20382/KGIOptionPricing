@@ -8,9 +8,11 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <EnableUnsafeBinaryFormatterSerialization>true</EnableUnsafeBinaryFormatterSerialization>
     <SuppressTfmSupportBuildWarnings>true</SuppressTfmSupportBuildWarnings>
+    <ApplicationIcon>VICON.ico</ApplicationIcon>
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="log4net" Version="3.3.2" />
     <PackageReference Include="MathNet.Numerics" Version="5.0.0" />
     <PackageReference Include="ScottPlot.WinForms" Version="5.1.59" />
     <PackageReference Include="System.Text.Encoding.CodePages" Version="6.0.0" />
@@ -33,6 +35,9 @@
 
   <ItemGroup>
     <None Update="config.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="log4net.config">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
     <None Update="holidays.txt">
