@@ -19,6 +19,7 @@ TestQueuePricingUsesFrozenInwardBounds();
 TestQueuePricingHandlesZeroTargetOneTickSpreadAndInvalidBooks();
 TestQueuePricingSupportsDifferentTickSizes();
 TestQueuePricingRejectsOffTickBooksAndInvalidBounds();
+TestQueuePricingAllowsZeroChaseWithHalfTickAnchor();
 
 Console.WriteLine("PeriodicQueueCycle smoke tests passed.");
 
@@ -541,11 +542,11 @@ static void TestQueuePricingRejectsOffTickBooksAndInvalidBounds()
     var invalidBounds = new[]
     {
         new FrozenPriceBounds(102.5m, 0m, 110m, 95m),
+        new FrozenPriceBounds(0m, 5m, 110m, 95m),
+        new FrozenPriceBounds(102.5m, 5m, 0m, 95m),
+        new FrozenPriceBounds(102.5m, 5m, 110m, 0m),
         new FrozenPriceBounds(102.5m, 5m, 107.5m, 95m),
-        new FrozenPriceBounds(102.5m, 5m, 110m, 97.5m),
-        new FrozenPriceBounds(102.5m, 5m, 100m, 95m),
-        new FrozenPriceBounds(102.5m, 5m, 110m, 105m),
-        new FrozenPriceBounds(102.5m, 5m, 95m, 110m)
+        new FrozenPriceBounds(102.5m, 5m, 110m, 97.5m)
     };
     foreach (FrozenPriceBounds invalid in invalidBounds)
     {
@@ -558,6 +559,29 @@ static void TestQueuePricingRejectsOffTickBooksAndInvalidBounds()
         Assert(reprice.Action == QueuePriceAction.Hold && reprice.ReasonCode == "InvalidBounds",
             $"不一致 FrozenPriceBounds 必須在改掛判斷拒絕：{invalid}");
     }
+}
+
+static void TestQueuePricingAllowsZeroChaseWithHalfTickAnchor()
+{
+    var policy = new QueueCyclePricingPolicy();
+    FrozenPriceBounds zeroChase = QueueCyclePricingPolicy.CreateBounds(102.5m, 5m, 0m);
+    Assert(zeroChase.Anchor == 102.5m && zeroChase.BuyLimit == 100m && zeroChase.SellLimit == 105m,
+        $"半 Tick anchor 的零追價界線必須各自向內取整：{zeroChase.BuyLimit}/{zeroChase.SellLimit}");
+
+    MarketEvent oneTickBook = QueueBook(5m, 100m, 105m, new[] { 10 }, new[] { 7 });
+    QueuePriceDecision buy = policy.SelectInitial(BuySell.Buy, oneTickBook, 0, zeroChase);
+    QueuePriceDecision sell = policy.SelectInitial(BuySell.Sell, oneTickBook, 0, zeroChase);
+    Assert(buy.Action == QueuePriceAction.Place && buy.Price == 100m,
+        $"零追價買單必須受獨立買方上界限制在 100，實際 {buy.Action}/{buy.Price}");
+    Assert(sell.Action == QueuePriceAction.Place && sell.Price == 105m,
+        $"零追價賣單必須受獨立賣方下界限制在 105，實際 {sell.Action}/{sell.Price}");
+
+    FrozenPriceBounds independentlyValid = new(102.5m, 5m, 95m, 110m);
+    QueuePriceDecision independentBuy = policy.SelectInitial(BuySell.Buy, oneTickBook, 1, independentlyValid);
+    QueuePriceDecision independentSell = policy.SelectInitial(BuySell.Sell, oneTickBook, 1, independentlyValid);
+    Assert(independentBuy.Action == QueuePriceAction.Place && independentBuy.Price == 95m &&
+           independentSell.Action == QueuePriceAction.Place && independentSell.Price == 110m,
+        "只要兩側界線各自為正且對齊 Tick，就不得以跨側關係拒絕 FrozenPriceBounds");
 }
 
 static MarketEvent QueueBook(decimal tick, decimal bestBid, decimal bestAsk,

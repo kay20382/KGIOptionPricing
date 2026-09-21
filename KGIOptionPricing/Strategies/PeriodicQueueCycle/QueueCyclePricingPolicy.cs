@@ -153,10 +153,7 @@ public sealed class QueueCyclePricingPolicy
         bounds.BuyLimit > 0m &&
         bounds.SellLimit > 0m &&
         IsTickAligned(bounds.BuyLimit, bounds.TickSize) &&
-        IsTickAligned(bounds.SellLimit, bounds.TickSize) &&
-        bounds.BuyLimit >= bounds.Anchor &&
-        bounds.SellLimit <= bounds.Anchor &&
-        bounds.BuyLimit >= bounds.SellLimit;
+        IsTickAligned(bounds.SellLimit, bounds.TickSize);
 
     private static bool IsValidBook(MarketEvent book, decimal tickSize)
     {
