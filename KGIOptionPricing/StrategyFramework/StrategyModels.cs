@@ -125,7 +125,10 @@ public sealed record OrderLifecycleEvent
     public string ClientOrderId { get; init; } = string.Empty;
     public string OrderId { get; init; } = string.Empty;
     public string BrokerOrderId { get; init; } = string.Empty;
+    public OrderLifecycleState PreviousState { get; init; }
     public OrderLifecycleState State { get; init; }
+    public decimal Price { get; init; }
+    public int Quantity { get; init; }
     public int FilledQuantity { get; init; }
     public int RemainingQuantity { get; init; }
     public string ReasonCode { get; init; } = string.Empty;

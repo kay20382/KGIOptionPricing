@@ -26,11 +26,31 @@ var correlated = new PaperOrderRequest
 var lifecycle = new OrderLifecycleEvent
 {
     StrategyInstanceId = "managed", ClientOrderId = correlated.ClientOrderId,
-    OrderId = "SIM-managed-1", State = OrderLifecycleState.Working,
+    OrderId = "SIM-managed-1", PreviousState = OrderLifecycleState.Submitted,
+    State = OrderLifecycleState.Working, Price = 100m, Quantity = 1,
     FilledQuantity = 0, RemainingQuantity = 1
 };
-Assert(lifecycle.ClientOrderId == "cycle-1-buy-g1" && lifecycle.RemainingQuantity == 1,
-    "單張委託生命週期必須保留策略用戶端識別與剩餘數量");
+var correlatedOrder = new PaperOrder
+{
+    OrderId = "SIM-managed-1", ClientOrderId = correlated.ClientOrderId,
+    StrategyInstanceId = "managed", Symbol = "MC", Side = BuySell.Buy,
+    Type = PaperOrderType.BrokerLimit, Role = PaperOrderRole.EntryLong,
+    Price = 100m, Quantity = 1, State = PaperOrderState.Working
+};
+var correlatedExecution = new ExecutionEvent
+{
+    StrategyInstanceId = "managed", ClientOrderId = correlated.ClientOrderId,
+    OrderId = "SIM-managed-1", Symbol = "MC", Side = BuySell.Buy,
+    Role = PaperOrderRole.EntryLong, Price = 100m, Quantity = 1
+};
+Assert(lifecycle.ClientOrderId == "cycle-1-buy-g1" &&
+       lifecycle.PreviousState == OrderLifecycleState.Submitted &&
+       lifecycle.State == OrderLifecycleState.Working && lifecycle.Price == 100m &&
+       lifecycle.Quantity == 1 && lifecycle.RemainingQuantity == 1,
+    "單張委託生命週期必須保留前後狀態、價格、數量與策略用戶端識別");
+Assert(correlatedOrder.ClientOrderId == "cycle-1-buy-g1" &&
+       correlatedExecution.ClientOrderId == "cycle-1-buy-g1",
+    "工作委託與成交事件必須保留策略用戶端識別");
 
 var broker = new CrossPricePaperExecutionService(2m);
 var brokerFills = new List<ExecutionEvent>();
