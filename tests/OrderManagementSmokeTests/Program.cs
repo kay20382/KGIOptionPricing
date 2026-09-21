@@ -700,6 +700,33 @@ using (var host = new StrategyHost(hostSource))
         "broker 歸零後第二次 Remove 才可成功移除 runner");
 }
 
+var retainedGateway = new FakeLiveStrategyOrderGateway();
+var retainedService = CreateLiveService(retainedGateway, "retained-start-live");
+using (var retainedSource = new FakeHostMarketSource())
+using (var retainedHost = new StrategyHost(retainedSource))
+{
+    var retainedStrategy = new ThrowAfterOrderStartStrategy("retained-start-live", "225MC");
+    AssertThrows<AggregateException>(() => retainedHost.Add(
+            retainedStrategy,
+            new ResolvedStrategyUniverse
+            {
+                Tradable = new ResolvedProduct { ProductId = "225MC", Symbol = "225MC", TickSize = 5m, ContractMultiplier = 10m }
+            },
+            36m,
+            retainedService),
+        "Start 送出 active BrokerLimit 後 throw 時 Add 必須 fail closed 並保留可管理 Runner");
+    Assert(retainedHost.GetSnapshots().Any(x => x.InstanceId == "retained-start-live") &&
+           retainedService.ActiveBrokerOrderCount == 1,
+        "Start-after-order failure 必須保留 runner、active tracking 與 callback routes");
+    PaperOrder retainedOrder = retainedService.GetWorkingOrders("retained-start-live").Single();
+    AssertThrows<InvalidOperationException>(() => retainedHost.Remove("retained-start-live"),
+        "active orphan cleanup 不得偽裝成功");
+    retainedGateway.EmitFill(retainedOrder.OrderId, 1, 0, OrderStatus.Filled, 1, 65000d);
+    Assert(retainedStrategy.Executions.Count == 1 && retainedHost.Ledger
+            .GetPosition("retained-start-live", "225MC").NetQuantity == 1,
+        "retained Runner 必須繼續接收 late fill 並更新 ledger/strategy");
+}
+
 // 非法倒退 callback 不得讓終結單或 CancelPending 回到錯誤狀態。
 var raceGateway = new FakeLiveStrategyOrderGateway();
 var raceLifecycle = new List<OrderLifecycleEvent>();
@@ -984,6 +1011,37 @@ sealed class FakeHostMarketSource : IMarketEventSource
     public void Subscribe(IEnumerable<ResolvedProduct> products) { }
     public void Emit(MarketEvent marketEvent) => MarketEventReceived?.Invoke(marketEvent);
     public void Dispose() { }
+}
+
+sealed class ThrowAfterOrderStartStrategy : ISimulationStrategy, IManagedOrderStrategy
+{
+    private readonly string _symbol;
+    public ThrowAfterOrderStartStrategy(string instanceId, string symbol) { InstanceId = instanceId; _symbol = symbol; }
+    public string StrategyType => "ThrowAfterOrderStart";
+    public string InstanceId { get; }
+    public StrategyLifecycleState State { get; private set; } = StrategyLifecycleState.Created;
+    public List<ExecutionEvent> Executions { get; } = new();
+    public event Action<PaperOrderRequest>? OrderRequested;
+    public event Action? CancelAllRequested;
+    public event Action<StrategySnapshot>? SnapshotChanged { add { } remove { } }
+    public event Action<string>? CancelOrderRequested { add { } remove { } }
+    public void Start(StrategyRuntimeContext context)
+    {
+        OrderRequested?.Invoke(new PaperOrderRequest
+        {
+            StrategyInstanceId = InstanceId, ClientOrderId = "start-active-g1", Symbol = _symbol,
+            Side = BuySell.Buy, Type = PaperOrderType.BrokerLimit, Role = PaperOrderRole.EntryLong,
+            Price = 65000m, Quantity = 1
+        });
+        throw new InvalidOperationException("start failed after order");
+    }
+    public void OnOrderLifecycle(OrderLifecycleEvent orderEvent) { }
+    public void OnExecution(ExecutionEvent execution) => Executions.Add(execution);
+    public void OnMarketEvent(MarketEvent marketEvent) { }
+    public void Pause(string reason) => State = StrategyLifecycleState.Suspended;
+    public void Resume() => State = StrategyLifecycleState.Ready;
+    public void Stop(string reason) { CancelAllRequested?.Invoke(); State = StrategyLifecycleState.Stopped; }
+    public StrategySnapshot GetSnapshot() => new() { StrategyType = StrategyType, InstanceId = InstanceId, State = State };
 }
 
 sealed class HostManagedProbeStrategy : ISimulationStrategy, IManagedOrderStrategy

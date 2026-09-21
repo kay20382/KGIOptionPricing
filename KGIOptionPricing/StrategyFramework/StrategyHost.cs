@@ -48,7 +48,8 @@ public sealed class StrategyInstanceRunner : IDisposable
         PaperPortfolioLedger ledger,
         IStrategyClock clock,
         decimal commissionPerContract,
-        IStrategyExecutionService? executionService = null)
+        IStrategyExecutionService? executionService = null,
+        bool deferStart = false)
     {
         _strategy = strategy;
         _universe = universe;
@@ -69,9 +70,9 @@ public sealed class StrategyInstanceRunner : IDisposable
             _managedStrategy.CancelOrderRequested += OnCancelOrderRequested;
             _managedBroker.OrderLifecycleChanged += OnOrderLifecycleChanged;
         }
-        try
+        if (!deferStart) try
         {
-            _strategy.Start(new StrategyRuntimeContext(universe, clock, ledger));
+            Initialize();
         }
         catch
         {
@@ -85,6 +86,8 @@ public sealed class StrategyInstanceRunner : IDisposable
             throw;
         }
     }
+
+    internal void Initialize() => _strategy.Start(new StrategyRuntimeContext(_universe, _clock, _ledger));
 
     public bool UsesSymbol(string symbol) => _universe.AllProducts.Any(x =>
         string.Equals(x.Symbol, symbol, StringComparison.OrdinalIgnoreCase));
@@ -350,17 +353,34 @@ public sealed class StrategyHost : IDisposable
             _addThreadDepth[threadId] = depth + 1;
         }
         StrategyInstanceRunner? runner = null;
+        bool addSucceeded = false;
         try
         {
             _source.Subscribe(universe.AllProducts);
-            runner = new StrategyInstanceRunner(strategy, universe, _ledger, _clock, commissionPerContract, executionService);
+            runner = new StrategyInstanceRunner(strategy, universe, _ledger, _clock, commissionPerContract, executionService, deferStart: true);
             runner.SnapshotChanged += snapshot => SnapshotChanged?.Invoke(snapshot);
             runner.ExecutionOccurred += execution => ExecutionOccurred?.Invoke(execution);
             lock (_sync) _runners.Add(runner);
+            try { runner.Initialize(); }
+            catch (Exception startError)
+            {
+                try { runner.Dispose(); lock (_sync) _runners.Remove(runner); }
+                catch (Exception cleanupError)
+                {
+                    throw new AggregateException("策略 Start 失敗且仍有活動執行資源；Runner 已保留供安全關閉。", startError, cleanupError);
+                }
+                throw;
+            }
+            addSucceeded = true;
             return runner;
         }
         finally
         {
+            if (runner != null && addSucceeded)
+            {
+                try { PublishSnapshotSafely(runner.GetSnapshot()); }
+                catch (ObjectDisposedException) { }
+            }
             lock (_sync)
             {
                 int threadId = Environment.CurrentManagedThreadId;
@@ -371,11 +391,6 @@ public sealed class StrategyHost : IDisposable
                 }
                 _activeAdds--;
                 Monitor.PulseAll(_sync);
-            }
-            if (runner != null)
-            {
-                try { PublishSnapshotSafely(runner.GetSnapshot()); }
-                catch (ObjectDisposedException) { }
             }
         }
     }

@@ -283,13 +283,43 @@ var selfDisposeSource = new TransactionalSource();
 using (var selfDisposeHost = new StrategyHost(selfDisposeSource))
 {
     selfDisposeSource.Host = selfDisposeHost;
+    Exception? snapshotSelfDisposeFailure = null;
+    selfDisposeHost.SnapshotChanged += _ =>
+    {
+        try { selfDisposeHost.Dispose(); }
+        catch (Exception exception) { snapshotSelfDisposeFailure = exception; }
+    };
     selfDisposeHost.SnapshotChanged += _ => throw new InvalidOperationException("subscriber failure");
     StrategyInstanceRunner added = selfDisposeHost.Add(
         new HeartbeatProbeStrategy("self-dispose-add"),
         new ResolvedStrategyUniverse { Tradable = Product("225MC", "TXD", 5m, 10m) });
     Assert(selfDisposeSource.SelfDisposeFailure is InvalidOperationException &&
+           snapshotSelfDisposeFailure is InvalidOperationException &&
            selfDisposeHost.GetSnapshots().Count == 1 && added.InstanceId == "self-dispose-add",
         "Add owner thread self-dispose 必須 fail closed，初始 snapshot subscriber 例外不得回滾成功 Add");
+}
+using (var publishBarrierHost = new StrategyHost(new FakeSource()))
+{
+    using var initialPublishEntered = new ManualResetEventSlim(false);
+    using var releaseInitialPublish = new ManualResetEventSlim(false);
+    publishBarrierHost.SnapshotChanged += _ =>
+    {
+        initialPublishEntered.Set();
+        releaseInitialPublish.Wait();
+    };
+    Task<StrategyInstanceRunner> addDuringPublish = Task.Factory.StartNew(
+        () => publishBarrierHost.Add(
+            new HeartbeatProbeStrategy("publish-barrier"),
+            new ResolvedStrategyUniverse { Tradable = Product("225MC", "TXB", 5m, 10m) }),
+        CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+    Assert(initialPublishEntered.Wait(TimeSpan.FromSeconds(5)), "測試前置：初始 snapshot subscriber 必須進入 barrier");
+    Task disposeDuringPublish = Task.Factory.StartNew(
+        publishBarrierHost.Dispose, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+    bool disposedBeforePublishReleased = disposeDuringPublish.Wait(TimeSpan.FromMilliseconds(100));
+    releaseInitialPublish.Set();
+    Assert(addDuringPublish.Wait(TimeSpan.FromSeconds(5)) && disposeDuringPublish.Wait(TimeSpan.FromSeconds(5)) &&
+           !disposedBeforePublishReleased,
+        "外部 Dispose 必須等待 initial snapshot 發布與 add lease 完整結束");
 }
 
 var serializedClock = new MutableStrategyClock(heartbeatTime);
