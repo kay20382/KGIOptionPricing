@@ -145,12 +145,12 @@ public sealed class StrategySimulationService : IDisposable
     public void Dispose()
     {
         if (_disposed) return;
-        _disposed = true;
         _heartbeat.Dispose();
+        _liveHost.Dispose();
         _liveHost.SnapshotChanged -= OnSnapshot;
         _liveHost.ExecutionOccurred -= OnExecution;
-        _liveHost.Dispose();
         _liveRecorder.Dispose();
+        _disposed = true;
     }
 
     private sealed class ReplayStrategyClock : IEventDrivenStrategyClock

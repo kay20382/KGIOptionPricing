@@ -602,6 +602,32 @@ Assert(disposeExecutions.Count == 1 && disposeLifecycle.Last().State == OrderLif
     "Dispose 失敗後仍須接收 late fill，並在成交後歸零 active count");
 disposeService.Dispose();
 
+// Terminal state is not safe to dispose until its execution/lifecycle callbacks are delivered.
+using var fillReadyToPublish = new ManualResetEventSlim(false);
+using var releaseFillPublish = new ManualResetEventSlim(false);
+var drainGateway = new FakeLiveStrategyOrderGateway();
+var drainExecutions = new List<ExecutionEvent>();
+var drainService = CreateLiveService(drainGateway, "drain-live", beforeFilledPublished: () =>
+{
+    fillReadyToPublish.Set();
+    releaseFillPublish.Wait();
+});
+drainService.Filled += drainExecutions.Add;
+PaperOrder drainOrder = drainService.Submit(
+    liveBuy with { StrategyInstanceId = "drain-live", ClientOrderId = "drain-g1" }, DateTimeOffset.UtcNow);
+Task emitBlockedFill = Task.Factory.StartNew(
+    () => drainGateway.EmitFill(drainOrder.OrderId, 1, 0, OrderStatus.Filled, 1, 65000d),
+    CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+Assert(fillReadyToPublish.Wait(TimeSpan.FromSeconds(5)), "測試前置：fill callback 必須停在發布 Filled 前");
+Task drainDispose = Task.Factory.StartNew(
+    drainService.Dispose, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+bool disposeReturnedBeforePublish = drainDispose.Wait(TimeSpan.FromMilliseconds(100));
+Assert(drainExecutions.Count == 0, "阻塞期間 execution 尚不得被誤判為已發布");
+releaseFillPublish.Set();
+Assert(Task.WaitAll(new[] { emitBlockedFill, drainDispose }, TimeSpan.FromSeconds(5)) &&
+       !disposeReturnedBeforePublish && drainExecutions.Count == 1,
+    "Dispose 必須等待 terminal-but-undelivered broker callback 完整送入 ledger/strategy 路由後才能成功");
+
 // StrategyHost.Remove 必須在 broker Dispose 成功後才移除 runner 或解除路由。
 var hostGateway = new FakeLiveStrategyOrderGateway();
 var hostService = CreateLiveService(hostGateway, "host-live");
@@ -714,7 +740,8 @@ Console.WriteLine("OrderManagement smoke tests passed.");
 static KgiLiveStrategyExecutionService CreateLiveService(
     ILiveStrategyOrderGateway gateway,
     string instanceId,
-    Func<DateTimeOffset>? now = null) => new(
+    Func<DateTimeOffset>? now = null,
+    Action? beforeFilledPublished = null) => new(
         gateway,
         instanceId,
         new ResolvedProduct { ProductId = "225MC", Symbol = "225MC", TickSize = 5m, ContractMultiplier = 10m },
@@ -724,7 +751,8 @@ static KgiLiveStrategyExecutionService CreateLiveService(
             ComYM2 = "202609", CPF = CPFEnum.Futures, ComType = '0'
         },
         36m,
-        now);
+        now,
+        beforeFilledPublished);
 
 static InstrumentKey ForeignInstrument() => new()
 {

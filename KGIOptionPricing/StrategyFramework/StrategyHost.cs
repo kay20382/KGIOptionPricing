@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
+using System.Runtime.ExceptionServices;
 using System.Threading;
 using KGIOptionPricing.StrategyFramework.Execution;
 using KGIOptionPricing.StrategyFramework.Performance;
@@ -28,9 +29,12 @@ public sealed class StrategyInstanceRunner : IDisposable
     private readonly IStrategyClock _clock;
     private readonly IManagedOrderStrategy? _managedStrategy;
     private readonly IManagedStrategyExecutionService? _managedBroker;
-    private readonly ManualResetEventSlim _disposeCompleted = new(false);
     private bool _disposed;
     private bool _disposing;
+    private int _disposeOwnerThreadId;
+    private int _disposeAttempt;
+    private int _failedDisposeAttempt;
+    private Exception? _lastDisposeException;
     private bool _paused;
 
     public string InstanceId => _strategy.InstanceId;
@@ -231,17 +235,23 @@ public sealed class StrategyInstanceRunner : IDisposable
 
     public void Dispose()
     {
-        bool disposeOwner;
+        int attempt;
         lock (_sync)
         {
             if (_disposed) return;
-            disposeOwner = !_disposing;
-            if (disposeOwner) _disposing = true;
-        }
-        if (!disposeOwner)
-        {
-            _disposeCompleted.Wait();
-            return;
+            if (_disposing)
+            {
+                if (_disposeOwnerThreadId == Environment.CurrentManagedThreadId)
+                    throw new InvalidOperationException("Runner 不可在 Dispose callback 中同步再次 Dispose。");
+                attempt = _disposeAttempt;
+                while (_disposing && attempt == _disposeAttempt) Monitor.Wait(_sync);
+                if (_disposed) return;
+                if (_failedDisposeAttempt == attempt && _lastDisposeException != null)
+                    ExceptionDispatchInfo.Capture(_lastDisposeException).Throw();
+            }
+            _disposing = true;
+            _disposeOwnerThreadId = Environment.CurrentManagedThreadId;
+            attempt = ++_disposeAttempt;
         }
 
         // The live broker is fail-closed. Dispose it before mutating runner
@@ -261,9 +271,23 @@ public sealed class StrategyInstanceRunner : IDisposable
                 if (_managedBroker != null) _managedBroker.OrderLifecycleChanged -= OnOrderLifecycleChanged;
             }
         }
+        catch (Exception exception)
+        {
+            lock (_sync)
+            {
+                _lastDisposeException = exception;
+                _failedDisposeAttempt = attempt;
+            }
+            throw;
+        }
         finally
         {
-            _disposeCompleted.Set();
+            lock (_sync)
+            {
+                _disposing = false;
+                _disposeOwnerThreadId = 0;
+                Monitor.PulseAll(_sync);
+            }
         }
     }
 }
@@ -367,10 +391,14 @@ public sealed class StrategyHost : IDisposable
 
     public void Dispose()
     {
-        _source.MarketEventReceived -= OnMarketEvent;
         StrategyInstanceRunner[] runners;
-        lock (_sync) { runners = _runners.ToArray(); _runners.Clear(); }
-        foreach (StrategyInstanceRunner runner in runners) runner.Dispose();
+        lock (_sync) runners = _runners.ToArray();
+        foreach (StrategyInstanceRunner runner in runners)
+        {
+            runner.Dispose();
+            lock (_sync) _runners.Remove(runner);
+        }
+        _source.MarketEventReceived -= OnMarketEvent;
         _source.Dispose();
     }
 }
@@ -412,14 +440,10 @@ internal sealed class StrategyHeartbeatTimer : IDisposable
 
     public void Dispose()
     {
+        if (Volatile.Read(ref _callbackThreadId) == Environment.CurrentManagedThreadId)
+            throw new InvalidOperationException("Heartbeat callback 不可同步釋放自己的 timer；請由外部執行緒重試。");
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
         _timer.Change(Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
-        if (Volatile.Read(ref _callbackThreadId) == Environment.CurrentManagedThreadId)
-        {
-            // Waiting for the current callback from inside that callback would deadlock.
-            _timer.Dispose();
-            return;
-        }
         using var drained = new ManualResetEvent(false);
         if (_timer.Dispose(drained)) drained.WaitOne();
     }

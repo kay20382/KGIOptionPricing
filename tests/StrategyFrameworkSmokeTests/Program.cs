@@ -329,6 +329,59 @@ Assert(disposeHeartbeatTimer.Wait(TimeSpan.FromSeconds(5)),
 Assert(!timerDisposeReturnedBeforeCallback,
     "timer callback 尚未結束時 Dispose 不得先返回並讓 host 被釋放");
 
+using var selfDisposeEntered = new ManualResetEventSlim(false);
+using var allowSelfDispose = new ManualResetEventSlim(false);
+using var selfDisposeFinished = new ManualResetEventSlim(false);
+IDisposable? selfDisposingTimer = null;
+Exception? selfDisposeFailure = null;
+Action<DateTimeOffset> selfDisposingPulse = _ =>
+{
+    selfDisposeEntered.Set();
+    allowSelfDispose.Wait();
+    try { selfDisposingTimer!.Dispose(); }
+    catch (Exception exception) { selfDisposeFailure = exception; }
+    finally { selfDisposeFinished.Set(); }
+};
+selfDisposingTimer = (IDisposable)Activator.CreateInstance(
+    heartbeatTimerType,
+    BindingFlags.Instance | BindingFlags.NonPublic,
+    binder: null,
+    args: new object?[] { selfDisposingPulse, TimeSpan.FromMilliseconds(1) },
+    culture: null)!;
+Assert(selfDisposeEntered.Wait(TimeSpan.FromSeconds(5)), "測試前置：self-dispose heartbeat 必須開始");
+allowSelfDispose.Set();
+Assert(selfDisposeFinished.Wait(TimeSpan.FromSeconds(5)) && selfDisposeFailure is InvalidOperationException,
+    "heartbeat callback 同步 Dispose 必須 fail closed，不得回傳成功後繼續拆 host");
+selfDisposingTimer.Dispose();
+
+var retryBroker = new FirstDisposeFailsExecutionService();
+var retryStrategy = new DisposalProbeStrategy("dispose-retry", "DRY");
+var retryLedger = new PaperPortfolioLedger();
+var retryRunner = new StrategyInstanceRunner(
+    retryStrategy,
+    new ResolvedStrategyUniverse { Tradable = Product("225MC", "DRY", 5m, 10m) },
+    retryLedger, new MutableStrategyClock(heartbeatTime), 0m, retryBroker);
+Task firstDispose = Task.Factory.StartNew(retryRunner.Dispose, CancellationToken.None,
+    TaskCreationOptions.LongRunning, TaskScheduler.Default);
+Assert(retryBroker.DisposeEntered.Wait(TimeSpan.FromSeconds(5)), "測試前置：第一次 broker Dispose 必須阻塞");
+Task waitingDispose = Task.Factory.StartNew(retryRunner.Dispose, CancellationToken.None,
+    TaskCreationOptions.LongRunning, TaskScheduler.Default);
+retryBroker.ReleaseDispose.Set();
+try { Task.WaitAll(new[] { firstDispose, waitingDispose }, TimeSpan.FromSeconds(5)); } catch (AggregateException) { }
+Assert(firstDispose.IsFaulted && waitingDispose.IsFaulted && retryBroker.DisposeCalls == 1,
+    "同一 Dispose attempt 的 owner/waiter 必須收到相同失敗，不得把 waiter 誤認成功");
+retryRunner.Pulse(heartbeatTime.AddSeconds(2));
+retryBroker.RaiseFill(new ExecutionEvent
+{
+    StrategyInstanceId = retryStrategy.InstanceId, Symbol = "DRY", Side = BuySell.Buy,
+    Role = PaperOrderRole.EntryLong, Price = 100m, Quantity = 1
+});
+Assert(retryStrategy.HeartbeatCount == 1 && retryStrategy.ExecutionCount == 1 &&
+       retryLedger.GetPosition(retryStrategy.InstanceId, "DRY").NetQuantity == 1,
+    "Dispose 失敗後必須復原 disposing，heartbeat 與 late fill 路由仍保持有效");
+retryBroker.FailDispose = false;
+retryRunner.Dispose();
+
 // Shared ledger: strategies read, runner writes.
 var ledger = new PaperPortfolioLedger();
 var product = Product("225MC", "MC", 5m, 10m);
@@ -857,6 +910,55 @@ sealed class ConcurrentCallbackExecutionService : IManagedStrategyExecutionServi
     public event Action<OrderLifecycleEvent>? OrderLifecycleChanged;
     public void RaiseFill(ExecutionEvent execution) => Filled?.Invoke(execution);
     public void RaiseLifecycle(OrderLifecycleEvent orderEvent) => OrderLifecycleChanged?.Invoke(orderEvent);
+    public PaperOrder Submit(PaperOrderRequest request, DateTimeOffset now) => throw new NotSupportedException();
+    public bool Cancel(string orderId) => false;
+    public int CancelAll(string strategyInstanceId) => 0;
+    public bool CancelByClientOrderId(string strategyInstanceId, string clientOrderId) => false;
+    public IReadOnlyList<PaperOrder> GetWorkingOrders(string strategyInstanceId) => Array.Empty<PaperOrder>();
+    public void OnMarketEvent(MarketEvent marketEvent) { }
+}
+
+sealed class DisposalProbeStrategy : ISimulationStrategy, IManagedOrderStrategy, IStrategyHeartbeat
+{
+    public DisposalProbeStrategy(string instanceId, string symbol) { InstanceId = instanceId; }
+    public string StrategyType => "DisposalProbe";
+    public string InstanceId { get; }
+    public StrategyLifecycleState State { get; private set; } = StrategyLifecycleState.Created;
+    public int HeartbeatCount { get; private set; }
+    public int ExecutionCount { get; private set; }
+    public event Action<PaperOrderRequest>? OrderRequested { add { } remove { } }
+    public event Action? CancelAllRequested { add { } remove { } }
+    public event Action<StrategySnapshot>? SnapshotChanged { add { } remove { } }
+    public event Action<string>? CancelOrderRequested { add { } remove { } }
+    public void Start(StrategyRuntimeContext context) => State = StrategyLifecycleState.Ready;
+    public void OnHeartbeat(DateTimeOffset now) => HeartbeatCount++;
+    public void OnOrderLifecycle(OrderLifecycleEvent orderEvent) { }
+    public void OnMarketEvent(MarketEvent marketEvent) { }
+    public void OnExecution(ExecutionEvent execution) => ExecutionCount++;
+    public void Pause(string reason) => State = StrategyLifecycleState.Suspended;
+    public void Resume() => State = StrategyLifecycleState.Ready;
+    public void Stop(string reason) => State = StrategyLifecycleState.Stopped;
+    public StrategySnapshot GetSnapshot() => new() { StrategyType = StrategyType, InstanceId = InstanceId, State = State };
+}
+
+sealed class FirstDisposeFailsExecutionService : IManagedStrategyExecutionService, IDisposable
+{
+    public ManualResetEventSlim DisposeEntered { get; } = new(false);
+    public ManualResetEventSlim ReleaseDispose { get; } = new(false);
+    public bool FailDispose { get; set; } = true;
+    public int DisposeCalls;
+    public event Action<ExecutionEvent>? Filled;
+    public event Action<string>? Failed { add { } remove { } }
+    public event Action<OrderLifecycleEvent>? OrderLifecycleChanged { add { } remove { } }
+    public void RaiseFill(ExecutionEvent execution) => Filled?.Invoke(execution);
+    public void Dispose()
+    {
+        Interlocked.Increment(ref DisposeCalls);
+        if (!FailDispose) return;
+        DisposeEntered.Set();
+        ReleaseDispose.Wait();
+        throw new InvalidOperationException("expected dispose failure");
+    }
     public PaperOrder Submit(PaperOrderRequest request, DateTimeOffset now) => throw new NotSupportedException();
     public bool Cancel(string orderId) => false;
     public int CancelAll(string strategyInstanceId) => 0;

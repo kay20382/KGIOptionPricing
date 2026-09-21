@@ -222,11 +222,11 @@ public sealed class LiveStrategyService : IDisposable
     public void Dispose()
     {
         if (_disposed) return;
-        _disposed = true;
         _heartbeat.Dispose();
         foreach (StrategySnapshot snapshot in _host.GetSnapshots().ToArray())
             EmergencyStop(snapshot.InstanceId, "程式關閉，實盤策略緊急停止");
         _host.SnapshotChanged -= OnSnapshot;
         _host.Dispose();
+        _disposed = true;
     }
 }

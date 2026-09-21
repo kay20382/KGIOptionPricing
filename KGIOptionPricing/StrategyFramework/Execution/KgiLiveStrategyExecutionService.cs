@@ -37,11 +37,15 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
     private readonly InstrumentKey _instrument;
     private readonly decimal _commission;
     private readonly Func<DateTimeOffset> _now;
+    private readonly Action? _beforeFilledPublished;
     private readonly Dictionary<string, PaperOrder> _conditions = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, TrackedRealOrder> _realOrders = new(StringComparer.OrdinalIgnoreCase);
     private long _localSequence;
     private long _executionSequence;
     private bool _disposed;
+    private bool _disposing;
+    private int _inflightCallbacks;
+    private readonly HashSet<int> _callbackThreads = new();
 
     public event Action<ExecutionEvent>? Filled;
     public event Action<string>? Failed;
@@ -78,13 +82,15 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         ResolvedProduct product,
         ContractInfo contract,
         decimal commissionPerContract,
-        Func<DateTimeOffset>? now = null)
+        Func<DateTimeOffset>? now = null,
+        Action? beforeFilledPublished = null)
     {
         _gateway = gateway ?? throw new ArgumentNullException(nameof(gateway));
         _instanceId = instanceId;
         _quoteSymbol = product.Symbol;
         _commission = Math.Max(0m, commissionPerContract);
         _now = now ?? (() => DateTimeOffset.Now);
+        _beforeFilledPublished = beforeFilledPublished;
         _instrument = LiveStrategyOrderMapper.ToInstrument(contract);
         _gateway.OrderFilled += OnOrderFilled;
         _gateway.OrderFailed += OnOrderFailed;
@@ -347,7 +353,9 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
 
     private void OnOrderFilled(OrderInfo brokerOrder, int quantity, double price)
     {
-        if (_disposed) return;
+        if (!TryEnterCallback()) return;
+        try
+        {
         ExecutionEvent? execution = null;
         OrderLifecycleEvent? lifecycle = null;
         bool legacyTerminal = false;
@@ -402,9 +410,15 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         }
 
         // Match paper execution ordering: ledger first, then terminal lifecycle.
+        _beforeFilledPublished?.Invoke();
         Filled?.Invoke(execution);
         if (lifecycle != null) OrderLifecycleChanged?.Invoke(lifecycle);
         if (execution != null || lifecycle != null || legacyTerminal) StateChanged?.Invoke();
+        }
+        finally
+        {
+            ExitCallback();
+        }
     }
 
     private void OnOrderFailed(OrderInfo brokerOrder, string reason)
@@ -655,14 +669,21 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
 
     public void Dispose()
     {
-        if (_disposed) return;
         lock (_sync)
         {
+            if (_disposed) return;
+            if (_callbackThreads.Contains(Environment.CurrentManagedThreadId))
+                throw new InvalidOperationException("實盤 broker callback 不可同步釋放自己的執行器。");
+            if (_disposing)
+            {
+                while (_disposing) Monitor.Wait(_sync);
+                if (_disposed) return;
+            }
             PurgeExpiredTerminalsLocked(_now());
             int active = _realOrders.Values.Count(x => !x.Terminal);
             if (active > 0)
                 throw new InvalidOperationException($"仍有 {active} 張實盤委託未終結，禁止釋放執行器。");
-            _disposed = true;
+            _disposing = true;
         }
         _gateway.OrderFilled -= OnOrderFilled;
         _gateway.OrderFailed -= OnOrderFailed;
@@ -671,10 +692,35 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         bool changed;
         lock (_sync)
         {
+            while (_inflightCallbacks > 0) Monitor.Wait(_sync);
+            _disposed = true;
             changed = _conditions.Count > 0 || _realOrders.Count > 0;
             _conditions.Clear();
             _realOrders.Clear();
+            _disposing = false;
+            Monitor.PulseAll(_sync);
         }
         if (changed) StateChanged?.Invoke();
+    }
+
+    private bool TryEnterCallback()
+    {
+        lock (_sync)
+        {
+            if (_disposed) return false;
+            _inflightCallbacks++;
+            _callbackThreads.Add(Environment.CurrentManagedThreadId);
+            return true;
+        }
+    }
+
+    private void ExitCallback()
+    {
+        lock (_sync)
+        {
+            _callbackThreads.Remove(Environment.CurrentManagedThreadId);
+            _inflightCallbacks--;
+            if (_inflightCallbacks == 0) Monitor.PulseAll(_sync);
+        }
     }
 }
