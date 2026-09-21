@@ -76,7 +76,8 @@ internal sealed class QueueCycleOrderCoordinator
         !_buy.HasFill && !_sell.HasFill;
     internal bool HasOutstandingOrders => IsOutstanding(_buy) || IsOutstanding(_sell) ||
         (_exitClientOrderId is not null && _exitState is LegState.Working or LegState.CancelPending);
-    internal bool EntryOrdersTerminal => !IsOutstanding(_buy) && !IsOutstanding(_sell);
+    internal bool EntryOrdersTerminal => !IsOutstanding(_buy) && !IsOutstanding(_sell) &&
+        !HasUnreconciledFill(_buy) && !HasUnreconciledFill(_sell);
     internal bool HasBothEntryFills => _buy?.HasFill == true && _sell?.HasFill == true;
     internal string CycleSummary =>
         $"Cycle={_buy?.CycleId ?? "none"};Direction={FrozenDirection};" +
@@ -315,17 +316,10 @@ internal sealed class QueueCycleOrderCoordinator
             case OrderLifecycleState.CancelPending when leg.State == LegState.CancelPending:
                 return;
             case OrderLifecycleState.Filled:
-                if (!leg.FilledClientOrderIds.Add(orderEvent.ClientOrderId)) return;
-                if (leg.HasFill)
-                {
-                    CancelWithoutReplacement(ReferenceEquals(leg, _buy) ? _sell : _buy, CancelIntent.Fault);
-                    Phase = QueueCyclePhase.Faulted;
-                    ReasonCode = "DuplicateGenerationFill";
-                    return;
-                }
-                leg.HasFill = true;
                 leg.State = LegState.Filled;
                 leg.PendingReplacementPrice = null;
+                leg.CancelIntent = CancelIntent.None;
+                ReasonCode = "FillAwaitingExecution";
                 UpdateWorkingPhase();
                 return;
             case OrderLifecycleState.Cancelled when leg.State == LegState.CancelPending:
@@ -531,6 +525,9 @@ internal sealed class QueueCycleOrderCoordinator
 
     private static bool IsOutstanding(OrderLeg? leg) =>
         leg is { Submitted: true, State: LegState.Working or LegState.CancelPending };
+
+    private static bool HasUnreconciledFill(OrderLeg? leg) =>
+        leg is { State: LegState.Filled, HasFill: false };
 
     private static string LegSummary(OrderLeg? leg) => leg is null
         ? "none"

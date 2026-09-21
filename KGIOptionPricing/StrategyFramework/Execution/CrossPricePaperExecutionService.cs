@@ -7,7 +7,7 @@ namespace KGIOptionPricing.StrategyFramework.Execution;
 
 /// <summary>
 /// Deterministic paper broker. A touch does not fill; a trade must pass strictly through
-/// the order price. Fills are booked at the requested price, never at a favourable price.
+/// limit/stop prices. Those fills use the requested price; Market fills use the next trade price.
 /// </summary>
 public sealed class CrossPricePaperExecutionService : IPaperExecutionService, IManagedStrategyExecutionService
 {
@@ -154,7 +154,7 @@ public sealed class CrossPricePaperExecutionService : IPaperExecutionService, IM
                     Symbol = order.Symbol,
                     Side = order.Side,
                     Role = order.Role,
-                    Price = order.Price,
+                    Price = order.Type == PaperOrderType.Market ? marketEvent.LastPrice : order.Price,
                     Quantity = order.Quantity,
                     Commission = _commissionPerContract * order.Quantity,
                     TriggerMarketPrice = marketEvent.LastPrice,

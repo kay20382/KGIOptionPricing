@@ -2,7 +2,7 @@ using KGIOptionPricing.StrategyFramework;
 
 namespace KGIOptionPricing.Strategies.PeriodicQueueCycle;
 
-public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOrderStrategy
+public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOrderStrategy, IStrategyHeartbeat
 {
     private readonly StrategyDefinition _definition;
     private readonly PeriodicQueueCycleParameters _parameters;
@@ -211,6 +211,65 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
         }
         TryAdvanceRiskExit();
         TryCompleteCycle();
+        TryCompleteStop();
+        Publish();
+    }
+
+    public void OnHeartbeat(DateTimeOffset now)
+    {
+        if (_context is null || _directionWindow is null || _coordinator is null ||
+            State is StrategyLifecycleState.Stopped or StrategyLifecycleState.Faulted)
+            return;
+
+        if (_cooldownUntil.HasValue)
+        {
+            if (now < _cooldownUntil.Value)
+            {
+                State = _paused ? StrategyLifecycleState.Suspended : StrategyLifecycleState.Running;
+                _reason = "CoolingDown";
+                Publish();
+                return;
+            }
+
+            _cooldownUntil = null;
+            _coordinator.ResetAfterCooldown();
+            _directionWindow = new DirectionWindow(_context.Universe.Tradable.TickSize, _parameters);
+            State = _paused ? StrategyLifecycleState.Suspended : StrategyLifecycleState.WarmingUp;
+            _reason = "WarmupIncomplete";
+            Publish();
+            return;
+        }
+
+        PositionSnapshot position = Position();
+        if (position.NetQuantity == 0)
+        {
+            TryAdvanceRiskExit();
+            TryCompleteCycle();
+            TryCompleteStop();
+            Publish();
+            return;
+        }
+
+        EnsureExposureTimingAndStop(position, _oneLegStartedAt ?? now);
+        DateTimeOffset staleAt = (_lastHealthyBook?.Timestamp ?? now)
+            .AddSeconds((double)_parameters.QuoteFreshnessSeconds);
+        if (now > staleAt)
+        {
+            if (!_unhealthySince.HasValue || _unhealthySince.Value > staleAt) _unhealthySince = staleAt;
+            _coordinator.BeginRiskCancellation("StaleQuote");
+            if ((decimal)(now - _unhealthySince.Value).TotalSeconds >= _parameters.MarketDataRecoverySeconds)
+                BeginRiskExit(PaperOrderRole.Flatten, "MarketDataRecoveryTimeout", _parameters.ShockCooldownSeconds);
+            else
+                _reason = "StaleQuote";
+        }
+        else if (_pendingExitRole is null && _oneLegStartedAt.HasValue &&
+                 (now - _oneLegStartedAt.Value).TotalSeconds >= _parameters.MaxOneLegSeconds)
+        {
+            BeginRiskExit(PaperOrderRole.Flatten, "OneLegTimeout", _parameters.CycleCooldownSeconds);
+        }
+
+        TryAdvanceRiskExit();
+        SetProtectedState();
         TryCompleteStop();
         Publish();
     }

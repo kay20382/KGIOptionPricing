@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
+using System.Threading;
 using KGIOptionPricing.StrategyFramework.Execution;
 using KGIOptionPricing.StrategyFramework.Performance;
 
@@ -89,6 +91,21 @@ public sealed class StrategyInstanceRunner : IDisposable
     }
 
     public StrategySnapshot GetSnapshot() { lock (_sync) return GetSnapshotCore(); }
+
+    public void Pulse(DateTimeOffset now)
+    {
+        lock (_sync)
+        {
+            if (_disposed || _strategy is not IStrategyHeartbeat heartbeat) return;
+            if (_clock is IEventDrivenStrategyClock eventClock) eventClock.Advance(now);
+            if (_paused)
+            {
+                PositionSnapshot position = _ledger.GetPosition(_strategy.InstanceId, _universe.Tradable.Symbol);
+                if (position.NetQuantity == 0) return;
+            }
+            heartbeat.OnHeartbeat(now);
+        }
+    }
 
     public bool Pause()
     {
@@ -298,6 +315,14 @@ public sealed class StrategyHost : IDisposable
         foreach (StrategyInstanceRunner runner in runners) runner.OnMarketEvent(marketEvent);
     }
 
+    public void Pulse(DateTimeOffset now)
+    {
+        if (_clock is IEventDrivenStrategyClock eventClock) eventClock.Advance(now);
+        StrategyInstanceRunner[] runners;
+        lock (_sync) runners = _runners.ToArray();
+        foreach (StrategyInstanceRunner runner in runners) runner.Pulse(now);
+    }
+
     public void Dispose()
     {
         _source.MarketEventReceived -= OnMarketEvent;
@@ -305,5 +330,45 @@ public sealed class StrategyHost : IDisposable
         lock (_sync) { runners = _runners.ToArray(); _runners.Clear(); }
         foreach (StrategyInstanceRunner runner in runners) runner.Dispose();
         _source.Dispose();
+    }
+}
+
+internal sealed class StrategyHeartbeatTimer : IDisposable
+{
+    private readonly Action<DateTimeOffset> _pulse;
+    private readonly System.Threading.Timer _timer;
+    private int _running;
+    private int _disposed;
+
+    internal StrategyHeartbeatTimer(Action<DateTimeOffset> pulse, TimeSpan? interval = null)
+    {
+        _pulse = pulse ?? throw new ArgumentNullException(nameof(pulse));
+        TimeSpan due = interval ?? TimeSpan.FromMilliseconds(250);
+        _timer = new System.Threading.Timer(OnTimer, null, due, due);
+    }
+
+    private void OnTimer(object? state)
+    {
+        if (Volatile.Read(ref _disposed) != 0 || Interlocked.CompareExchange(ref _running, 1, 0) != 0)
+            return;
+        try
+        {
+            _pulse(DateTimeOffset.Now);
+        }
+        catch (Exception exception)
+        {
+            Debug.WriteLine($"Strategy heartbeat failed: {exception}");
+        }
+        finally
+        {
+            Volatile.Write(ref _running, 0);
+        }
+    }
+
+    public void Dispose()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+        _timer.Change(Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
+        _timer.Dispose();
     }
 }

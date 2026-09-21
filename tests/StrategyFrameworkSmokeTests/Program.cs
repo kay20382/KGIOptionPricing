@@ -232,6 +232,33 @@ broker.OnMarketEvent(Trade("MC", "225MC", 95m, 2, DateTimeOffset.UtcNow));
 Assert(brokerFills.Count == 1 && brokerFills[0].Price == 100m && brokerFills[0].Commission == 2m,
     "穿價應按委託價成交並計費");
 
+var marketBroker = new CrossPricePaperExecutionService();
+var marketFills = new List<ExecutionEvent>();
+marketBroker.Filled += marketFills.Add;
+marketBroker.Submit(new PaperOrderRequest
+{
+    StrategyInstanceId = "market-price", ClientOrderId = "market-price-1", Symbol = "MC",
+    Side = BuySell.Sell, Type = PaperOrderType.Market, Role = PaperOrderRole.Flatten,
+    Price = 100m, Quantity = 1
+}, DateTimeOffset.UtcNow);
+marketBroker.OnMarketEvent(Trade("MC", "225MC", 75m, 3, DateTimeOffset.UtcNow));
+Assert(marketFills.Count == 1 && marketFills[0].Price == 75m,
+    "模擬 Market 單必須按下一筆實際 Trade 價成交，不得沿用請求參考價");
+
+DateTimeOffset heartbeatTime = new(2026, 9, 23, 0, 0, 0, TimeSpan.Zero);
+var heartbeatClock = new MutableStrategyClock(heartbeatTime);
+var heartbeatSource = new FakeSource();
+using (var heartbeatHost = new StrategyHost(heartbeatSource, heartbeatClock))
+{
+    var heartbeatProbe = new HeartbeatProbeStrategy("heartbeat-probe");
+    heartbeatHost.Add(heartbeatProbe,
+        new ResolvedStrategyUniverse { Tradable = Product("225MC", "HBP", 5m, 10m) });
+    heartbeatHost.Pulse(heartbeatTime.AddSeconds(1));
+    Assert(heartbeatProbe.Heartbeats.SequenceEqual(new[] { heartbeatTime.AddSeconds(1) }) &&
+           heartbeatClock.Now == heartbeatTime.AddSeconds(1),
+        "StrategyHost.Pulse 必須以事件時鐘驅動 optional heartbeat strategy，測試不依賴 sleep");
+}
+
 // Shared ledger: strategies read, runner writes.
 var ledger = new PaperPortfolioLedger();
 var product = Product("225MC", "MC", 5m, 10m);
@@ -663,6 +690,29 @@ sealed class ManagedProbeStrategy : ISimulationStrategy, IManagedOrderStrategy
     };
 }
 
+sealed class HeartbeatProbeStrategy : ISimulationStrategy, IStrategyHeartbeat
+{
+    public HeartbeatProbeStrategy(string instanceId) => InstanceId = instanceId;
+    public string StrategyType => "HeartbeatProbe";
+    public string InstanceId { get; }
+    public StrategyLifecycleState State { get; private set; } = StrategyLifecycleState.Created;
+    public List<DateTimeOffset> Heartbeats { get; } = new();
+    public event Action<PaperOrderRequest>? OrderRequested { add { } remove { } }
+    public event Action? CancelAllRequested { add { } remove { } }
+    public event Action<StrategySnapshot>? SnapshotChanged { add { } remove { } }
+    public void Start(StrategyRuntimeContext context) => State = StrategyLifecycleState.Ready;
+    public void OnHeartbeat(DateTimeOffset now) => Heartbeats.Add(now);
+    public void OnMarketEvent(MarketEvent marketEvent) { }
+    public void OnExecution(ExecutionEvent execution) { }
+    public void Pause(string reason) => State = StrategyLifecycleState.Suspended;
+    public void Resume() => State = StrategyLifecycleState.Ready;
+    public void Stop(string reason) => State = StrategyLifecycleState.Stopped;
+    public StrategySnapshot GetSnapshot() => new()
+    {
+        StrategyType = StrategyType, InstanceId = InstanceId, State = State, UpdatedAt = DateTimeOffset.UtcNow
+    };
+}
+
 sealed class TrackingManagedExecutionService : IManagedStrategyExecutionService
 {
     private readonly List<PaperOrder> _working = new();
@@ -703,7 +753,7 @@ sealed class TrackingManagedExecutionService : IManagedStrategyExecutionService
     public void OnMarketEvent(MarketEvent marketEvent) { }
 }
 
-sealed class MutableStrategyClock : IStrategyClock
+sealed class MutableStrategyClock : IEventDrivenStrategyClock
 {
     public MutableStrategyClock(DateTimeOffset now) => Now = now;
     public DateTimeOffset Now { get; private set; }

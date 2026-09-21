@@ -55,6 +55,11 @@ TestPeriodicStrategyCooldownsClearDirectionWindow();
 TestPeriodicStrategyPauseProtectsHeldPositionAndStopFlattensSafely();
 TestPeriodicStrategyAcceptsFilledLifecycleAfterExecutionStartsCooldown();
 TestPeriodicStrategyIgnoresDuplicateBookForRiskTriggers();
+TestPeriodicHeartbeatAdvancesTimeoutAndHealthRecoveryWithoutMarketEvents();
+TestPeriodicLifecycleFirstWaitsForAuthoritativeExecutions();
+TestPeriodicFixedStopDoesNotTriggerBelowSixTicks();
+TestPeriodicExitCallbacksAreIdempotentOutOfOrder();
+TestPeriodicHealthFlattenUsesNextTradePriceThroughRealPaperBroker();
 
 Console.WriteLine("PeriodicQueueCycle smoke tests passed.");
 
@@ -1600,6 +1605,191 @@ static void TestPeriodicStrategyIgnoresDuplicateBookForRiskTriggers()
     strategy.OnMarketEvent(duplicate);
     Assert(cancels.Count == 0 && orders.Count == 2,
         "重複或倒序 Book 必須直接忽略，不得當成行情中斷或拿其價格觸發停損");
+}
+
+static void TestPeriodicHeartbeatAdvancesTimeoutAndHealthRecoveryWithoutMarketEvents()
+{
+    DateTimeOffset start = new(2026, 9, 23, 15, 0, 0, TimeSpan.Zero);
+    var timeoutLedger = new KGIOptionPricing.StrategyFramework.Performance.PaperPortfolioLedger();
+    IReadOnlyDictionary<string, string> timeoutParameters = RiskParameters().Concat(
+        new[] { new KeyValuePair<string, string>("QuoteFreshnessSeconds", "30") })
+        .ToDictionary(x => x.Key, x => x.Value, StringComparer.OrdinalIgnoreCase);
+    (PeriodicQueueCycleStrategy timeout, MutableClock clock, List<PaperOrderRequest> timeoutOrders) =
+        StartWorkingUpStrategy("heartbeat-timeout", timeoutParameters, start, timeoutLedger);
+    var timeoutCancels = new List<string>();
+    timeout.CancelOrderRequested += timeoutCancels.Add;
+    ApplyFill(timeout, timeoutLedger, timeoutOrders.Single(x => x.Side == BuySell.Buy), 200m, clock.Now);
+    clock.Advance(clock.Now.AddSeconds(29));
+    ((IStrategyHeartbeat)timeout).OnHeartbeat(clock.Now);
+    Assert(timeoutCancels.Count == 0, "無新行情時 heartbeat 29 秒不得提前單邊逾時");
+    clock.Advance(clock.Now.AddSeconds(1));
+    ((IStrategyHeartbeat)timeout).OnHeartbeat(clock.Now);
+    string timeoutPeer = timeoutOrders.Single(x => x.Side == BuySell.Sell).ClientOrderId;
+    Assert(timeoutCancels.SequenceEqual(new[] { timeoutPeer }, StringComparer.Ordinal),
+        "無新行情時 heartbeat 滿 30 秒仍必須定向撤銷 peer");
+    timeout.OnOrderLifecycle(Cancelled(timeoutPeer, timeout.InstanceId, clock.Now));
+    Assert(timeoutOrders.Single(x => x.Role == PaperOrderRole.Flatten).Quantity == 1 &&
+           timeout.GetSnapshot().Reason.Contains("OneLegTimeout", StringComparison.Ordinal),
+        "heartbeat 單邊逾時必須送 Flatten/OneLegTimeout");
+
+    DateTimeOffset healthStart = start.AddHours(1);
+    var healthLedger = new KGIOptionPricing.StrategyFramework.Performance.PaperPortfolioLedger();
+    (PeriodicQueueCycleStrategy health, MutableClock healthClock, List<PaperOrderRequest> healthOrders) =
+        StartWorkingUpStrategy("heartbeat-health", RiskParameters(), healthStart, healthLedger);
+    var healthCancels = new List<string>();
+    health.CancelOrderRequested += healthCancels.Add;
+    ApplyFill(health, healthLedger, healthOrders.Single(x => x.Side == BuySell.Buy), 200m, healthClock.Now);
+    DateTimeOffset staleBoundary = healthClock.Now.AddSeconds(2);
+    healthClock.Advance(staleBoundary);
+    ((IStrategyHeartbeat)health).OnHeartbeat(healthClock.Now);
+    Assert(healthCancels.Count == 0, "最新健康報價年齡恰等於 QuoteFreshnessSeconds 時仍屬有效");
+    healthClock.Advance(staleBoundary.AddMilliseconds(1));
+    ((IStrategyHeartbeat)health).OnHeartbeat(healthClock.Now);
+    string healthPeer = healthOrders.Single(x => x.Side == BuySell.Sell).ClientOrderId;
+    Assert(healthCancels.SequenceEqual(new[] { healthPeer }, StringComparer.Ordinal),
+        "健康報價超過新鮮度後 heartbeat 必須立即撤 peer");
+    health.OnOrderLifecycle(Cancelled(healthPeer, health.InstanceId, healthClock.Now));
+    healthClock.Advance(staleBoundary.AddSeconds(2));
+    ((IStrategyHeartbeat)health).OnHeartbeat(healthClock.Now);
+    Assert(healthOrders.Single(x => x.Role == PaperOrderRole.Flatten).Quantity == 1 &&
+           health.GetSnapshot().Reason.Contains("MarketDataRecoveryTimeout", StringComparison.Ordinal),
+        "報價老化起算滿 MarketDataRecoverySeconds 後 heartbeat 必須中性平倉");
+}
+
+static void TestPeriodicLifecycleFirstWaitsForAuthoritativeExecutions()
+{
+    DateTimeOffset start = new(2026, 9, 23, 17, 0, 0, TimeSpan.Zero);
+    var ledger = new KGIOptionPricing.StrategyFramework.Performance.PaperPortfolioLedger();
+    (PeriodicQueueCycleStrategy strategy, MutableClock clock, List<PaperOrderRequest> orders) =
+        StartWorkingUpStrategy("lifecycle-first", RiskParameters(), start, ledger);
+    PaperOrderRequest buy = orders.Single(x => x.Side == BuySell.Buy);
+    PaperOrderRequest sell = orders.Single(x => x.Side == BuySell.Sell);
+    foreach (PaperOrderRequest order in new[] { buy, sell })
+    {
+        strategy.OnOrderLifecycle(new OrderLifecycleEvent
+        {
+            StrategyInstanceId = strategy.InstanceId,
+            ClientOrderId = order.ClientOrderId,
+            Timestamp = clock.Now,
+            State = OrderLifecycleState.Filled,
+            Quantity = 1,
+            FilledQuantity = 1
+        });
+    }
+    Assert(strategy.GetSnapshot().Reason != "CoolingDown" && strategy.State != StrategyLifecycleState.Faulted,
+        "兩腿只有 Filled lifecycle、帳本仍為零時不得完成或退休週期");
+
+    ApplyFill(strategy, ledger, buy, 200m, clock.Now);
+    Assert(ledger.GetPosition(strategy.InstanceId, "225MC").NetQuantity == 1 &&
+           strategy.GetSnapshot().Reason != "CoolingDown" && strategy.State != StrategyLifecycleState.Faulted,
+        "後到 execution 形成部位時必須立即進入保護，不得落入 45 秒裸倉冷卻");
+    ApplyFill(strategy, ledger, sell, 205m, clock.Now);
+    Assert(strategy.GetSnapshot().Reason == "CoolingDown" &&
+           ledger.GetPosition(strategy.InstanceId, "225MC").NetQuantity == 0,
+        "只有兩筆權威 execution 使帳本歸零後才能完成週期");
+}
+
+static void TestPeriodicFixedStopDoesNotTriggerBelowSixTicks()
+{
+    foreach (BuySell side in new[] { BuySell.Buy, BuySell.Sell })
+    {
+        DateTimeOffset start = new(2026, 9, 23, side == BuySell.Buy ? 18 : 19, 0, 0, TimeSpan.Zero);
+        var ledger = new KGIOptionPricing.StrategyFramework.Performance.PaperPortfolioLedger();
+        (PeriodicQueueCycleStrategy strategy, MutableClock clock, List<PaperOrderRequest> orders) =
+            StartWorkingUpStrategy($"sub-six-{side}", RiskParameters(), start, ledger);
+        var cancels = new List<string>();
+        strategy.CancelOrderRequested += cancels.Add;
+        ApplyFill(strategy, ledger, orders.Single(x => x.Side == side), 200m, clock.Now);
+        clock.Advance(clock.Now.AddSeconds(1));
+        strategy.OnMarketEvent(side == BuySell.Buy
+            ? StrategyBook(175m, 180m, 20, 10, 3, clock.Now)
+            : StrategyBook(220m, 225m, 10, 20, 3, clock.Now));
+        Assert(cancels.Count == 0 && orders.All(x => x.Role != PaperOrderRole.StopLoss),
+            $"{side} 不利 5 ticks 不得提早觸發 6 ticks 固定停損");
+    }
+}
+
+static void TestPeriodicExitCallbacksAreIdempotentOutOfOrder()
+{
+    DateTimeOffset start = new(2026, 9, 23, 20, 0, 0, TimeSpan.Zero);
+    var ledger = new KGIOptionPricing.StrategyFramework.Performance.PaperPortfolioLedger();
+    (PeriodicQueueCycleStrategy strategy, MutableClock clock, List<PaperOrderRequest> orders) =
+        StartWorkingUpStrategy("exit-idempotence", RiskParameters(), start, ledger);
+    PaperOrderRequest buy = orders.Single(x => x.Side == BuySell.Buy);
+    ApplyFill(strategy, ledger, buy, 200m, clock.Now);
+    clock.Advance(clock.Now.AddSeconds(1));
+    strategy.OnMarketEvent(StrategyBook(170m, 175m, 20, 10, 3, clock.Now));
+    string peer = orders.Single(x => x.Side == BuySell.Sell).ClientOrderId;
+    strategy.OnOrderLifecycle(Cancelled(peer, strategy.InstanceId, clock.Now));
+    PaperOrderRequest exit = orders.Single(x => x.Role == PaperOrderRole.StopLoss);
+    ApplyFill(strategy, ledger, exit, 170m, clock.Now);
+    strategy.OnOrderLifecycle(new OrderLifecycleEvent
+    {
+        StrategyInstanceId = strategy.InstanceId, ClientOrderId = exit.ClientOrderId,
+        Timestamp = clock.Now, State = OrderLifecycleState.Filled, Quantity = 1, FilledQuantity = 1
+    });
+    strategy.OnExecution(Fill(exit.ClientOrderId, strategy.InstanceId, exit.Side, 170m, clock.Now) with
+    {
+        Role = PaperOrderRole.StopLoss
+    });
+    Assert(strategy.State != StrategyLifecycleState.Faulted && orders.Count == 3 &&
+           strategy.GetSnapshot().Reason == "CoolingDown",
+        "退出 execution/lifecycle 重複或亂序不得重複平倉或誤進 Faulted");
+}
+
+static void TestPeriodicHealthFlattenUsesNextTradePriceThroughRealPaperBroker()
+{
+    DateTimeOffset start = new(2026, 9, 23, 21, 0, 0, TimeSpan.Zero);
+    var clock = new MutableClock(start);
+    var ledger = new KGIOptionPricing.StrategyFramework.Performance.PaperPortfolioLedger();
+    var broker = new KGIOptionPricing.StrategyFramework.Execution.CrossPricePaperExecutionService(0m, clock);
+    var strategy = (PeriodicQueueCycleStrategy)new PeriodicQueueCycleFactory().Create(
+        PeriodicDefinition("paper-health-gap", RiskParameters()));
+    using var runner = new StrategyInstanceRunner(
+        strategy,
+        new ResolvedStrategyUniverse
+        {
+            Tradable = new ResolvedProduct
+            {
+                ProductId = "225MC", Symbol = "225MC", TickSize = 5m, ContractMultiplier = 10m
+            }
+        },
+        ledger,
+        clock,
+        0m,
+        broker);
+    var executions = new List<ExecutionEvent>();
+    runner.ExecutionOccurred += executions.Add;
+    runner.OnMarketEvent(StrategyBook(100m, 105m, 20, 10, 1, start));
+    clock.Advance(start.AddSeconds(1));
+    runner.OnMarketEvent(StrategyBook(110m, 115m, 20, 10, 2, clock.Now));
+    PaperOrder buy = broker.GetWorkingOrders(strategy.InstanceId).Single(x => x.Side == BuySell.Buy);
+    clock.Advance(start.AddSeconds(2));
+    runner.OnMarketEvent(new MarketEvent
+    {
+        Sequence = 3, Timestamp = clock.Now, Symbol = "225MC", ProductId = "225MC",
+        Kind = MarketEventKind.Trade, LastPrice = buy.Price - 5m, TradeQuantity = 1
+    });
+    Assert(ledger.GetPosition(strategy.InstanceId, "225MC").NetQuantity == 1,
+        "端到端測試前置必須只成交買進完成單");
+
+    clock.Advance(start.AddSeconds(3).AddMilliseconds(1));
+    runner.Pulse(clock.Now);
+    clock.Advance(start.AddSeconds(5));
+    runner.Pulse(clock.Now);
+    Assert(broker.GetWorkingOrders(strategy.InstanceId).Single().Role == PaperOrderRole.Flatten,
+        "行情恢復逾時後真實 paper broker 必須持有一張 Market Flatten");
+
+    const decimal gapTrade = 70m;
+    clock.Advance(start.AddSeconds(6));
+    runner.OnMarketEvent(new MarketEvent
+    {
+        Sequence = 4, Timestamp = clock.Now, Symbol = "225MC", ProductId = "225MC",
+        Kind = MarketEventKind.Trade, LastPrice = gapTrade, TradeQuantity = 1
+    });
+    ExecutionEvent flatten = executions.Single(x => x.Role == PaperOrderRole.Flatten);
+    Assert(flatten.Price == gapTrade && ledger.GetPosition(strategy.InstanceId, "225MC").NetQuantity == 0,
+        "行情缺口後 Market Flatten 必須按當下 Trade 價成交並由共用帳本歸零");
 }
 
 static IReadOnlyDictionary<string, string> RiskParameters() => Values(

@@ -50,6 +50,11 @@ public interface IManagedOrderStrategy
     void OnOrderLifecycle(OrderLifecycleEvent orderEvent);
 }
 
+public interface IStrategyHeartbeat
+{
+    void OnHeartbeat(DateTimeOffset now);
+}
+
 public interface IStrategyFactory
 {
     string StrategyType { get; }
