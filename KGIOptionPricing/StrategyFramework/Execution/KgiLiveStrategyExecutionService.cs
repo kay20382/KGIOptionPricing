@@ -45,7 +45,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
     private bool _disposed;
     private bool _disposing;
     private int _inflightCallbacks;
-    private readonly HashSet<int> _callbackThreads = new();
+    private readonly Dictionary<int, int> _callbackThreadDepth = new();
 
     public event Action<ExecutionEvent>? Filled;
     public event Action<string>? Failed;
@@ -100,8 +100,11 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
 
     public PaperOrder Submit(PaperOrderRequest request, DateTimeOffset now)
     {
-        if (_disposed) throw new ObjectDisposedException(nameof(KgiLiveStrategyExecutionService));
-        lock (_sync) PurgeExpiredTerminalsLocked(_now());
+        lock (_sync)
+        {
+            ThrowIfClosingLocked();
+            PurgeExpiredTerminalsLocked(_now());
+        }
         if (!_gateway.IsLoggedIn) throw new InvalidOperationException("交易服務尚未登入，禁止實盤送單。");
         if (!string.Equals(request.StrategyInstanceId, _instanceId, StringComparison.OrdinalIgnoreCase))
             throw new InvalidOperationException("策略實例與實盤執行器不一致。");
@@ -146,6 +149,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         string? realId;
         lock (_sync)
         {
+            ThrowIfClosingLocked();
             PurgeExpiredTerminalsLocked(_now());
             removedCondition = _conditions.Remove(orderId);
             realId = removedCondition
@@ -162,13 +166,13 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
 
     public bool CancelByClientOrderId(string strategyInstanceId, string clientOrderId)
     {
-        if (_disposed ||
-            !string.Equals(strategyInstanceId, _instanceId, StringComparison.OrdinalIgnoreCase) ||
+        if (!string.Equals(strategyInstanceId, _instanceId, StringComparison.OrdinalIgnoreCase) ||
             string.IsNullOrWhiteSpace(clientOrderId)) return false;
 
         string? realId;
         lock (_sync)
         {
+            ThrowIfClosingLocked();
             PurgeExpiredTerminalsLocked(_now());
             string[] matches = _realOrders
                 .Where(x => !x.Value.Terminal &&
@@ -189,6 +193,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         int conditionCount;
         lock (_sync)
         {
+            ThrowIfClosingLocked();
             PurgeExpiredTerminalsLocked(_now());
             conditionCount = _conditions.Count;
             _conditions.Clear();
@@ -213,12 +218,13 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
 
     public void OnMarketEvent(MarketEvent marketEvent)
     {
-        if (_disposed || marketEvent.Kind != MarketEventKind.Trade || marketEvent.LastPrice <= 0m ||
+        if (marketEvent.Kind != MarketEventKind.Trade || marketEvent.LastPrice <= 0m ||
             !string.Equals(marketEvent.Symbol, _quoteSymbol, StringComparison.OrdinalIgnoreCase)) return;
 
         PaperOrder? triggered;
         lock (_sync)
         {
+            ThrowIfClosingLocked();
             triggered = _conditions.Values.OrderBy(x => x.CreatedAt).FirstOrDefault(order => order.Type switch
             {
                 PaperOrderType.Limit when order.Side == BuySell.Buy => marketEvent.LastPrice < order.Price,
@@ -235,6 +241,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
     public void Flatten(int netPosition)
     {
         if (netPosition == 0) return;
+        lock (_sync) ThrowIfClosingLocked();
         var order = new PaperOrder
         {
             OrderId = $"FLAT-{_instanceId}-{Interlocked.Increment(ref _localSequence)}",
@@ -423,7 +430,9 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
 
     private void OnOrderFailed(OrderInfo brokerOrder, string reason)
     {
-        if (_disposed) return;
+        if (!TryEnterCallback()) return;
+        try
+        {
         OrderLifecycleEvent? lifecycle = null;
         string? failure = null;
         bool legacyRemoved = false;
@@ -447,11 +456,15 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         if (lifecycle != null) OrderLifecycleChanged?.Invoke(lifecycle);
         if (failure != null) Failed?.Invoke(failure);
         if (lifecycle != null || legacyRemoved) StateChanged?.Invoke();
+        }
+        finally { ExitCallback(); }
     }
 
     private void OnCancelFailed(OrderInfo brokerOrder, string reason)
     {
-        if (_disposed) return;
+        if (!TryEnterCallback()) return;
+        try
+        {
         bool owned;
         OrderLifecycleEvent? lifecycle = null;
         lock (_sync)
@@ -465,11 +478,15 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         if (lifecycle != null) OrderLifecycleChanged?.Invoke(lifecycle);
         if (owned) Failed?.Invoke($"實盤刪單失敗：{reason}");
         if (lifecycle != null) StateChanged?.Invoke();
+        }
+        finally { ExitCallback(); }
     }
 
     private void OnOrderChanged(OrderInfo brokerOrder)
     {
-        if (_disposed) return;
+        if (!TryEnterCallback()) return;
+        try
+        {
         OrderLifecycleEvent? lifecycle = null;
         string? failure = null;
         bool legacyChanged = false;
@@ -527,6 +544,8 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         if (lifecycle != null) OrderLifecycleChanged?.Invoke(lifecycle);
         if (failure != null) Failed?.Invoke(failure);
         if (lifecycle != null || legacyChanged) StateChanged?.Invoke();
+        }
+        finally { ExitCallback(); }
     }
 
     private void PublishTransition(
@@ -672,17 +691,14 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         lock (_sync)
         {
             if (_disposed) return;
-            if (_callbackThreads.Contains(Environment.CurrentManagedThreadId))
-                throw new InvalidOperationException("實盤 broker callback 不可同步釋放自己的執行器。");
             if (_disposing)
-            {
-                while (_disposing) Monitor.Wait(_sync);
-                if (_disposed) return;
-            }
+                throw new InvalidOperationException("實盤執行器正在釋放，請稍後重試。");
             PurgeExpiredTerminalsLocked(_now());
             int active = _realOrders.Values.Count(x => !x.Terminal);
             if (active > 0)
                 throw new InvalidOperationException($"仍有 {active} 張實盤委託未終結，禁止釋放執行器。");
+            if (_inflightCallbacks > 0)
+                throw new InvalidOperationException($"仍有 {_inflightCallbacks} 個 broker callback 尚未發布完成，禁止釋放執行器。");
             _disposing = true;
         }
         _gateway.OrderFilled -= OnOrderFilled;
@@ -692,7 +708,6 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         bool changed;
         lock (_sync)
         {
-            while (_inflightCallbacks > 0) Monitor.Wait(_sync);
             _disposed = true;
             changed = _conditions.Count > 0 || _realOrders.Count > 0;
             _conditions.Clear();
@@ -709,7 +724,9 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         {
             if (_disposed) return false;
             _inflightCallbacks++;
-            _callbackThreads.Add(Environment.CurrentManagedThreadId);
+            int threadId = Environment.CurrentManagedThreadId;
+            _callbackThreadDepth.TryGetValue(threadId, out int depth);
+            _callbackThreadDepth[threadId] = depth + 1;
             return true;
         }
     }
@@ -718,9 +735,20 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
     {
         lock (_sync)
         {
-            _callbackThreads.Remove(Environment.CurrentManagedThreadId);
+            int threadId = Environment.CurrentManagedThreadId;
+            if (_callbackThreadDepth.TryGetValue(threadId, out int depth))
+            {
+                if (depth <= 1) _callbackThreadDepth.Remove(threadId);
+                else _callbackThreadDepth[threadId] = depth - 1;
+            }
             _inflightCallbacks--;
             if (_inflightCallbacks == 0) Monitor.PulseAll(_sync);
         }
+    }
+
+    private void ThrowIfClosingLocked()
+    {
+        if (_disposed || _disposing)
+            throw new ObjectDisposedException(nameof(KgiLiveStrategyExecutionService));
     }
 }

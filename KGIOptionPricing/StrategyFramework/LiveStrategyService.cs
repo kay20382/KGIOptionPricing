@@ -7,6 +7,7 @@ using KGIOptionPricing.Strategies.OrderBookTrend;
 using KGIOptionPricing.Strategies.WaveletScalper;
 using KGIOptionPricing.StrategyFramework.Execution;
 using KGIOptionPricing.StrategyFramework.MarketData;
+using System.Runtime.ExceptionServices;
 
 namespace KGIOptionPricing.StrategyFramework;
 
@@ -22,7 +23,11 @@ public sealed class LiveStrategyService : IDisposable
     private readonly StrategyRegistry _registry = new();
     private readonly StrategyProductResolver _resolver = new();
     private readonly StrategyHost _host;
-    private readonly StrategyHeartbeatTimer _heartbeat;
+    private StrategyHeartbeatTimer _heartbeat;
+    private readonly object _disposeSync = new();
+    private bool _disposing;
+    private int _disposeOwnerThreadId, _disposeAttempt, _failedDisposeAttempt;
+    private Exception? _lastDisposeException;
     private readonly OrderManager _orders;
     private readonly KGITradeService _trade;
     private readonly ConcurrentDictionary<string, KgiLiveStrategyExecutionService> _executions = new(StringComparer.OrdinalIgnoreCase);
@@ -221,12 +226,47 @@ public sealed class LiveStrategyService : IDisposable
 
     public void Dispose()
     {
-        if (_disposed) return;
-        _heartbeat.Dispose();
-        foreach (StrategySnapshot snapshot in _host.GetSnapshots().ToArray())
-            EmergencyStop(snapshot.InstanceId, "程式關閉，實盤策略緊急停止");
-        _host.SnapshotChanged -= OnSnapshot;
-        _host.Dispose();
-        _disposed = true;
+        lock (_disposeSync)
+        {
+            if (_disposed) return;
+            if (_disposing)
+            {
+                if (_disposeOwnerThreadId == Environment.CurrentManagedThreadId) throw new InvalidOperationException("服務不可在自己的 callback 中同步 Dispose。");
+                int waitingAttempt = _disposeAttempt;
+                while (_disposing) Monitor.Wait(_disposeSync);
+                if (_disposed) return;
+                if (_failedDisposeAttempt == waitingAttempt && _lastDisposeException != null) ExceptionDispatchInfo.Capture(_lastDisposeException).Throw();
+            }
+            _disposing = true;
+            _disposeOwnerThreadId = Environment.CurrentManagedThreadId;
+            _disposeAttempt++;
+        }
+        bool timerDrained = false;
+        try
+        {
+            foreach (StrategySnapshot snapshot in _host.GetSnapshots().ToArray())
+                EmergencyStop(snapshot.InstanceId, "程式關閉，實盤策略緊急停止");
+            LiveStrategyCloseStatus[] unsafeStates = _host.GetSnapshots()
+                .Select(x => GetCloseStatus(x.InstanceId))
+                .Where(x => x.Position != 0 || x.ActiveBrokerOrders != 0 || x.LocalConditions != 0)
+                .ToArray();
+            if (unsafeStates.Length > 0)
+                throw new InvalidOperationException("實盤策略尚有部位、broker 委託或本地條件，禁止釋放服務。");
+            _heartbeat.Dispose();
+            timerDrained = true;
+            _host.Dispose();
+            _host.SnapshotChanged -= OnSnapshot;
+            _disposed = true;
+        }
+        catch (Exception exception)
+        {
+            if (timerDrained) _heartbeat = new StrategyHeartbeatTimer(_host.Pulse);
+            lock (_disposeSync) { _lastDisposeException = exception; _failedDisposeAttempt = _disposeAttempt; }
+            throw;
+        }
+        finally
+        {
+            lock (_disposeSync) { _disposing = false; _disposeOwnerThreadId = 0; Monitor.PulseAll(_disposeSync); }
+        }
     }
 }

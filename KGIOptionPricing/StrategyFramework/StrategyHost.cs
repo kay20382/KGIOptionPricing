@@ -261,13 +261,14 @@ public sealed class StrategyInstanceRunner : IDisposable
             if (_broker is IDisposable disposable) disposable.Dispose();
             lock (_sync)
             {
-                StopCore("執行個體已釋放");
-                _disposed = true;
                 _strategy.OrderRequested -= OnOrderRequested;
                 _strategy.CancelAllRequested -= OnCancelAllRequested;
                 _strategy.SnapshotChanged -= OnStrategySnapshotChanged;
-                _broker.Filled -= OnFilled;
                 if (_managedStrategy != null) _managedStrategy.CancelOrderRequested -= OnCancelOrderRequested;
+                _paused = false;
+                _strategy.Stop("執行個體已釋放");
+                _disposed = true;
+                _broker.Filled -= OnFilled;
                 if (_managedBroker != null) _managedBroker.OrderLifecycleChanged -= OnOrderLifecycleChanged;
             }
         }

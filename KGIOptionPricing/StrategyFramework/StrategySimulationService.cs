@@ -6,6 +6,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Runtime.ExceptionServices;
 using KGIOptionPricing.Strategies.MeanReversionScalper;
 using KGIOptionPricing.Strategies.MiniLeadMicro;
 using KGIOptionPricing.Strategies.NikkeiMicrostructureAlpha;
@@ -21,7 +22,11 @@ public sealed class StrategySimulationService : IDisposable
     private readonly StrategyRegistry _registry = new();
     private readonly StrategyProductResolver _resolver = new();
     private readonly StrategyHost _liveHost;
-    private readonly StrategyHeartbeatTimer _heartbeat;
+    private StrategyHeartbeatTimer _heartbeat;
+    private readonly object _disposeSync = new();
+    private bool _disposing;
+    private int _disposeOwnerThreadId, _disposeAttempt, _failedDisposeAttempt;
+    private Exception? _lastDisposeException;
     private readonly SimulationRunRecorder _liveRecorder;
     private readonly string _root;
     private bool _disposed;
@@ -144,13 +149,42 @@ public sealed class StrategySimulationService : IDisposable
 
     public void Dispose()
     {
-        if (_disposed) return;
-        _heartbeat.Dispose();
-        _liveHost.Dispose();
-        _liveHost.SnapshotChanged -= OnSnapshot;
-        _liveHost.ExecutionOccurred -= OnExecution;
-        _liveRecorder.Dispose();
-        _disposed = true;
+        lock (_disposeSync)
+        {
+            if (_disposed) return;
+            if (_disposing)
+            {
+                if (_disposeOwnerThreadId == Environment.CurrentManagedThreadId) throw new InvalidOperationException("服務不可在自己的 callback 中同步 Dispose。");
+                int waitingAttempt = _disposeAttempt;
+                while (_disposing) Monitor.Wait(_disposeSync);
+                if (_disposed) return;
+                if (_failedDisposeAttempt == waitingAttempt && _lastDisposeException != null) ExceptionDispatchInfo.Capture(_lastDisposeException).Throw();
+            }
+            _disposing = true;
+            _disposeOwnerThreadId = Environment.CurrentManagedThreadId;
+            _disposeAttempt++;
+        }
+        bool timerDrained = false;
+        try
+        {
+            _heartbeat.Dispose();
+            timerDrained = true;
+            _liveHost.Dispose();
+            _liveHost.SnapshotChanged -= OnSnapshot;
+            _liveHost.ExecutionOccurred -= OnExecution;
+            _liveRecorder.Dispose();
+            _disposed = true;
+        }
+        catch (Exception exception)
+        {
+            if (timerDrained) _heartbeat = new StrategyHeartbeatTimer(_liveHost.Pulse);
+            lock (_disposeSync) { _lastDisposeException = exception; _failedDisposeAttempt = _disposeAttempt; }
+            throw;
+        }
+        finally
+        {
+            lock (_disposeSync) { _disposing = false; _disposeOwnerThreadId = 0; Monitor.PulseAll(_disposeSync); }
+        }
     }
 
     private sealed class ReplayStrategyClock : IEventDrivenStrategyClock
