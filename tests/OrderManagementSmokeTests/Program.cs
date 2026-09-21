@@ -627,6 +627,24 @@ Assert(emitBlockedFill.Wait(TimeSpan.FromSeconds(5)) && drainExecutions.Count ==
     "Dispose 失敗後 terminal-but-undelivered callback 必須完整送入 ledger/strategy 路由");
 drainService.Dispose();
 
+var operationGateway = new FakeLiveStrategyOrderGateway { BlockPlaceOrder = true };
+var operationService = CreateLiveService(operationGateway, "operation-live");
+Task<PaperOrder> blockedSubmit = Task.Factory.StartNew(
+    () => operationService.Submit(
+        liveBuy with { StrategyInstanceId = "operation-live", ClientOrderId = "operation-g1" },
+        DateTimeOffset.UtcNow),
+    CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+Assert(operationGateway.PlaceOrderEntered.Wait(TimeSpan.FromSeconds(5)),
+    "測試前置：Submit 必須持 operation lease 進入 gateway call");
+AssertThrows<InvalidOperationException>(operationService.Dispose,
+    "gateway call 期間 Dispose 必須立即 fail closed，不得拆 tracking/subscription");
+Assert(operationService.ActiveBrokerOrderCount == 1,
+    "operation Dispose 失敗後 active tracking 必須保留");
+operationGateway.ReleasePlaceOrder.Set();
+Assert(blockedSubmit.Wait(TimeSpan.FromSeconds(5)), "release 後 Submit 必須完成");
+operationGateway.EmitFill(blockedSubmit.Result.OrderId, 1, 0, OrderStatus.Filled, 1, 65000d);
+operationService.Dispose();
+
 // StrategyHost.Remove 必須在 broker Dispose 成功後才移除 runner 或解除路由。
 var hostGateway = new FakeLiveStrategyOrderGateway();
 var hostService = CreateLiveService(hostGateway, "host-live");
@@ -856,6 +874,9 @@ sealed class FakeLiveStrategyOrderGateway : ILiveStrategyOrderGateway
     public bool IsLoggedIn { get; set; } = true;
     public string BrokerId { get; set; } = "BRK";
     public string Account { get; set; } = "ACC";
+    public bool BlockPlaceOrder { get; set; }
+    public ManualResetEventSlim PlaceOrderEntered { get; } = new(false);
+    public ManualResetEventSlim ReleasePlaceOrder { get; } = new(false);
 
     public event Action<OrderInfo>? OrderStateChanged;
     public event Action<OrderInfo, int, double>? OrderFilled;
@@ -864,6 +885,11 @@ sealed class FakeLiveStrategyOrderGateway : ILiveStrategyOrderGateway
 
     public void PlaceOrder(OrderRequest request)
     {
+        if (BlockPlaceOrder)
+        {
+            PlaceOrderEntered.Set();
+            ReleasePlaceOrder.Wait();
+        }
         var order = new OrderInfo
         {
             OrderId = request.OrderId,

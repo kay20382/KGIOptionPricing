@@ -305,6 +305,8 @@ public sealed class StrategyHost : IDisposable
     private readonly IStrategyClock _clock;
     private readonly IMarketEventSource _source;
     private bool _disposed;
+    private bool _disposing;
+    private int _activeAdds;
     internal bool IsDisposed { get { lock (_sync) return _disposed; } }
 
     public event Action<StrategySnapshot>? SnapshotChanged;
@@ -324,24 +326,42 @@ public sealed class StrategyHost : IDisposable
         decimal commissionPerContract = 0m,
         IStrategyExecutionService? executionService = null)
     {
-        var runner = new StrategyInstanceRunner(strategy, universe, _ledger, _clock, commissionPerContract, executionService);
-        runner.SnapshotChanged += snapshot => SnapshotChanged?.Invoke(snapshot);
-        runner.ExecutionOccurred += execution => ExecutionOccurred?.Invoke(execution);
-        lock (_sync) _runners.Add(runner);
-        _source.Subscribe(universe.AllProducts);
-        SnapshotChanged?.Invoke(runner.GetSnapshot());
-        return runner;
+        lock (_sync)
+        {
+            if (_disposed || _disposing) throw new ObjectDisposedException(nameof(StrategyHost));
+            _activeAdds++;
+        }
+        try
+        {
+            var runner = new StrategyInstanceRunner(strategy, universe, _ledger, _clock, commissionPerContract, executionService);
+            runner.SnapshotChanged += snapshot => SnapshotChanged?.Invoke(snapshot);
+            runner.ExecutionOccurred += execution => ExecutionOccurred?.Invoke(execution);
+            lock (_sync) _runners.Add(runner);
+            _source.Subscribe(universe.AllProducts);
+            SnapshotChanged?.Invoke(runner.GetSnapshot());
+            return runner;
+        }
+        finally
+        {
+            lock (_sync) { _activeAdds--; Monitor.PulseAll(_sync); }
+        }
     }
 
     public IReadOnlyList<StrategySnapshot> GetSnapshots()
     {
-        lock (_sync) return _runners.Select(x => x.GetSnapshot()).ToArray();
+        StrategyInstanceRunner[] runners;
+        lock (_sync)
+        {
+            if (_disposed || _disposing) throw new ObjectDisposedException(nameof(StrategyHost));
+            runners = _runners.ToArray();
+        }
+        return runners.Select(x => x.GetSnapshot()).ToArray();
     }
 
     public bool Stop(string instanceId, string reason = "使用者停止")
     {
         StrategyInstanceRunner? runner;
-        lock (_sync) runner = _runners.FirstOrDefault(x => string.Equals(x.InstanceId, instanceId, StringComparison.OrdinalIgnoreCase));
+        lock (_sync) runner = !_disposed && !_disposing ? _runners.FirstOrDefault(x => string.Equals(x.InstanceId, instanceId, StringComparison.OrdinalIgnoreCase)) : null;
         if (runner == null) return false;
         runner.Stop(reason);
         return true;
@@ -350,14 +370,14 @@ public sealed class StrategyHost : IDisposable
     public bool Pause(string instanceId)
     {
         StrategyInstanceRunner? runner;
-        lock (_sync) runner = _runners.FirstOrDefault(x => string.Equals(x.InstanceId, instanceId, StringComparison.OrdinalIgnoreCase));
+        lock (_sync) runner = !_disposed && !_disposing ? _runners.FirstOrDefault(x => string.Equals(x.InstanceId, instanceId, StringComparison.OrdinalIgnoreCase)) : null;
         return runner?.Pause() == true;
     }
 
     public bool Resume(string instanceId)
     {
         StrategyInstanceRunner? runner;
-        lock (_sync) runner = _runners.FirstOrDefault(x => string.Equals(x.InstanceId, instanceId, StringComparison.OrdinalIgnoreCase));
+        lock (_sync) runner = !_disposed && !_disposing ? _runners.FirstOrDefault(x => string.Equals(x.InstanceId, instanceId, StringComparison.OrdinalIgnoreCase)) : null;
         return runner?.Resume() == true;
     }
 
@@ -365,7 +385,7 @@ public sealed class StrategyHost : IDisposable
     {
         StrategyInstanceRunner? runner;
         lock (_sync)
-            runner = _runners.FirstOrDefault(x => string.Equals(x.InstanceId, instanceId, StringComparison.OrdinalIgnoreCase));
+            runner = !_disposed && !_disposing ? _runners.FirstOrDefault(x => string.Equals(x.InstanceId, instanceId, StringComparison.OrdinalIgnoreCase)) : null;
         if (runner == null) return false;
         // Dispose may fail while a live order is still active. Remove only
         // after success so the runner continues routing late fills.
@@ -380,7 +400,7 @@ public sealed class StrategyHost : IDisposable
     public void StopAll(string reason = "全部停止")
     {
         StrategyInstanceRunner[] runners;
-        lock (_sync) runners = _runners.ToArray();
+        lock (_sync) runners = _disposed || _disposing ? Array.Empty<StrategyInstanceRunner>() : _runners.ToArray();
         foreach (StrategyInstanceRunner runner in runners) runner.Stop(reason);
     }
 
@@ -388,7 +408,7 @@ public sealed class StrategyHost : IDisposable
     {
         if (_clock is IEventDrivenStrategyClock eventClock) eventClock.Advance(marketEvent.Timestamp);
         StrategyInstanceRunner[] runners;
-        lock (_sync) runners = _runners.ToArray();
+        lock (_sync) runners = _disposed || _disposing ? Array.Empty<StrategyInstanceRunner>() : _runners.ToArray();
         foreach (StrategyInstanceRunner runner in runners) runner.OnMarketEvent(marketEvent);
     }
 
@@ -396,22 +416,36 @@ public sealed class StrategyHost : IDisposable
     {
         if (_clock is IEventDrivenStrategyClock eventClock) eventClock.Advance(now);
         StrategyInstanceRunner[] runners;
-        lock (_sync) runners = _runners.ToArray();
+        lock (_sync) runners = _disposed || _disposing ? Array.Empty<StrategyInstanceRunner>() : _runners.ToArray();
         foreach (StrategyInstanceRunner runner in runners) runner.Pulse(now);
     }
 
     public void Dispose()
     {
         StrategyInstanceRunner[] runners;
-        lock (_sync) runners = _runners.ToArray();
-        foreach (StrategyInstanceRunner runner in runners)
+        lock (_sync)
         {
-            try { runner.Dispose(); }
-            finally { if (runner.IsDisposed) lock (_sync) _runners.Remove(runner); }
+            if (_disposed) return;
+            if (_disposing) throw new InvalidOperationException("StrategyHost 正在釋放。");
+            _disposing = true;
+            while (_activeAdds > 0) Monitor.Wait(_sync);
+            runners = _runners.ToArray();
         }
-        lock (_sync) _disposed = true;
-        _source.MarketEventReceived -= OnMarketEvent;
-        _source.Dispose();
+        try
+        {
+            foreach (StrategyInstanceRunner runner in runners)
+            {
+                try { runner.Dispose(); }
+                finally { if (runner.IsDisposed) lock (_sync) _runners.Remove(runner); }
+            }
+            lock (_sync) _disposed = true;
+            _source.MarketEventReceived -= OnMarketEvent;
+            _source.Dispose();
+        }
+        finally
+        {
+            lock (_sync) { _disposing = false; Monitor.PulseAll(_sync); }
+        }
     }
 }
 
