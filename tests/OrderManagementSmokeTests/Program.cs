@@ -585,6 +585,24 @@ partialGateway.EmitState(partialOrder.OrderId, OrderStatus.Rejected, 1, 0);
 Assert(partialLifecycle.Count == partialLifecycleCountAfterDispose,
     "Dispose 後必須解除 gateway callback 訂閱");
 
+var reportedFillGateway = new FakeLiveStrategyOrderGateway();
+var reportedFillService = CreateLiveService(reportedFillGateway, "reported-fill-live");
+var reportedExecutions = new List<ExecutionEvent>();
+reportedFillService.Filled += reportedExecutions.Add;
+PaperOrder reportedFillOrder = reportedFillService.Submit(
+    liveBuy with { StrategyInstanceId = "reported-fill-live", ClientOrderId = "reported-fill-g1" },
+    DateTimeOffset.UtcNow);
+reportedFillGateway.EmitState(reportedFillOrder.OrderId, OrderStatus.Filled, 1, 0);
+Assert(reportedFillService.ActiveBrokerOrderCount == 0 &&
+       reportedFillService.QuarantinedBrokerOrderCount == 1 && reportedExecutions.Count == 0,
+    "terminal Filled report 的 quantity 尚未由 Fill callback 交付 ledger 時仍須 quarantine");
+AssertThrows<InvalidOperationException>(reportedFillService.Dispose,
+    "Filled lifecycle 不得取代 Fill callback ledger delivery");
+reportedFillGateway.EmitFill(reportedFillOrder.OrderId, 1, 0, OrderStatus.Filled, 1, 65000d);
+Assert(reportedExecutions.Count == 1 && reportedFillService.QuarantinedBrokerOrderCount == 0,
+    "完整 Fill callback delivered quantity 一致後才算 settled");
+reportedFillService.Dispose();
+
 // Dispose 必須 fail closed：有 active broker order 時不可清除追蹤或解除 callback。
 var disposeGateway = new FakeLiveStrategyOrderGateway();
 var disposeLifecycle = new List<OrderLifecycleEvent>();
@@ -862,6 +880,38 @@ Assert(filledLive.RequestClose("live-filled-retained", true, out _),
     "Flatten fill 後必須可安全完成 retained cleanup");
 filledLive.Dispose();
 
+// The flatten token is the ownership gate: while the winning caller is still
+// inside the gateway, a concurrent close attempt must not submit a second exit.
+var parallelFlattenHost = new StrategyHost(new FakeHostMarketSource());
+var parallelFlattenGateway = new FakeLiveStrategyOrderGateway { EmitFillBeforePlaceOrderRelease = true };
+var parallelFlattenLive = new LiveStrategyService(
+    parallelFlattenHost, () => true, () => "TEST", _ => atomicUniverse,
+    definition => new ThrowAfterOrderStartStrategy(definition.InstanceId, "225MC"),
+    (definition, universe, commission) => CreateLiveService(parallelFlattenGateway, definition.InstanceId),
+    enableHeartbeat: false);
+var parallelFlattenDefinition = atomicDefinition with { InstanceId = "live-parallel-flatten" };
+AssertThrows<AggregateException>(() => parallelFlattenLive.Add(parallelFlattenDefinition, 36m, 1000m),
+    "parallel flatten 前置必須保留 sync-fill 部位");
+parallelFlattenGateway.EmitFillBeforePlaceOrderRelease = false;
+parallelFlattenGateway.BlockPlaceOrder = true;
+Task<bool> winningClose = Task.Factory.StartNew(
+    () => parallelFlattenLive.RequestClose("live-parallel-flatten", true, out _),
+    TaskCreationOptions.LongRunning);
+Assert(parallelFlattenGateway.PlaceOrderEntered.Wait(TimeSpan.FromSeconds(2)),
+    "第一個 flatten 必須進入 gateway barrier");
+Assert(!parallelFlattenLive.RequestClose("live-parallel-flatten", true, out _) &&
+       parallelFlattenGateway.PlaceOrderCount == 2,
+    "第二個並行 TryFinalize 必須在 flatten token gate 返回且不得送第二張");
+parallelFlattenGateway.ReleasePlaceOrder.Set();
+Assert(winningClose.Wait(TimeSpan.FromSeconds(2)) && !winningClose.Result &&
+       parallelFlattenGateway.PlaceOrderCount == 2,
+    "winning close 完成後仍只能有一張 flatten");
+parallelFlattenGateway.BlockPlaceOrder = false;
+parallelFlattenGateway.EmitFill(parallelFlattenGateway.LastOrderId, 1, 0, OrderStatus.Filled, 1, 64995d);
+Assert(parallelFlattenLive.RequestClose("live-parallel-flatten", true, out _),
+    "唯一 flatten 成交後應可完成 close");
+parallelFlattenLive.Dispose();
+
 // Flatten terminal failure clears the in-flight guard exactly once. Rejected
 // and Cancelled attempts may be retried without concurrent duplicate exits.
 var retryFlattenHost = new StrategyHost(new FakeHostMarketSource());
@@ -875,25 +925,30 @@ var retryFlattenDefinition = atomicDefinition with { InstanceId = "live-flatten-
 AssertThrows<AggregateException>(() => retryFlattenLive.Add(retryFlattenDefinition, 36m, 1000m),
     "retry flatten 前置必須保留 sync-fill 部位");
 retryFlattenGateway.EmitFillBeforePlaceOrderRelease = false;
+retryFlattenGateway.PlaceOutcomes.Enqueue(FakePlaceOutcome.Rejected);
+retryFlattenGateway.PlaceOutcomes.Enqueue(FakePlaceOutcome.Cancelled);
+retryFlattenGateway.PlaceOutcomes.Enqueue(FakePlaceOutcome.Throw);
+retryFlattenGateway.PlaceOutcomes.Enqueue(FakePlaceOutcome.None);
 Assert(!retryFlattenLive.RequestClose("live-flatten-retry", true, out _), "第一次 close 應送 flatten");
-string rejectedFlatten = retryFlattenGateway.LastOrderId;
-retryFlattenGateway.EmitState(rejectedFlatten, OrderStatus.Rejected, 0, 0, "reject flatten 1");
+Assert(retryFlattenGateway.PlaceOrderCount == 2,
+    "同步 Rejected callback 不得在同一 RequestClose call stack 遞迴重送");
+retryFlattenLive.Pulse(DateTimeOffset.UtcNow);
 string cancelledFlatten = retryFlattenGateway.LastOrderId;
-Assert(cancelledFlatten != rejectedFlatten &&
-       GetLiveExecution(retryFlattenLive, "live-flatten-retry").ActiveBrokerOrderCount == 1,
-    "Rejected flatten 必須清 pending 並只重送一張");
-retryFlattenGateway.EmitState(cancelledFlatten, OrderStatus.Cancelled, 0, 0);
+Assert(retryFlattenGateway.PlaceOrderCount == 3,
+    "下一個 Pulse 才能在同步 Rejected 後重送一次，且同步 Cancelled 不得形成 storm");
+retryFlattenLive.Pulse(DateTimeOffset.UtcNow.AddMilliseconds(250));
+Assert(retryFlattenGateway.PlaceOrderCount == 4,
+    "PlaceOrder throw 後下一個 Pulse 只能重送一次");
+retryFlattenLive.Pulse(DateTimeOffset.UtcNow.AddMilliseconds(500));
 string successfulFlatten = retryFlattenGateway.LastOrderId;
-Assert(successfulFlatten != cancelledFlatten &&
+Assert(retryFlattenGateway.PlaceOrderCount == 5 &&
        GetLiveExecution(retryFlattenLive, "live-flatten-retry").ActiveBrokerOrderCount == 1,
-    "Cancelled flatten 必須清 pending 並只重送第三張");
+    "再下一個 Pulse 才送第4次 Flatten，並行 gate只能保留一張 active exit");
 retryFlattenGateway.EmitFill(successfulFlatten, 1, 0, OrderStatus.Filled, 1, 64995d);
-Assert(retryFlattenLive.GetCloseStatus("live-flatten-retry").QuarantinedBrokerOrders == 1,
-    "第三次 Flatten 成功仍不得忽略前一張 Cancelled quarantine");
-retryFlattenGateway.EmitState(cancelledFlatten, OrderStatus.Rejected, 0, 0, "definitive settlement");
-Assert(retryFlattenLive.RequestClose("live-flatten-retry", true, out _),
-    "Cancelled 收到 definitive Rejected settlement 後才可完成 close");
-retryFlattenLive.Dispose();
+Assert(retryFlattenLive.GetCloseStatus("live-flatten-retry").QuarantinedBrokerOrders >= 2,
+    "Rejected/Cancelled 原單都必須保持 quarantine，成功 Flatten 不得猜測其 settlement");
+AssertThrows<InvalidOperationException>(retryFlattenLive.Dispose,
+    "未收到完整 Fill callback 的 Rejected/Cancelled quarantine 必須阻擋 Dispose");
 
 // A loss snapshot published synchronously during Start is deferred until the
 // add lease exits, then risk processing must run exactly once and flatten.
@@ -916,6 +971,52 @@ Assert(startRiskGateway.PlaceOrderCount == 2 &&
 Assert(startRiskLive.RequestClose("live-start-risk", true, out _),
     "延後風控 Flatten 歸零後 retained runner 必須可完成 close");
 startRiskLive.Dispose();
+
+// Pending risk is scoped to one Add incarnation. A flat, fully-settled failed
+// incarnation must not stop a later Add that reuses the same instanceId.
+var generationHost = new StrategyHost(new FakeHostMarketSource());
+var generationGateway = new FakeLiveStrategyOrderGateway { EmitFillBeforePlaceOrderRelease = true };
+int generationCreateCount = 0;
+var generationLive = new LiveStrategyService(
+    generationHost, () => true, () => "TEST", _ => atomicUniverse,
+    definition => Interlocked.Increment(ref generationCreateCount) == 1
+        ? new RoundTripLossThrowStrategy(definition.InstanceId, "225MC")
+        : new HostManagedProbeStrategy(definition.InstanceId, "225MC"),
+    (definition, universe, commission) => new KgiLiveStrategyExecutionService(
+        generationGateway, definition.InstanceId, universe.Tradable,
+        new ContractInfo { ExchangeNm = "JPX", ProductId = "225MC", Symbol = "JPX.225MC-202609", ComYM2 = "202609", CPF = CPFEnum.Futures, ComType = '0' },
+        commission),
+    enableHeartbeat: false);
+var generationDefinition = atomicDefinition with { InstanceId = "live-generation" };
+AssertThrows<InvalidOperationException>(() => generationLive.Add(generationDefinition, 36m, 1m),
+    "flat roundtrip loss incarnation 應回報 Start failure並完整清理");
+generationGateway.EmitFillBeforePlaceOrderRelease = false;
+generationLive.Add(generationDefinition, 36m, 1m);
+Assert(generationLive.GetCloseStatus("live-generation").Exists && generationGateway.PlaceOrderCount == 2 &&
+       generationLive.GetSnapshots().Single(x => x.InstanceId == "live-generation").State == StrategyLifecycleState.Ready,
+    "同ID新generation不得繼承舊loss reason或自動送Flatten");
+generationLive.EmergencyStop("live-generation");
+generationLive.RequestClose("live-generation", false, out _);
+generationLive.Dispose();
+
+// A throwing diagnostic hook cannot bypass ownership cleanup.
+var hookHost = new StrategyHost(new FakeHostMarketSource());
+var hookGateway = new FakeLiveStrategyOrderGateway();
+KgiLiveStrategyExecutionService? hookExecution = null;
+var hookLive = new LiveStrategyService(
+    hookHost, () => true, () => "TEST", _ => atomicUniverse,
+    definition => new ThrowBeforeOrderStartStrategy(definition.InstanceId),
+    (definition, universe, commission) => hookExecution = CreateLiveService(hookGateway, definition.InstanceId),
+    enableHeartbeat: false,
+    afterHostAddFailure: () => throw new InvalidOperationException("hook failed"));
+AssertThrows<AggregateException>(() => hookLive.Add(atomicDefinition with { InstanceId = "live-hook-failure" }, 36m, 1000m),
+    "afterHostAddFailure hook exception 必須被aggregate但不可跳過cleanup");
+Assert(hookHost.GetSnapshots().Count == 0 && hookExecution != null,
+    "無 retained runner 的 hook failure 不得留下Host orphan");
+AssertThrows<ObjectDisposedException>(() => hookExecution!.Submit(
+        liveBuy with { StrategyInstanceId = "live-hook-failure", ClientOrderId = "disposed-hook" }, DateTimeOffset.UtcNow),
+    "hook failure 後 executor 必須已安全Dispose");
+hookLive.Dispose();
 
 // Start is a lifecycle lease. Close APIs wait for it; a duplicate Add is
 // rejected before creating a second executor or live path.
@@ -1009,6 +1110,10 @@ Assert(raceLifecycle.Count(x =>
     "CancelPending 後 late Accepted 不得倒退回 Working");
 raceGateway.EmitState(pendingRace.OrderId, OrderStatus.Cancelled, 0, 0);
 raceGateway.EmitState(pendingRace.OrderId, OrderStatus.Rejected, 0, 0, "settled");
+AssertThrows<InvalidOperationException>(raceService.Dispose,
+    "Rejected/Cancelled terminal report 未由 Fill callback 完整交付前仍須 quarantine");
+raceGateway.EmitFill(cancelledRace.OrderId, 1, 0, OrderStatus.Filled, 1, 65000d);
+raceGateway.EmitFill(pendingRace.OrderId, 1, 0, OrderStatus.Filled, 1, 65000d);
 raceService.Dispose();
 
 // Cancelled tombstone 沒有 definitive settlement 時不可因時間經過而猜測安全。
@@ -1179,6 +1284,7 @@ sealed class FakeLiveStrategyOrderGateway : ILiveStrategyOrderGateway
     public ManualResetEventSlim ReleasePlaceOrder { get; } = new(false);
     public string LastOrderId { get; private set; } = string.Empty;
     public int PlaceOrderCount { get; private set; }
+    public Queue<FakePlaceOutcome> PlaceOutcomes { get; } = new();
 
     public event Action<OrderInfo>? OrderStateChanged;
     public event Action<OrderInfo, int, double>? OrderFilled;
@@ -1204,6 +1310,14 @@ sealed class FakeLiveStrategyOrderGateway : ILiveStrategyOrderGateway
         LastOrderId = request.OrderId;
         PlaceOrderCount++;
         OrderStateChanged?.Invoke(order);
+        FakePlaceOutcome outcome = PlaceOutcomes.Count == 0 ? FakePlaceOutcome.None : PlaceOutcomes.Dequeue();
+        if (outcome == FakePlaceOutcome.Throw) throw new InvalidOperationException("synchronous place failure");
+        if (outcome is FakePlaceOutcome.Rejected or FakePlaceOutcome.Cancelled)
+        {
+            order.Status = outcome == FakePlaceOutcome.Rejected ? OrderStatus.Rejected : OrderStatus.Cancelled;
+            order.LeavesQty = 0;
+            OrderStateChanged?.Invoke(order);
+        }
         if (EmitFillBeforePlaceOrderRelease)
         {
             order.Status = OrderStatus.Filled;
@@ -1261,6 +1375,8 @@ sealed class FakeLiveStrategyOrderGateway : ILiveStrategyOrderGateway
     public void EmitCancelFailed(string orderId, string reason) => CancelFailed?.Invoke(_orders[orderId], reason);
 }
 
+enum FakePlaceOutcome { None, Rejected, Cancelled, Throw }
+
 sealed class FakeHostMarketSource : IMarketEventSource
 {
     public event Action<MarketEvent>? MarketEventReceived;
@@ -1300,6 +1416,49 @@ sealed class ThrowAfterOrderStartStrategy : ISimulationStrategy, IManagedOrderSt
     public void Pause(string reason) => State = StrategyLifecycleState.Suspended;
     public void Resume() => State = StrategyLifecycleState.Ready;
     public void Stop(string reason) { CancelAllRequested?.Invoke(); State = StrategyLifecycleState.Stopped; }
+    public StrategySnapshot GetSnapshot() => new() { StrategyType = StrategyType, InstanceId = InstanceId, State = State };
+}
+
+sealed class ThrowBeforeOrderStartStrategy : ISimulationStrategy
+{
+    public ThrowBeforeOrderStartStrategy(string instanceId) => InstanceId = instanceId;
+    public string StrategyType => "ThrowBeforeOrder";
+    public string InstanceId { get; }
+    public StrategyLifecycleState State => StrategyLifecycleState.Created;
+    public event Action<PaperOrderRequest>? OrderRequested;
+    public event Action? CancelAllRequested;
+    public event Action<StrategySnapshot>? SnapshotChanged;
+    public void Start(StrategyRuntimeContext context) => throw new InvalidOperationException("start failed before order");
+    public void OnMarketEvent(MarketEvent marketEvent) { }
+    public void OnExecution(ExecutionEvent execution) { }
+    public void Pause(string reason) { }
+    public void Resume() { }
+    public void Stop(string reason) { }
+    public StrategySnapshot GetSnapshot() => new() { StrategyType = StrategyType, InstanceId = InstanceId, State = State };
+}
+
+sealed class RoundTripLossThrowStrategy : ISimulationStrategy
+{
+    private readonly string _symbol;
+    public RoundTripLossThrowStrategy(string instanceId, string symbol) { InstanceId = instanceId; _symbol = symbol; }
+    public string StrategyType => "RoundTripLossThrow";
+    public string InstanceId { get; }
+    public StrategyLifecycleState State { get; private set; } = StrategyLifecycleState.Created;
+    public event Action<PaperOrderRequest>? OrderRequested;
+    public event Action? CancelAllRequested;
+    public event Action<StrategySnapshot>? SnapshotChanged;
+    public void Start(StrategyRuntimeContext context)
+    {
+        OrderRequested?.Invoke(new PaperOrderRequest { StrategyInstanceId = InstanceId, ClientOrderId = "rt-buy", Symbol = _symbol, Side = BuySell.Buy, Type = PaperOrderType.BrokerLimit, Role = PaperOrderRole.EntryLong, Price = 65000m, Quantity = 1 });
+        OrderRequested?.Invoke(new PaperOrderRequest { StrategyInstanceId = InstanceId, ClientOrderId = "rt-sell", Symbol = _symbol, Side = BuySell.Sell, Type = PaperOrderType.BrokerLimit, Role = PaperOrderRole.Flatten, Price = 65000m, Quantity = 1 });
+        SnapshotChanged?.Invoke(GetSnapshot());
+        throw new InvalidOperationException("roundtrip start failed");
+    }
+    public void OnMarketEvent(MarketEvent marketEvent) { }
+    public void OnExecution(ExecutionEvent execution) { }
+    public void Pause(string reason) => State = StrategyLifecycleState.Suspended;
+    public void Resume() => State = StrategyLifecycleState.Ready;
+    public void Stop(string reason) => State = StrategyLifecycleState.Stopped;
     public StrategySnapshot GetSnapshot() => new() { StrategyType = StrategyType, InstanceId = InstanceId, State = State };
 }
 

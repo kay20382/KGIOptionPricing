@@ -68,7 +68,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
     public int LocalConditionCount { get { lock (_sync) return _conditions.Count; } }
     public int QuarantinedBrokerOrderCount
     {
-        get { lock (_sync) return _realOrders.Values.Count(x => x.AwaitingSettlement); }
+        get { lock (_sync) return _realOrders.Values.Count(x => x.Terminal && x.AwaitingSettlement); }
     }
 
     public KgiLiveStrategyExecutionService(
@@ -304,7 +304,8 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
             {
                 Order = order,
                 Trigger = request.Price,
-                RemainingQuantity = order.Quantity
+                RemainingQuantity = order.Quantity,
+                AwaitingSettlement = true
             };
         }
         PublishTransition(order.OrderId, OrderLifecycleState.Submitted, null, "Submitted", now);
@@ -334,7 +335,8 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
             {
                 Order = condition,
                 Trigger = trigger,
-                RemainingQuantity = condition.Quantity
+                RemainingQuantity = condition.Quantity,
+                AwaitingSettlement = true
             };
         }
         StateChanged?.Invoke();
@@ -355,7 +357,15 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         }
         catch (Exception ex)
         {
-            lock (_sync) _realOrders.Remove(realId);
+            lock (_sync)
+            {
+                if (_realOrders.TryGetValue(realId, out TrackedRealOrder? tracked))
+                {
+                    tracked.Terminal = true;
+                    tracked.TerminalAt = _now();
+                    tracked.AwaitingSettlement = true;
+                }
+            }
             Failed?.Invoke("實盤送單例外：" + ex.GetBaseException().Message);
             StateChanged?.Invoke();
         }
@@ -478,7 +488,12 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
                 lifecycle = CreateTransitionLocked(tracked, OrderLifecycleState.Rejected, brokerOrder,
                     "Rejected", _now());
             else
-                legacyRemoved = _realOrders.Remove(brokerOrder.OrderId);
+            {
+                tracked.Terminal = true;
+                tracked.TerminalAt = _now();
+                tracked.AwaitingSettlement = true;
+                legacyRemoved = true;
+            }
             if (!tracked.FailurePublished)
             {
                 tracked.FailurePublished = true;
@@ -529,15 +544,13 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
             UpdateBrokerOrderId(tracked, brokerOrder);
             if (!tracked.IsManaged)
             {
-                if (brokerOrder.Status == OrderStatus.Cancelled)
+                if (brokerOrder.Status is OrderStatus.Filled or OrderStatus.Cancelled or OrderStatus.Rejected)
                 {
                     tracked.Terminal = true;
                     tracked.TerminalAt = _now();
                     tracked.AwaitingSettlement = true;
                     legacyChanged = true;
                 }
-                else if (brokerOrder.Status is OrderStatus.Filled or OrderStatus.Rejected)
-                    legacyChanged = _realOrders.Remove(brokerOrder.OrderId);
             }
             else
             {
@@ -545,13 +558,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
                 // guarantees the execution reaches the ledger first.
                 if (tracked.Terminal)
                 {
-                    if (tracked.AwaitingSettlement && brokerOrder.Status == OrderStatus.Rejected)
-                    {
-                        tracked.AwaitingSettlement = false;
-                        tracked.TerminalAt = _now();
-                        legacyChanged = true;
-                    }
-                    else return;
+                    return;
                 }
                 else
                 switch (brokerOrder.Status)
@@ -633,6 +640,9 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         if (tracked.LifecycleState == state &&
             tracked.FilledQuantity == filled && tracked.RemainingQuantity == remaining)
         {
+            if (state == OrderLifecycleState.Filled &&
+                tracked.DeliveredFilledQuantity >= tracked.Order.Quantity && remaining == 0)
+                tracked.AwaitingSettlement = false;
             if (terminal)
             {
                 tracked.Terminal = true;
@@ -647,8 +657,8 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         tracked.RemainingQuantity = remaining;
         tracked.Terminal = tracked.Terminal || terminal;
         if (terminal) tracked.TerminalAt = timestamp;
-        if (state == OrderLifecycleState.Cancelled) tracked.AwaitingSettlement = true;
-        else if (state is OrderLifecycleState.Filled or OrderLifecycleState.Rejected) tracked.AwaitingSettlement = false;
+        if (state == OrderLifecycleState.Filled && tracked.DeliveredFilledQuantity >= tracked.Order.Quantity && remaining == 0)
+            tracked.AwaitingSettlement = false;
         return new OrderLifecycleEvent
         {
             Timestamp = timestamp,
@@ -752,7 +762,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
                 throw new InvalidOperationException($"仍有 {active} 張實盤委託未終結，禁止釋放執行器。");
             if (_inflightCallbacks > 0 || _inflightOperations > 0)
                 throw new InvalidOperationException($"仍有 {_inflightCallbacks} 個 callback／{_inflightOperations} 個操作尚未完成，禁止釋放執行器。");
-            int quarantined = _realOrders.Values.Count(x => x.AwaitingSettlement);
+            int quarantined = _realOrders.Values.Count(x => x.Terminal && x.AwaitingSettlement);
             if (quarantined > 0)
                 throw new InvalidOperationException($"仍有 {quarantined} 張已撤委託等待 late-fill settlement，禁止釋放執行器。");
             if (!isLedgerFlat())

@@ -326,6 +326,7 @@ public sealed class StrategyHost : IDisposable
     private readonly IMarketEventSource _source;
     private bool _disposed;
     private bool _disposing;
+    private bool _administrativeStop;
     private readonly Dictionary<string, int> _addOwners = new(StringComparer.OrdinalIgnoreCase);
     internal bool IsDisposed { get { lock (_sync) return _disposed; } }
 
@@ -349,6 +350,8 @@ public sealed class StrategyHost : IDisposable
         lock (_sync)
         {
             if (_disposed || _disposing) throw new ObjectDisposedException(nameof(StrategyHost));
+            if (_administrativeStop)
+                throw new InvalidOperationException("StopAll 正在執行，暫停新增策略。");
             if (_addOwners.ContainsKey(strategy.InstanceId) ||
                 _runners.Any(x => string.Equals(x.InstanceId, strategy.InstanceId, StringComparison.OrdinalIgnoreCase)))
                 throw new InvalidOperationException($"策略實例已存在：{strategy.InstanceId}");
@@ -365,7 +368,7 @@ public sealed class StrategyHost : IDisposable
             try { runner.Initialize(); }
             catch (Exception startError)
             {
-                try { runner.Dispose(); }
+                try { runner.Dispose(); _ledger.RemoveFlatInstance(strategy.InstanceId); }
                 catch (Exception cleanupError)
                 {
                     lock (_sync) _runners.Add(runner);
@@ -427,15 +430,33 @@ public sealed class StrategyHost : IDisposable
         try { runner.Dispose(); }
         finally
         {
-            if (runner.IsDisposed) lock (_sync) _runners.Remove(runner);
+            if (runner.IsDisposed)
+            {
+                lock (_sync) _runners.Remove(runner);
+                _ledger.RemoveFlatInstance(instanceId);
+            }
         }
         return true;
     }
 
     public void StopAll(string reason = "全部停止")
     {
-        StrategyInstanceRunner[] runners = GetRunnersForOperation(throwIfDisposed: false);
-        foreach (StrategyInstanceRunner runner in runners) runner.Stop(reason);
+        StrategyInstanceRunner[] runners;
+        lock (_sync)
+        {
+            if (_disposed || _disposing) return;
+            if (_addOwners.Count > 0)
+                throw new InvalidOperationException("仍有策略正在 Add/Start，StopAll 未執行；請稍後重試。");
+            if (_administrativeStop)
+                throw new InvalidOperationException("StopAll 已在執行中。");
+            _administrativeStop = true;
+            runners = _runners.ToArray();
+        }
+        try { foreach (StrategyInstanceRunner runner in runners) runner.Stop(reason); }
+        finally
+        {
+            lock (_sync) { _administrativeStop = false; Monitor.PulseAll(_sync); }
+        }
     }
 
     private void OnMarketEvent(MarketEvent marketEvent)

@@ -359,9 +359,14 @@ using (var perInstanceHost = new StrategyHost(perInstanceSource, new MutableStra
         "同 instanceId Host.Add 必須在第一個 Start 完成前原子拒絕");
     Assert(perInstanceHost.GetSnapshots().Count == 1,
         "GetSnapshots 不得等待或暴露 partial B runner");
+    AssertThrows<InvalidOperationException>(() => perInstanceHost.StopAll("administrative stop"),
+        "pending Add 存在時 StopAll 必須 fail closed，不得假裝全部停止");
     releaseSlow.Set();
     Assert(slowAdd.Wait(TimeSpan.FromSeconds(5)) && perInstanceHost.GetSnapshots().Count == 2,
         "B Start 完成後才可公開 runner");
+    perInstanceHost.StopAll("administrative stop retry");
+    Assert(perInstanceHost.GetSnapshots().All(x => x.State == StrategyLifecycleState.Stopped),
+        "pending Add 完成後重試 StopAll 才可線性化地停止全部 runner");
 }
 
 var serializedClock = new MutableStrategyClock(heartbeatTime);

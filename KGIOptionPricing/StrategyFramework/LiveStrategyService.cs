@@ -38,11 +38,15 @@ public sealed class LiveStrategyService : IDisposable
     private readonly ConcurrentDictionary<string, KgiLiveStrategyExecutionService> _executions = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, decimal> _dailyLossLimits = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, byte> _riskTriggered = new(StringComparer.OrdinalIgnoreCase);
-    private readonly ConcurrentDictionary<string, string> _pendingRisk = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, PendingRisk> _pendingRisk = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, byte> _riskProcessing = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, long> _activeGenerations = new(StringComparer.OrdinalIgnoreCase);
+    private long _generationSequence;
     private readonly ConcurrentDictionary<string, byte> _pendingClose = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, byte> _closeFlattenAuthorized = new(StringComparer.OrdinalIgnoreCase);
-    private readonly ConcurrentDictionary<string, byte> _flattenPending = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, long> _flattenPending = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, byte> _closeRetryNeeded = new(StringComparer.OrdinalIgnoreCase);
+    private long _flattenToken;
     private readonly ConcurrentDictionary<string, AddReservation> _addReservations = new(StringComparer.OrdinalIgnoreCase);
     private bool _disposed;
 
@@ -74,7 +78,7 @@ public sealed class LiveStrategyService : IDisposable
         _host = new StrategyHost(new KgiStrategyMarketDataSource(quote));
         _host.SnapshotChanged += OnSnapshot;
         _host.ExecutionOccurred += execution => ExecutionOccurred?.Invoke(execution);
-        _heartbeat = new StrategyHeartbeatTimer(_host.Pulse);
+        _heartbeat = new StrategyHeartbeatTimer(Pulse);
     }
 
     public LiveStrategyService(
@@ -97,7 +101,7 @@ public sealed class LiveStrategyService : IDisposable
         _afterHostAddFailure = afterHostAddFailure;
         _host.SnapshotChanged += OnSnapshot;
         _host.ExecutionOccurred += execution => ExecutionOccurred?.Invoke(execution);
-        _heartbeat = enableHeartbeat ? new StrategyHeartbeatTimer(_host.Pulse) : null;
+        _heartbeat = enableHeartbeat ? new StrategyHeartbeatTimer(Pulse) : null;
     }
 
     public void Add(StrategyDefinition definition, decimal commissionPerContract, decimal dailyLossLimit)
@@ -109,7 +113,7 @@ public sealed class LiveStrategyService : IDisposable
             throw new InvalidOperationException("Mini 領先 Micro 尚屬研究策略；未明確標記已通過樣本外、滑價、延遲與模擬盤門檻，禁止實盤啟動。");
         if (!string.Equals(definition.Universe.Tradable.ProductId, "225MC", StringComparison.OrdinalIgnoreCase))
             throw new InvalidOperationException("實盤策略第一版僅允許交易商品 225MC。");
-        var reservation = new AddReservation(Environment.CurrentManagedThreadId);
+        var reservation = new AddReservation(Environment.CurrentManagedThreadId, Interlocked.Increment(ref _generationSequence));
         if (!_addReservations.TryAdd(definition.InstanceId, reservation))
             throw new InvalidOperationException($"實盤策略實例正在加入：{definition.InstanceId}");
         try
@@ -120,7 +124,7 @@ public sealed class LiveStrategyService : IDisposable
 
             ResolvedStrategyUniverse universe = _resolve(definition);
             var execution = _createExecution(definition, universe, commissionPerContract);
-            execution.Failed += reason => QueueRiskStop(definition.InstanceId, reason);
+            execution.Failed += reason => QueueRiskStop(definition.InstanceId, reservation.Generation, reason);
             execution.StateChanged += () => OnExecutionStateChanged(definition.InstanceId, execution);
             if (!_executions.TryAdd(definition.InstanceId, execution))
             {
@@ -128,18 +132,25 @@ public sealed class LiveStrategyService : IDisposable
                 throw new InvalidOperationException($"實盤策略實例已存在：{definition.InstanceId}");
             }
             _dailyLossLimits[definition.InstanceId] = Math.Max(1m, dailyLossLimit);
+            _activeGenerations[definition.InstanceId] = reservation.Generation;
             try
             {
                 _host.Add(_createStrategy(definition), universe, commissionPerContract, execution);
             }
             catch (Exception addError)
             {
-                _afterHostAddFailure?.Invoke();
+                Exception? hookError = null;
+                try { _afterHostAddFailure?.Invoke(); }
+                catch (Exception exception) { hookError = exception; }
                 // Host retaining the runner is the single owner of this executor.
                 // Never race an independent cleanup against its ledger/routes.
                 bool retainedByHost = _host.GetSnapshots().Any(x =>
                     string.Equals(x.InstanceId, definition.InstanceId, StringComparison.OrdinalIgnoreCase));
-                if (retainedByHost) throw;
+                if (retainedByHost)
+                {
+                    if (hookError != null) throw new AggregateException(addError, hookError);
+                    throw;
+                }
                 try
                 {
                     execution.Dispose();
@@ -152,6 +163,11 @@ public sealed class LiveStrategyService : IDisposable
                 }
                 _executions.TryRemove(definition.InstanceId, out _);
                 _dailyLossLimits.TryRemove(definition.InstanceId, out _);
+                _activeGenerations.TryRemove(definition.InstanceId, out _);
+                if (_pendingRisk.TryGetValue(definition.InstanceId, out PendingRisk? pending) &&
+                    pending.Generation == reservation.Generation)
+                    _pendingRisk.TryRemove(definition.InstanceId, out _);
+                if (hookError != null) throw new AggregateException(addError, hookError);
                 throw;
             }
         }
@@ -159,7 +175,7 @@ public sealed class LiveStrategyService : IDisposable
         {
             _addReservations.TryRemove(definition.InstanceId, out _);
             reservation.Completed.Set();
-            TryProcessPendingRisk(definition.InstanceId);
+            TryProcessPendingRisk(definition.InstanceId, reservation.Generation);
         }
     }
 
@@ -248,6 +264,8 @@ public sealed class LiveStrategyService : IDisposable
             _executions.TryRemove(instanceId, out _);
             _dailyLossLimits.TryRemove(instanceId, out _);
             _riskTriggered.TryRemove(instanceId, out _);
+            _activeGenerations.TryRemove(instanceId, out _);
+            _pendingRisk.TryRemove(instanceId, out _);
             _pendingClose.TryRemove(instanceId, out _);
             _closeFlattenAuthorized.TryRemove(instanceId, out _);
             _flattenPending.TryRemove(instanceId, out _);
@@ -256,6 +274,17 @@ public sealed class LiveStrategyService : IDisposable
     }
 
     public IReadOnlyList<StrategySnapshot> GetSnapshots() => _host.GetSnapshots();
+
+    public void Pulse(DateTimeOffset now)
+    {
+        _host.Pulse(now);
+        foreach (string instanceId in _closeRetryNeeded.Keys.ToArray())
+        {
+            if (_closeRetryNeeded.TryRemove(instanceId, out _)) TryFinalizeClose(instanceId);
+        }
+        foreach (string instanceId in _pendingRisk.Keys.ToArray())
+            if (_activeGenerations.TryGetValue(instanceId, out long generation)) TryProcessPendingRisk(instanceId, generation);
+    }
 
     public IReadOnlyList<string> GetShutdownWarnings()
     {
@@ -280,10 +309,15 @@ public sealed class LiveStrategyService : IDisposable
             try { handler(snapshot); }
             catch (Exception exception) { Debug.WriteLine($"Live snapshot subscriber failed: {exception}"); }
         }
-        if (_pendingClose.ContainsKey(snapshot.InstanceId)) TryFinalizeClose(snapshot.InstanceId);
+        if (_pendingClose.ContainsKey(snapshot.InstanceId)) _closeRetryNeeded.TryAdd(snapshot.InstanceId, 0);
         if (_dailyLossLimits.TryGetValue(snapshot.InstanceId, out decimal limit) && snapshot.NetPnl <= -limit &&
             !_riskTriggered.ContainsKey(snapshot.InstanceId))
-            QueueRiskStop(snapshot.InstanceId, $"觸發單日最大虧損 ¥{limit}");
+        {
+            long generation = _addReservations.TryGetValue(snapshot.InstanceId, out AddReservation? reservation)
+                ? reservation.Generation
+                : _activeGenerations.GetValueOrDefault(snapshot.InstanceId);
+            if (generation != 0) QueueRiskStop(snapshot.InstanceId, generation, $"觸發單日最大虧損 ¥{limit}");
+        }
     }
 
     private void WaitForAdd(string instanceId)
@@ -294,19 +328,21 @@ public sealed class LiveStrategyService : IDisposable
         reservation.Completed.Wait();
     }
 
-    private void QueueRiskStop(string instanceId, string reason)
+    private void QueueRiskStop(string instanceId, long generation, string reason)
     {
-        _pendingRisk[instanceId] = reason;
-        TryProcessPendingRisk(instanceId);
+        _pendingRisk[instanceId] = new PendingRisk(generation, reason);
+        TryProcessPendingRisk(instanceId, generation);
     }
 
-    private void TryProcessPendingRisk(string instanceId)
+    private void TryProcessPendingRisk(string instanceId, long generation)
     {
-        if (_addReservations.ContainsKey(instanceId) || !_pendingRisk.TryGetValue(instanceId, out string? reason) ||
+        if (_addReservations.ContainsKey(instanceId) || !_pendingRisk.TryGetValue(instanceId, out PendingRisk? pending) ||
+            pending.Generation != generation || !_activeGenerations.TryGetValue(instanceId, out long activeGeneration) ||
+            activeGeneration != generation ||
             !_riskProcessing.TryAdd(instanceId, 0)) return;
         try
         {
-            if (EmergencyStop(instanceId, reason))
+            if (EmergencyStop(instanceId, pending.Reason))
             {
                 _riskTriggered.TryAdd(instanceId, 0);
                 _pendingRisk.TryRemove(instanceId, out _);
@@ -328,9 +364,15 @@ public sealed class LiveStrategyService : IDisposable
         if (execution.ActiveBrokerOrderCount > 0) return false;
         if (snapshot.Position != 0)
         {
-            if (!_closeFlattenAuthorized.ContainsKey(instanceId) || _flattenPending.ContainsKey(instanceId)) return false;
-            _flattenPending.TryAdd(instanceId, 0);
-            execution.Flatten(snapshot.Position);
+            if (!_closeFlattenAuthorized.ContainsKey(instanceId) ||
+                !_flattenPending.TryAdd(instanceId, Interlocked.Increment(ref _flattenToken))) return false;
+            try { execution.Flatten(snapshot.Position); }
+            catch
+            {
+                _flattenPending.TryRemove(instanceId, out _);
+                _closeRetryNeeded.TryAdd(instanceId, 0);
+                throw;
+            }
             return false;
         }
         if (execution.QuarantinedBrokerOrderCount > 0) return false;
@@ -343,8 +385,10 @@ public sealed class LiveStrategyService : IDisposable
 
     private void OnExecutionStateChanged(string instanceId, KgiLiveStrategyExecutionService execution)
     {
-        if (execution.ActiveBrokerOrderCount == 0) _flattenPending.TryRemove(instanceId, out _);
-        TryFinalizeClose(instanceId);
+        if (execution.ActiveBrokerOrderCount == 0 && _flattenPending.TryRemove(instanceId, out _))
+            _closeRetryNeeded.TryAdd(instanceId, 0);
+        else if (_pendingClose.ContainsKey(instanceId) && execution.ActiveBrokerOrderCount == 0)
+            _closeRetryNeeded.TryAdd(instanceId, 0);
     }
 
     public void Dispose()
@@ -383,7 +427,7 @@ public sealed class LiveStrategyService : IDisposable
         }
         catch (Exception exception)
         {
-            if (timerDrained && !_host.IsDisposed && _heartbeat != null) _heartbeat = new StrategyHeartbeatTimer(_host.Pulse);
+            if (timerDrained && !_host.IsDisposed && _heartbeat != null) _heartbeat = new StrategyHeartbeatTimer(Pulse);
             if (_host.IsDisposed) _disposed = true;
             attempt.Error = exception;
             throw;
@@ -405,8 +449,11 @@ public sealed class LiveStrategyService : IDisposable
 
     private sealed class AddReservation
     {
-        internal AddReservation(int ownerThreadId) => OwnerThreadId = ownerThreadId;
+        internal AddReservation(int ownerThreadId, long generation) { OwnerThreadId = ownerThreadId; Generation = generation; }
         internal int OwnerThreadId { get; }
+        internal long Generation { get; }
         internal ManualResetEventSlim Completed { get; } = new(false);
     }
+
+    private sealed record PendingRisk(long Generation, string Reason);
 }
