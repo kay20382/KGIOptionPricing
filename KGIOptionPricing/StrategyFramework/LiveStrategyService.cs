@@ -23,28 +23,45 @@ public sealed class LiveStrategyService : IDisposable
     private readonly StrategyRegistry _registry = new();
     private readonly StrategyProductResolver _resolver = new();
     private readonly StrategyHost _host;
-    private StrategyHeartbeatTimer _heartbeat;
+    private StrategyHeartbeatTimer? _heartbeat;
     private readonly object _disposeSync = new();
     private DisposeAttempt? _disposeAttempt;
     private readonly OrderManager _orders;
-    private readonly KGITradeService _trade;
+    private readonly Func<bool> _isLoggedIn;
+    private readonly Func<string> _account;
+    private readonly Func<StrategyDefinition, ResolvedStrategyUniverse> _resolve;
+    private readonly Func<StrategyDefinition, ISimulationStrategy> _createStrategy;
+    private readonly Func<StrategyDefinition, ResolvedStrategyUniverse, decimal, KgiLiveStrategyExecutionService> _createExecution;
+    private readonly Action? _afterHostAddFailure;
     private readonly ConcurrentDictionary<string, KgiLiveStrategyExecutionService> _executions = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, decimal> _dailyLossLimits = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, byte> _riskTriggered = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, byte> _pendingClose = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, byte> _closeFlattenAuthorized = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, byte> _flattenPending = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, byte> _addReservations = new(StringComparer.OrdinalIgnoreCase);
     private bool _disposed;
 
     public event Action<StrategySnapshot>? SnapshotChanged;
     public event Action<ExecutionEvent>? ExecutionOccurred;
-    public string Account => _trade.Account;
-    public bool IsLoggedIn => _trade.IsLoggedIn;
+    public string Account => _account();
+    public bool IsLoggedIn => _isLoggedIn();
 
     public LiveStrategyService(KGIQuoteService quote, OrderManager orders, KGITradeService trade)
     {
         _orders = orders;
-        _trade = trade;
+        _isLoggedIn = () => trade.IsLoggedIn;
+        _account = () => trade.Account;
+        _resolve = definition => _resolver.Resolve(definition.Universe);
+        _createStrategy = definition => _registry.Get(definition.StrategyType).Create(definition);
+        _createExecution = (definition, universe, commission) =>
+        {
+            ContractInfo contract = SymbolRepository.Instance.GetHotMonthContract(definition.Universe.Tradable.ProductId)
+                ?? throw new InvalidOperationException("找不到 225MC 熱門月合約，禁止實盤啟動。");
+            return new KgiLiveStrategyExecutionService(
+                _orders, trade, definition.InstanceId, universe.Tradable, contract, commission);
+        };
+        _afterHostAddFailure = null;
         _registry.Register(new MeanReversionScalperFactory());
         _registry.Register(new WaveletScalperFactory());
         _registry.Register(new NikkeiMicrostructureAlphaFactory());
@@ -56,47 +73,84 @@ public sealed class LiveStrategyService : IDisposable
         _heartbeat = new StrategyHeartbeatTimer(_host.Pulse);
     }
 
+    public LiveStrategyService(
+        StrategyHost host,
+        Func<bool> isLoggedIn,
+        Func<string> account,
+        Func<StrategyDefinition, ResolvedStrategyUniverse> resolve,
+        Func<StrategyDefinition, ISimulationStrategy> createStrategy,
+        Func<StrategyDefinition, ResolvedStrategyUniverse, decimal, KgiLiveStrategyExecutionService> createExecution,
+        bool enableHeartbeat,
+        Action? afterHostAddFailure = null)
+    {
+        _orders = null!;
+        _host = host ?? throw new ArgumentNullException(nameof(host));
+        _isLoggedIn = isLoggedIn ?? throw new ArgumentNullException(nameof(isLoggedIn));
+        _account = account ?? throw new ArgumentNullException(nameof(account));
+        _resolve = resolve ?? throw new ArgumentNullException(nameof(resolve));
+        _createStrategy = createStrategy ?? throw new ArgumentNullException(nameof(createStrategy));
+        _createExecution = createExecution ?? throw new ArgumentNullException(nameof(createExecution));
+        _afterHostAddFailure = afterHostAddFailure;
+        _host.SnapshotChanged += OnSnapshot;
+        _host.ExecutionOccurred += execution => ExecutionOccurred?.Invoke(execution);
+        _heartbeat = enableHeartbeat ? new StrategyHeartbeatTimer(_host.Pulse) : null;
+    }
+
     public void Add(StrategyDefinition definition, decimal commissionPerContract, decimal dailyLossLimit)
     {
-        if (!_trade.IsLoggedIn) throw new InvalidOperationException("交易服務尚未登入，禁止啟動實盤策略。");
+        if (!_isLoggedIn()) throw new InvalidOperationException("交易服務尚未登入，禁止啟動實盤策略。");
         if (string.Equals(definition.StrategyType, MiniLeadMicroFactory.TypeName, StringComparison.OrdinalIgnoreCase) &&
             (!definition.Parameters.TryGetValue("ResearchValidated", out string? validated) ||
              !bool.TryParse(validated, out bool isValidated) || !isValidated))
             throw new InvalidOperationException("Mini 領先 Micro 尚屬研究策略；未明確標記已通過樣本外、滑價、延遲與模擬盤門檻，禁止實盤啟動。");
         if (!string.Equals(definition.Universe.Tradable.ProductId, "225MC", StringComparison.OrdinalIgnoreCase))
             throw new InvalidOperationException("實盤策略第一版僅允許交易商品 225MC。");
-        if (_host.GetSnapshots().Any(x => string.Equals(x.InstanceId, definition.InstanceId, StringComparison.OrdinalIgnoreCase)))
-            throw new InvalidOperationException($"實盤策略實例已存在：{definition.InstanceId}");
-
-        ResolvedStrategyUniverse universe = _resolver.Resolve(definition.Universe);
-        ContractInfo contract = SymbolRepository.Instance.GetHotMonthContract(definition.Universe.Tradable.ProductId)
-            ?? throw new InvalidOperationException("找不到 225MC 熱門月合約，禁止實盤啟動。");
-        var execution = new KgiLiveStrategyExecutionService(
-            _orders, _trade, definition.InstanceId, universe.Tradable, contract, commissionPerContract);
-        execution.Failed += reason => EmergencyStop(definition.InstanceId, reason);
-        execution.StateChanged += () => TryFinalizeClose(definition.InstanceId);
-        _executions[definition.InstanceId] = execution;
-        _dailyLossLimits[definition.InstanceId] = Math.Max(1m, dailyLossLimit);
+        if (!_addReservations.TryAdd(definition.InstanceId, 0))
+            throw new InvalidOperationException($"實盤策略實例正在加入：{definition.InstanceId}");
         try
         {
-            _host.Add(_registry.Get(definition.StrategyType).Create(definition), universe, commissionPerContract, execution);
-        }
-        catch (Exception addError)
-        {
-            try
+            if (_executions.ContainsKey(definition.InstanceId) ||
+                _host.GetSnapshots().Any(x => string.Equals(x.InstanceId, definition.InstanceId, StringComparison.OrdinalIgnoreCase)))
+                throw new InvalidOperationException($"實盤策略實例已存在：{definition.InstanceId}");
+
+            ResolvedStrategyUniverse universe = _resolve(definition);
+            var execution = _createExecution(definition, universe, commissionPerContract);
+            execution.Failed += reason => EmergencyStop(definition.InstanceId, reason);
+            execution.StateChanged += () => TryFinalizeClose(definition.InstanceId);
+            if (!_executions.TryAdd(definition.InstanceId, execution))
             {
                 execution.Dispose();
+                throw new InvalidOperationException($"實盤策略實例已存在：{definition.InstanceId}");
             }
-            catch (Exception cleanupError)
+            _dailyLossLimits[definition.InstanceId] = Math.Max(1m, dailyLossLimit);
+            try
             {
-                // Ownership must remain discoverable when an active live order
-                // prevents cleanup; close/retry paths still need this executor.
-                throw new AggregateException("策略加入失敗，且實盤執行器仍有活動資源。", addError, cleanupError);
+                _host.Add(_createStrategy(definition), universe, commissionPerContract, execution);
             }
-            _executions.TryRemove(definition.InstanceId, out _);
-            _dailyLossLimits.TryRemove(definition.InstanceId, out _);
-            throw;
+            catch (Exception addError)
+            {
+                _afterHostAddFailure?.Invoke();
+                // Host retaining the runner is the single owner of this executor.
+                // Never race an independent cleanup against its ledger/routes.
+                bool retainedByHost = _host.GetSnapshots().Any(x =>
+                    string.Equals(x.InstanceId, definition.InstanceId, StringComparison.OrdinalIgnoreCase));
+                if (retainedByHost) throw;
+                try
+                {
+                    execution.Dispose();
+                }
+                catch (Exception cleanupError)
+                {
+                    // Ownership must remain discoverable when an active live order
+                    // prevents cleanup; close/retry paths still need this executor.
+                    throw new AggregateException("策略加入失敗，且實盤執行器仍有活動資源。", addError, cleanupError);
+                }
+                _executions.TryRemove(definition.InstanceId, out _);
+                _dailyLossLimits.TryRemove(definition.InstanceId, out _);
+                throw;
+            }
         }
+        finally { _addReservations.TryRemove(definition.InstanceId, out _); }
     }
 
     public bool Pause(string instanceId)
@@ -105,7 +159,7 @@ public sealed class LiveStrategyService : IDisposable
         return snapshot != null && _host.Pause(instanceId);
     }
 
-    public bool Resume(string instanceId) => _trade.IsLoggedIn && _host.Resume(instanceId);
+    public bool Resume(string instanceId) => _isLoggedIn() && _host.Resume(instanceId);
 
     public bool EmergencyStop(string instanceId, string reason = "使用者停止實盤策略")
     {
@@ -258,7 +312,7 @@ public sealed class LiveStrategyService : IDisposable
                 .ToArray();
             if (unsafeStates.Length > 0)
                 throw new InvalidOperationException("實盤策略尚有部位、broker 委託或本地條件，禁止釋放服務。");
-            _heartbeat.Dispose();
+            _heartbeat?.Dispose();
             timerDrained = true;
             _host.Dispose();
             _host.SnapshotChanged -= OnSnapshot;
@@ -266,7 +320,7 @@ public sealed class LiveStrategyService : IDisposable
         }
         catch (Exception exception)
         {
-            if (timerDrained && !_host.IsDisposed) _heartbeat = new StrategyHeartbeatTimer(_host.Pulse);
+            if (timerDrained && !_host.IsDisposed && _heartbeat != null) _heartbeat = new StrategyHeartbeatTimer(_host.Pulse);
             if (_host.IsDisposed) _disposed = true;
             attempt.Error = exception;
             throw;

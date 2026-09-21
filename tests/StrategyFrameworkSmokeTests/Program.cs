@@ -279,6 +279,18 @@ using (var startFailureHost = new StrategyHost(new FakeSource()))
         "strategy.Start 失敗時 Add 必須失敗");
     Assert(startFailureHost.GetSnapshots().Count == 0, "Start 失敗不得留下 runner");
 }
+using (var startSnapshotHost = new StrategyHost(new FakeSource()))
+{
+    int healthySubscriberCalls = 0;
+    startSnapshotHost.SnapshotChanged += _ => throw new InvalidOperationException("start snapshot subscriber failure");
+    startSnapshotHost.SnapshotChanged += _ => healthySubscriberCalls++;
+    StrategyInstanceRunner runner = startSnapshotHost.Add(
+        new ManagedProbeStrategy("start-snapshot-isolated", "TXS"),
+        new ResolvedStrategyUniverse { Tradable = Product("225MC", "TXS", 5m, 10m) });
+    Assert(runner.InstanceId == "start-snapshot-isolated" && healthySubscriberCalls >= 2 &&
+           startSnapshotHost.GetSnapshots().Count == 1,
+        "Start 內與 initial snapshot 都必須逐 subscriber 隔離，例外不得讓 Add 失敗");
+}
 var selfDisposeSource = new TransactionalSource();
 using (var selfDisposeHost = new StrategyHost(selfDisposeSource))
 {

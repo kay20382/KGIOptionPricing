@@ -668,8 +668,8 @@ terminalOperationService.Dispose();
 // StrategyHost.Remove 必須在 broker Dispose 成功後才移除 runner 或解除路由。
 var hostGateway = new FakeLiveStrategyOrderGateway();
 var hostService = CreateLiveService(hostGateway, "host-live");
-using (var hostSource = new FakeHostMarketSource())
-using (var host = new StrategyHost(hostSource))
+var hostSource = new FakeHostMarketSource();
+var host = new StrategyHost(hostSource);
 {
     var hostStrategy = new HostManagedProbeStrategy("host-live", "225MC");
     host.Add(
@@ -696,8 +696,15 @@ using (var host = new StrategyHost(hostSource))
     hostGateway.EmitFill(hostOrder.OrderId, 1, 0, OrderStatus.Filled, 1, 65000d);
     Assert(hostStrategy.Executions.Count == 1 && hostStrategy.Lifecycle.Last().State == OrderLifecycleState.Filled,
         "Remove 失敗後 runner 必須仍接收 late fill 與 lifecycle");
+    AssertThrows<InvalidOperationException>(() => host.Remove("host-live"),
+        "broker 歸零但 ledger 非零仍不得移除 runner");
+    hostService.Flatten(1);
+    PaperOrder hostFlatten = hostService.GetWorkingOrders("host-live").Single();
+    hostGateway.EmitFill(hostGateway.LastOrderId, 1, 0, OrderStatus.Filled, 1, 64995d);
+    Assert(host.Ledger.GetPosition("host-live", "225MC").NetQuantity == 0,
+        "Flatten 成交必須先使 ledger 歸零");
     Assert(host.Remove("host-live") && host.GetSnapshots().All(x => x.InstanceId != "host-live"),
-        "broker 歸零後第二次 Remove 才可成功移除 runner");
+        "broker 與 ledger 同時歸零後第二次 Remove 才可成功移除 runner");
 }
 
 var retainedGateway = new FakeLiveStrategyOrderGateway();
@@ -725,7 +732,114 @@ using (var retainedHost = new StrategyHost(retainedSource))
     Assert(retainedStrategy.Executions.Count == 1 && retainedHost.Ledger
             .GetPosition("retained-start-live", "225MC").NetQuantity == 1,
         "retained Runner 必須繼續接收 late fill 並更新 ledger/strategy");
+    retainedService.Flatten(1);
+    PaperOrder retainedFlatten = retainedService.GetWorkingOrders("retained-start-live").Single();
+    retainedGateway.EmitFill(retainedGateway.LastOrderId, 1, 0, OrderStatus.Filled, 1, 64995d);
+    Assert(retainedHost.Remove("retained-start-live"), "ledger 歸零後 retained runner 才可清理");
 }
+
+// Live service owns a failed Start atomically: the executor must never be
+// independently cleaned up while Host still owns the retained runner.
+var atomicSource = new FakeHostMarketSource();
+var atomicHost = new StrategyHost(atomicSource);
+var atomicGateway = new FakeLiveStrategyOrderGateway();
+ThrowAfterOrderStartStrategy? atomicStrategy = null;
+using var liveCatchEntered = new ManualResetEventSlim(false);
+using var releaseLiveCatch = new ManualResetEventSlim(false);
+var atomicUniverse = new ResolvedStrategyUniverse
+{
+    Tradable = new ResolvedProduct { ProductId = "225MC", Symbol = "225MC", TickSize = 5m, ContractMultiplier = 10m }
+};
+var atomicLive = new LiveStrategyService(
+    atomicHost,
+    () => true,
+    () => "TEST",
+    _ => atomicUniverse,
+    definition => atomicStrategy = new ThrowAfterOrderStartStrategy(definition.InstanceId, "225MC"),
+    (definition, universe, commission) => CreateLiveService(atomicGateway, definition.InstanceId),
+    enableHeartbeat: false,
+    afterHostAddFailure: () => { liveCatchEntered.Set(); releaseLiveCatch.Wait(); });
+var atomicDefinition = new StrategyDefinition
+{
+    StrategyType = "ThrowAfterOrderStart", InstanceId = "live-retained", Universe = new StrategyUniverse
+    {
+        Tradable = new ProductSelection("225MC", "225MC"), References = Array.Empty<ProductSelection>()
+    }
+};
+Exception? atomicAddError = null;
+Task atomicAdd = Task.Factory.StartNew(() =>
+{
+    try { atomicLive.Add(atomicDefinition, 36m, 1000m); }
+    catch (Exception exception) { atomicAddError = exception; }
+}, TaskCreationOptions.LongRunning);
+Assert(liveCatchEntered.Wait(TimeSpan.FromSeconds(5)),
+    "Host 第一次 cleanup fail 後必須可固定 Live catch race");
+atomicGateway.EmitState(atomicGateway.LastOrderId, OrderStatus.Cancelled, 0, 0);
+releaseLiveCatch.Set();
+Assert(atomicAdd.Wait(TimeSpan.FromSeconds(5)) && atomicAddError is AggregateException,
+    "terminal race 後 Live Add 仍須回報原始 Start/cleanup failure");
+LiveStrategyCloseStatus atomicStatus = atomicLive.GetCloseStatus("live-retained");
+Assert(atomicStatus.Exists && atomicStatus.ActiveBrokerOrders == 0,
+    "Host cleanup fail 與 Live catch 間 terminal 仍須保留 instance ownership/status");
+Assert(atomicLive.EmergencyStop("live-retained"), "retained failure 必須可由 EmergencyStop 管理");
+Assert(atomicLive.RequestClose("live-retained", false, out _),
+    "terminal 後 retained failure 必須可由 RequestClose 完成關閉");
+atomicLive.Dispose();
+
+// A synchronous fill before Start throws leaves active=0 but a real position;
+// cleanup must retain the runner/executor until the public close API flattens it.
+var filledSource = new FakeHostMarketSource();
+var filledHost = new StrategyHost(filledSource);
+var filledGateway = new FakeLiveStrategyOrderGateway { EmitFillBeforePlaceOrderRelease = true };
+var filledLive = new LiveStrategyService(
+    filledHost, () => true, () => "TEST", _ => atomicUniverse,
+    definition => new ThrowAfterOrderStartStrategy(definition.InstanceId, "225MC"),
+    (definition, universe, commission) => CreateLiveService(filledGateway, definition.InstanceId),
+    enableHeartbeat: false);
+var filledDefinition = atomicDefinition with { InstanceId = "live-filled-retained" };
+AssertThrows<AggregateException>(() => filledLive.Add(filledDefinition, 36m, 1000m),
+    "Start sync fill 後 throw 不得清除非零 ledger runner");
+LiveStrategyCloseStatus filledStatus = filledLive.GetCloseStatus("live-filled-retained");
+Assert(filledStatus.Exists && filledStatus.ActiveBrokerOrders == 0 && filledStatus.Position == 1,
+    "sync fill retained 狀態必須公開可見");
+filledGateway.EmitFillBeforePlaceOrderRelease = false;
+Assert(!filledLive.RequestClose("live-filled-retained", true, out _),
+    "非零部位第一次 RequestClose 應送 Flatten 並等待成交");
+PaperOrder flattenOrder = GetLiveExecution(filledLive, "live-filled-retained")
+    .GetWorkingOrders("live-filled-retained").Single();
+filledGateway.EmitFill(filledGateway.LastOrderId, 1, 0, OrderStatus.Filled, 1, 64995d);
+Assert(filledLive.RequestClose("live-filled-retained", true, out _),
+    "Flatten fill 後必須可安全完成 retained cleanup");
+filledLive.Dispose();
+
+// Start is a lifecycle lease. Close APIs wait for it; a duplicate Add is
+// rejected before creating a second executor or live path.
+var leaseSource = new FakeHostMarketSource();
+var leaseHost = new StrategyHost(leaseSource);
+var leaseGateway = new FakeLiveStrategyOrderGateway();
+using var startEntered = new ManualResetEventSlim(false);
+using var releaseStart = new ManualResetEventSlim(false);
+int leaseExecutors = 0;
+var leaseLive = new LiveStrategyService(
+    leaseHost, () => true, () => "TEST", _ => atomicUniverse,
+    definition => new BarrierStartStrategy(definition.InstanceId, "225MC", startEntered, releaseStart),
+    (definition, universe, commission) => { Interlocked.Increment(ref leaseExecutors); return CreateLiveService(leaseGateway, definition.InstanceId); },
+    enableHeartbeat: false);
+var leaseDefinition = atomicDefinition with { StrategyType = "BarrierStart", InstanceId = "live-add-lease" };
+Task addLease = Task.Factory.StartNew(() => leaseLive.Add(leaseDefinition, 36m, 1000m), TaskCreationOptions.LongRunning);
+Assert(startEntered.Wait(TimeSpan.FromSeconds(5)), "Start barrier 未進入");
+AssertThrows<InvalidOperationException>(() => leaseLive.Add(leaseDefinition, 36m, 1000m),
+    "concurrent duplicate Add 必須在建立第二 executor 前失敗");
+Task<bool> closeDuringAdd = Task.Factory.StartNew(
+    () => leaseLive.EmergencyStop("live-add-lease"), TaskCreationOptions.LongRunning);
+Assert(!closeDuringAdd.Wait(TimeSpan.FromMilliseconds(100)),
+    "EmergencyStop 不得在 Start lease 結束前先回 true");
+releaseStart.Set();
+Task.WaitAll(addLease, closeDuringAdd);
+Assert(closeDuringAdd.Result && leaseExecutors == 1 && leaseLive.GetSnapshots().Count == 1,
+    "Start lease 完成後 close 應生效，且只能存在一條 runner/executor/live path");
+leaseLive.RequestClose("live-add-lease", false, out _);
+leaseLive.Dispose();
 
 // 非法倒退 callback 不得讓終結單或 CancelPending 回到錯誤狀態。
 var raceGateway = new FakeLiveStrategyOrderGateway();
@@ -817,6 +931,14 @@ static KgiLiveStrategyExecutionService CreateLiveService(
         36m,
         now,
         beforeFilledPublished);
+
+static KgiLiveStrategyExecutionService GetLiveExecution(LiveStrategyService service, string instanceId)
+{
+    var field = typeof(LiveStrategyService).GetField("_executions", BindingFlags.Instance | BindingFlags.NonPublic)
+        ?? throw new InvalidOperationException("Live execution ownership field missing");
+    var map = (System.Collections.Concurrent.ConcurrentDictionary<string, KgiLiveStrategyExecutionService>)field.GetValue(service)!;
+    return map[instanceId];
+}
 
 static InstrumentKey ForeignInstrument() => new()
 {
@@ -925,6 +1047,7 @@ sealed class FakeLiveStrategyOrderGateway : ILiveStrategyOrderGateway
     public bool EmitFillBeforePlaceOrderRelease { get; set; }
     public ManualResetEventSlim PlaceOrderEntered { get; } = new(false);
     public ManualResetEventSlim ReleasePlaceOrder { get; } = new(false);
+    public string LastOrderId { get; private set; } = string.Empty;
 
     public event Action<OrderInfo>? OrderStateChanged;
     public event Action<OrderInfo, int, double>? OrderFilled;
@@ -947,6 +1070,7 @@ sealed class FakeLiveStrategyOrderGateway : ILiveStrategyOrderGateway
             Identity = new ExternalOrderIdentity { OrdNo = "ORD-" + request.OrderId }
         };
         _orders[request.OrderId] = order;
+        LastOrderId = request.OrderId;
         OrderStateChanged?.Invoke(order);
         if (EmitFillBeforePlaceOrderRelease)
         {
@@ -1042,6 +1166,32 @@ sealed class ThrowAfterOrderStartStrategy : ISimulationStrategy, IManagedOrderSt
     public void Resume() => State = StrategyLifecycleState.Ready;
     public void Stop(string reason) { CancelAllRequested?.Invoke(); State = StrategyLifecycleState.Stopped; }
     public StrategySnapshot GetSnapshot() => new() { StrategyType = StrategyType, InstanceId = InstanceId, State = State };
+}
+
+sealed class BarrierStartStrategy : ISimulationStrategy
+{
+    private readonly string _symbol;
+    private readonly ManualResetEventSlim _entered;
+    private readonly ManualResetEventSlim _release;
+    public BarrierStartStrategy(string instanceId, string symbol, ManualResetEventSlim entered, ManualResetEventSlim release)
+    { InstanceId = instanceId; _symbol = symbol; _entered = entered; _release = release; }
+    public string StrategyType => "BarrierStart";
+    public string InstanceId { get; }
+    public StrategyLifecycleState State { get; private set; } = StrategyLifecycleState.Created;
+    public event Action<PaperOrderRequest>? OrderRequested;
+    public event Action? CancelAllRequested;
+    public event Action<StrategySnapshot>? SnapshotChanged;
+    public void Start(StrategyRuntimeContext context) { _entered.Set(); _release.Wait(); State = StrategyLifecycleState.Ready; }
+    public void OnMarketEvent(MarketEvent marketEvent) { }
+    public void OnExecution(ExecutionEvent execution) { }
+    public void Pause(string reason) => State = StrategyLifecycleState.Suspended;
+    public void Resume() => State = StrategyLifecycleState.Ready;
+    public void Stop(string reason) { CancelAllRequested?.Invoke(); State = StrategyLifecycleState.Stopped; }
+    public StrategySnapshot GetSnapshot() => new()
+    {
+        StrategyType = StrategyType, InstanceId = InstanceId, TradableSymbol = _symbol,
+        State = State, UpdatedAt = DateTimeOffset.UtcNow
+    };
 }
 
 sealed class HostManagedProbeStrategy : ISimulationStrategy, IManagedOrderStrategy

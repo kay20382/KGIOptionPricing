@@ -276,6 +276,9 @@ public sealed class StrategyInstanceRunner : IDisposable
         // state or detaching routes so a failure leaves late fills observable.
         try
         {
+            PositionSnapshot position = _ledger.GetPosition(_strategy.InstanceId, _universe.Tradable.Symbol);
+            if (_broker is KgiLiveStrategyExecutionService && position.NetQuantity != 0)
+                throw new InvalidOperationException($"Runner 尚有部位 {position.NetQuantity} 口，禁止釋放。");
             if (_broker is IDisposable disposable) disposable.Dispose();
             Exception? cleanupError = null;
             lock (_sync)
@@ -347,6 +350,8 @@ public sealed class StrategyHost : IDisposable
         lock (_sync)
         {
             if (_disposed || _disposing) throw new ObjectDisposedException(nameof(StrategyHost));
+            if (_runners.Any(x => string.Equals(x.InstanceId, strategy.InstanceId, StringComparison.OrdinalIgnoreCase)))
+                throw new InvalidOperationException($"策略實例已存在：{strategy.InstanceId}");
             _activeAdds++;
             int threadId = Environment.CurrentManagedThreadId;
             _addThreadDepth.TryGetValue(threadId, out int depth);
@@ -358,7 +363,7 @@ public sealed class StrategyHost : IDisposable
         {
             _source.Subscribe(universe.AllProducts);
             runner = new StrategyInstanceRunner(strategy, universe, _ledger, _clock, commissionPerContract, executionService, deferStart: true);
-            runner.SnapshotChanged += snapshot => SnapshotChanged?.Invoke(snapshot);
+            runner.SnapshotChanged += PublishSnapshotSafely;
             runner.ExecutionOccurred += execution => ExecutionOccurred?.Invoke(execution);
             lock (_sync) _runners.Add(runner);
             try { runner.Initialize(); }
@@ -397,19 +402,13 @@ public sealed class StrategyHost : IDisposable
 
     public IReadOnlyList<StrategySnapshot> GetSnapshots()
     {
-        StrategyInstanceRunner[] runners;
-        lock (_sync)
-        {
-            if (_disposed || _disposing) throw new ObjectDisposedException(nameof(StrategyHost));
-            runners = _runners.ToArray();
-        }
+        StrategyInstanceRunner[] runners = GetRunnersForOperation(throwIfDisposed: true);
         return runners.Select(x => x.GetSnapshot()).ToArray();
     }
 
     public bool Stop(string instanceId, string reason = "使用者停止")
     {
-        StrategyInstanceRunner? runner;
-        lock (_sync) runner = !_disposed && !_disposing ? _runners.FirstOrDefault(x => string.Equals(x.InstanceId, instanceId, StringComparison.OrdinalIgnoreCase)) : null;
+        StrategyInstanceRunner? runner = FindForOperation(instanceId);
         if (runner == null) return false;
         runner.Stop(reason);
         return true;
@@ -417,23 +416,19 @@ public sealed class StrategyHost : IDisposable
 
     public bool Pause(string instanceId)
     {
-        StrategyInstanceRunner? runner;
-        lock (_sync) runner = !_disposed && !_disposing ? _runners.FirstOrDefault(x => string.Equals(x.InstanceId, instanceId, StringComparison.OrdinalIgnoreCase)) : null;
+        StrategyInstanceRunner? runner = FindForOperation(instanceId);
         return runner?.Pause() == true;
     }
 
     public bool Resume(string instanceId)
     {
-        StrategyInstanceRunner? runner;
-        lock (_sync) runner = !_disposed && !_disposing ? _runners.FirstOrDefault(x => string.Equals(x.InstanceId, instanceId, StringComparison.OrdinalIgnoreCase)) : null;
+        StrategyInstanceRunner? runner = FindForOperation(instanceId);
         return runner?.Resume() == true;
     }
 
     public bool Remove(string instanceId)
     {
-        StrategyInstanceRunner? runner;
-        lock (_sync)
-            runner = !_disposed && !_disposing ? _runners.FirstOrDefault(x => string.Equals(x.InstanceId, instanceId, StringComparison.OrdinalIgnoreCase)) : null;
+        StrategyInstanceRunner? runner = FindForOperation(instanceId);
         if (runner == null) return false;
         // Dispose may fail while a live order is still active. Remove only
         // after success so the runner continues routing late fills.
@@ -447,24 +442,21 @@ public sealed class StrategyHost : IDisposable
 
     public void StopAll(string reason = "全部停止")
     {
-        StrategyInstanceRunner[] runners;
-        lock (_sync) runners = _disposed || _disposing ? Array.Empty<StrategyInstanceRunner>() : _runners.ToArray();
+        StrategyInstanceRunner[] runners = GetRunnersForOperation(throwIfDisposed: false);
         foreach (StrategyInstanceRunner runner in runners) runner.Stop(reason);
     }
 
     private void OnMarketEvent(MarketEvent marketEvent)
     {
         if (_clock is IEventDrivenStrategyClock eventClock) eventClock.Advance(marketEvent.Timestamp);
-        StrategyInstanceRunner[] runners;
-        lock (_sync) runners = _disposed || _disposing ? Array.Empty<StrategyInstanceRunner>() : _runners.ToArray();
+        StrategyInstanceRunner[] runners = GetRunnersForOperation(throwIfDisposed: false);
         foreach (StrategyInstanceRunner runner in runners) runner.OnMarketEvent(marketEvent);
     }
 
     public void Pulse(DateTimeOffset now)
     {
         if (_clock is IEventDrivenStrategyClock eventClock) eventClock.Advance(now);
-        StrategyInstanceRunner[] runners;
-        lock (_sync) runners = _disposed || _disposing ? Array.Empty<StrategyInstanceRunner>() : _runners.ToArray();
+        StrategyInstanceRunner[] runners = GetRunnersForOperation(throwIfDisposed: false);
         foreach (StrategyInstanceRunner runner in runners) runner.Pulse(now);
     }
 
@@ -505,6 +497,27 @@ public sealed class StrategyHost : IDisposable
         {
             try { handler(snapshot); }
             catch (Exception exception) { Debug.WriteLine($"Initial strategy snapshot subscriber failed: {exception}"); }
+        }
+    }
+
+    private StrategyInstanceRunner? FindForOperation(string instanceId) =>
+        GetRunnersForOperation(throwIfDisposed: false).FirstOrDefault(x =>
+            string.Equals(x.InstanceId, instanceId, StringComparison.OrdinalIgnoreCase));
+
+    private StrategyInstanceRunner[] GetRunnersForOperation(bool throwIfDisposed)
+    {
+        lock (_sync)
+        {
+            int threadId = Environment.CurrentManagedThreadId;
+            if (_addThreadDepth.ContainsKey(threadId))
+                throw new InvalidOperationException("Add/Start callback 不可同步操作 partial runner。");
+            while (_activeAdds > 0 && !_disposing) Monitor.Wait(_sync);
+            if (_disposed || _disposing)
+            {
+                if (throwIfDisposed) throw new ObjectDisposedException(nameof(StrategyHost));
+                return Array.Empty<StrategyInstanceRunner>();
+            }
+            return _runners.ToArray();
         }
     }
 }
