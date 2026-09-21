@@ -1,4 +1,5 @@
 using System.Globalization;
+using KGIOptionPricing.OrderManagement.Core;
 using KGIOptionPricing.Strategies.PeriodicQueueCycle;
 using KGIOptionPricing.StrategyFramework;
 
@@ -11,6 +12,12 @@ TestDirectionalAssessments();
 TestNeutralDirectionConditions();
 TestHealthRejectionCodes();
 TestUtcSecondSamplingAndWarmup();
+TestQueueInitialPricingUsesCumulativeAheadSymmetrically();
+TestQueueRepriceRequiresStrictlyMoreThanThreshold();
+TestQueueRepriceNeverBecomesLessAggressive();
+TestQueuePricingUsesFrozenInwardBounds();
+TestQueuePricingHandlesZeroTargetOneTickSpreadAndInvalidBooks();
+TestQueuePricingSupportsDifferentTickSizes();
 
 Console.WriteLine("PeriodicQueueCycle smoke tests passed.");
 
@@ -348,6 +355,144 @@ static void TestUtcSecondSamplingAndWarmup()
     ThresholdResult warmup = gapAssessment.Thresholds.Single(x => x.Name == "DirectionWindowSeconds");
     Assert(warmup.Observed == 8m && warmup.Required == 15m && !warmup.Passed,
         $"缺秒暖機必須揭露尾端實際連續秒數，實際 {warmup.Observed}");
+}
+
+static void TestQueueInitialPricingUsesCumulativeAheadSymmetrically()
+{
+    var policy = new QueueCyclePricingPolicy();
+    MarketEvent book = QueueBook(5m, 100m, 110m, new[] { 10, 15, 20 }, new[] { 10, 15, 20 });
+    FrozenPriceBounds bounds = QueueCyclePricingPolicy.CreateBounds(105m, 5m, 10m);
+
+    QueuePriceDecision buy = policy.SelectInitial(BuySell.Buy, book, 22, bounds);
+    QueuePriceDecision sell = policy.SelectInitial(BuySell.Sell, book, 22, bounds);
+
+    Assert(buy.Action == QueuePriceAction.Place && buy.Price == 95m,
+        $"買單 A 必須選在累積第 22 口所在價位 95，實際 {buy.Action}/{buy.Price}");
+    Assert(sell.Action == QueuePriceAction.Place && sell.Price == 115m,
+        $"賣單 A 必須對稱選在累積第 22 口所在價位 115，實際 {sell.Action}/{sell.Price}");
+}
+
+static void TestQueueRepriceRequiresStrictlyMoreThanThreshold()
+{
+    var policy = new QueueCyclePricingPolicy();
+    MarketEvent book = QueueBook(5m, 100m, 110m, new[] { 10, 15, 20 }, new[] { 10, 15, 20 });
+    FrozenPriceBounds bounds = QueueCyclePricingPolicy.CreateBounds(105m, 5m, 10m);
+
+    QueuePriceDecision buyAtB = policy.EvaluateReprice(BuySell.Buy, book, 90m, 5, 30, 22, bounds);
+    QueuePriceDecision buyAboveB = policy.EvaluateReprice(BuySell.Buy, book, 90m, 5, 29, 22, bounds);
+    QueuePriceDecision sellAboveB = policy.EvaluateReprice(BuySell.Sell, book, 120m, 5, 29, 22, bounds);
+
+    Assert(buyAtB.Action == QueuePriceAction.Hold && buyAtB.Price == 90m &&
+           buyAtB.BetterPriceQuantity == 25 && buyAtB.SamePriceAheadQuantity == 5,
+        "同價前方量加更佳價位量恰等於 B 時不得改掛");
+    Assert(buyAboveB.Action == QueuePriceAction.Reprice && buyAboveB.Price == 95m,
+        $"買單 totalAhead 大於 B 時必須依 C 改掛至 95，實際 {buyAboveB.Action}/{buyAboveB.Price}");
+    Assert(sellAboveB.Action == QueuePriceAction.Reprice && sellAboveB.Price == 115m,
+        $"賣單 totalAhead 大於 B 時必須對稱依 C 改掛至 115，實際 {sellAboveB.Action}/{sellAboveB.Price}");
+}
+
+static void TestQueueRepriceNeverBecomesLessAggressive()
+{
+    var policy = new QueueCyclePricingPolicy();
+    MarketEvent book = QueueBook(5m, 100m, 110m, new[] { 10, 15, 20 }, new[] { 10, 15, 20 });
+    FrozenPriceBounds bounds = QueueCyclePricingPolicy.CreateBounds(105m, 5m, 10m);
+
+    QueuePriceDecision buy = policy.EvaluateReprice(BuySell.Buy, book, 100m, 50, 10, 22, bounds);
+    QueuePriceDecision sell = policy.EvaluateReprice(BuySell.Sell, book, 110m, 50, 10, 22, bounds);
+
+    Assert(buy.Action == QueuePriceAction.Hold && buy.Price == 100m && buy.ReasonCode == "PriceBoundaryReached",
+        "買單 C 候選較低時不得往較不積極方向改掛");
+    Assert(sell.Action == QueuePriceAction.Hold && sell.Price == 110m && sell.ReasonCode == "PriceBoundaryReached",
+        "賣單 C 候選較高時不得往較不積極方向改掛");
+}
+
+static void TestQueuePricingUsesFrozenInwardBounds()
+{
+    var policy = new QueueCyclePricingPolicy();
+    FrozenPriceBounds bounds = QueueCyclePricingPolicy.CreateBounds(102.5m, 5m, 2m);
+    Assert(bounds.Anchor == 102.5m && bounds.BuyLimit == 110m && bounds.SellLimit == 95m,
+        $"半 Tick 中價邊界取整錯誤：{bounds.Anchor}/{bounds.BuyLimit}/{bounds.SellLimit}");
+
+    MarketEvent initialOutside = QueueBook(5m, 115m, 120m, new[] { 10 }, new[] { 10 });
+    QueuePriceDecision clampedBuy = policy.SelectInitial(BuySell.Buy, initialOutside, 1, bounds);
+    MarketEvent initialSellOutside = QueueBook(5m, 85m, 90m, new[] { 10 }, new[] { 10 });
+    QueuePriceDecision clampedSell = policy.SelectInitial(BuySell.Sell, initialSellOutside, 1, bounds);
+    Assert(clampedBuy.Action == QueuePriceAction.Place && clampedBuy.Price == 110m,
+        "買單首次掛單越界時必須向內夾到凍結上界");
+    Assert(clampedSell.Action == QueuePriceAction.Place && clampedSell.Price == 95m,
+        "賣單首次掛單越界時必須向內夾到凍結下界");
+
+    MarketEvent buyBook = QueueBook(5m, 100m, 110m, new[] { 10, 15 }, new[] { 10, 15 });
+    FrozenPriceBounds exactBuyBounds = new(102.5m, 5m, 95m, 90m);
+    QueuePriceDecision exactBuy = policy.EvaluateReprice(BuySell.Buy, buyBook, 90m, 40, 10, 22, exactBuyBounds);
+    Assert(exactBuy.Action == QueuePriceAction.Reprice && exactBuy.Price == 95m,
+        "買單改掛候選恰好命中凍結上界時應允許改掛");
+
+    FrozenPriceBounds crossedBuyBounds = new(102.5m, 5m, 90m, 90m);
+    QueuePriceDecision crossedBuy = policy.EvaluateReprice(BuySell.Buy, buyBook, 85m, 40, 10, 22, crossedBuyBounds);
+    Assert(crossedBuy.Action == QueuePriceAction.Hold && crossedBuy.Price == 85m &&
+           crossedBuy.ReasonCode == "PriceBoundaryReached",
+        "買單改掛候選越過凍結上界時必須維持原價");
+
+    FrozenPriceBounds originalBounds = bounds;
+    _ = policy.SelectInitial(BuySell.Buy, QueueBook(5m, 130m, 135m, new[] { 10 }, new[] { 10 }), 1, bounds);
+    Assert(bounds == originalBounds && bounds.BuyLimit == 110m && bounds.SellLimit == 95m,
+        "市場移動後不得重算或移動週期價格邊界");
+}
+
+static void TestQueuePricingHandlesZeroTargetOneTickSpreadAndInvalidBooks()
+{
+    var policy = new QueueCyclePricingPolicy();
+    FrozenPriceBounds bounds = QueueCyclePricingPolicy.CreateBounds(102.5m, 5m, 10m);
+    MarketEvent oneTick = QueueBook(5m, 100m, 105m, new[] { 10 }, new[] { 10 });
+
+    QueuePriceDecision buy = policy.SelectInitial(BuySell.Buy, oneTick, 0, bounds);
+    QueuePriceDecision sell = policy.SelectInitial(BuySell.Sell, oneTick, 0, bounds);
+    Assert(buy.Action == QueuePriceAction.Place && buy.Price == 105m,
+        "A=0 且價差一跳時買單必須使用對手第一檔，不得穿價");
+    Assert(sell.Action == QueuePriceAction.Place && sell.Price == 100m,
+        "A=0 且價差一跳時賣單必須使用對手第一檔，不得穿價");
+
+    MarketEvent invalid = oneTick with { AskPrices = Array.Empty<decimal>(), AskQuantities = Array.Empty<int>() };
+    QueuePriceDecision invalidInitial = policy.SelectInitial(BuySell.Buy, invalid, 22, bounds);
+    QueuePriceDecision invalidReprice = policy.EvaluateReprice(BuySell.Sell, invalid, 105m, 20, 10, 22, bounds);
+    Assert(invalidInitial.Action == QueuePriceAction.Hold && invalidInitial.Price == 0m &&
+           invalidInitial.ReasonCode == "InvalidBook",
+        "無效 Book 不得產生首次掛單價格");
+    Assert(invalidReprice.Action == QueuePriceAction.Hold && invalidReprice.Price == 105m &&
+           invalidReprice.ReasonCode == "InvalidBook",
+        "無效 Book 不得產生改掛價格");
+}
+
+static void TestQueuePricingSupportsDifferentTickSizes()
+{
+    var policy = new QueueCyclePricingPolicy();
+    FrozenPriceBounds bounds = QueueCyclePricingPolicy.CreateBounds(101.25m, 2.5m, 1m);
+    Assert(bounds.BuyLimit == 102.5m && bounds.SellLimit == 100m,
+        $"2.5 Tick 的向內價格邊界錯誤：{bounds.BuyLimit}/{bounds.SellLimit}");
+
+    MarketEvent book = QueueBook(2.5m, 100m, 102.5m, new[] { 10 }, new[] { 10 });
+    QueuePriceDecision buy = policy.SelectInitial(BuySell.Buy, book, 0, bounds);
+    QueuePriceDecision sell = policy.SelectInitial(BuySell.Sell, book, 0, bounds);
+    Assert(buy.Price == 102.5m && sell.Price == 100m,
+        $"政策必須使用 bounds.TickSize，不得寫死 5：{buy.Price}/{sell.Price}");
+}
+
+static MarketEvent QueueBook(decimal tick, decimal bestBid, decimal bestAsk,
+    int[] bidQuantities, int[] askQuantities)
+{
+    return new MarketEvent
+    {
+        Timestamp = new DateTimeOffset(2026, 9, 21, 4, 0, 0, TimeSpan.Zero),
+        Sequence = 1,
+        Symbol = "225MC",
+        ProductId = "225MC",
+        Kind = MarketEventKind.Book,
+        BidPrices = Enumerable.Range(0, bidQuantities.Length).Select(i => bestBid - i * tick).ToArray(),
+        BidQuantities = bidQuantities,
+        AskPrices = Enumerable.Range(0, askQuantities.Length).Select(i => bestAsk + i * tick).ToArray(),
+        AskQuantities = askQuantities
+    };
 }
 
 static void AssertRejected(string reasonCode, MarketEvent item, DateTimeOffset now,
