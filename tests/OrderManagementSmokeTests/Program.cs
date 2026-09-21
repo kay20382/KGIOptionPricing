@@ -645,6 +645,26 @@ Assert(blockedSubmit.Wait(TimeSpan.FromSeconds(5)), "release 後 Submit 必須�
 operationGateway.EmitFill(blockedSubmit.Result.OrderId, 1, 0, OrderStatus.Filled, 1, 65000d);
 operationService.Dispose();
 
+var terminalOperationGateway = new FakeLiveStrategyOrderGateway
+{
+    BlockPlaceOrder = true,
+    EmitFillBeforePlaceOrderRelease = true
+};
+var terminalOperationService = CreateLiveService(terminalOperationGateway, "terminal-operation-live");
+Task<PaperOrder> terminalBlockedSubmit = Task.Factory.StartNew(
+    () => terminalOperationService.Submit(
+        liveBuy with { StrategyInstanceId = "terminal-operation-live", ClientOrderId = "terminal-operation-g1" },
+        DateTimeOffset.UtcNow),
+    CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+Assert(terminalOperationGateway.PlaceOrderEntered.Wait(TimeSpan.FromSeconds(5)) &&
+       terminalOperationService.ActiveBrokerOrderCount == 0,
+    "同步 fill 後 active 必須歸零，但 Submit operation 仍卡在 gateway return 前");
+AssertThrows<InvalidOperationException>(terminalOperationService.Dispose,
+    "active=0/callback=0 但 operation inflight>0 時 Dispose 仍必須 fail closed");
+terminalOperationGateway.ReleasePlaceOrder.Set();
+Assert(terminalBlockedSubmit.Wait(TimeSpan.FromSeconds(5)), "operation release 後 Submit 必須返回");
+terminalOperationService.Dispose();
+
 // StrategyHost.Remove 必須在 broker Dispose 成功後才移除 runner 或解除路由。
 var hostGateway = new FakeLiveStrategyOrderGateway();
 var hostService = CreateLiveService(hostGateway, "host-live");
@@ -875,6 +895,7 @@ sealed class FakeLiveStrategyOrderGateway : ILiveStrategyOrderGateway
     public string BrokerId { get; set; } = "BRK";
     public string Account { get; set; } = "ACC";
     public bool BlockPlaceOrder { get; set; }
+    public bool EmitFillBeforePlaceOrderRelease { get; set; }
     public ManualResetEventSlim PlaceOrderEntered { get; } = new(false);
     public ManualResetEventSlim ReleasePlaceOrder { get; } = new(false);
 
@@ -885,11 +906,6 @@ sealed class FakeLiveStrategyOrderGateway : ILiveStrategyOrderGateway
 
     public void PlaceOrder(OrderRequest request)
     {
-        if (BlockPlaceOrder)
-        {
-            PlaceOrderEntered.Set();
-            ReleasePlaceOrder.Wait();
-        }
         var order = new OrderInfo
         {
             OrderId = request.OrderId,
@@ -905,6 +921,18 @@ sealed class FakeLiveStrategyOrderGateway : ILiveStrategyOrderGateway
         };
         _orders[request.OrderId] = order;
         OrderStateChanged?.Invoke(order);
+        if (EmitFillBeforePlaceOrderRelease)
+        {
+            order.Status = OrderStatus.Filled;
+            order.FilledQty = request.Quantity;
+            order.LeavesQty = 0;
+            OrderFilled?.Invoke(order, request.Quantity, request.Price);
+        }
+        if (BlockPlaceOrder)
+        {
+            PlaceOrderEntered.Set();
+            ReleasePlaceOrder.Wait();
+        }
     }
 
     public void CancelOrder(string orderId)

@@ -81,11 +81,20 @@ public sealed class LiveStrategyService : IDisposable
         {
             _host.Add(_registry.Get(definition.StrategyType).Create(definition), universe, commissionPerContract, execution);
         }
-        catch
+        catch (Exception addError)
         {
+            try
+            {
+                execution.Dispose();
+            }
+            catch (Exception cleanupError)
+            {
+                // Ownership must remain discoverable when an active live order
+                // prevents cleanup; close/retry paths still need this executor.
+                throw new AggregateException("策略加入失敗，且實盤執行器仍有活動資源。", addError, cleanupError);
+            }
             _executions.TryRemove(definition.InstanceId, out _);
             _dailyLossLimits.TryRemove(definition.InstanceId, out _);
-            execution.Dispose();
             throw;
         }
     }

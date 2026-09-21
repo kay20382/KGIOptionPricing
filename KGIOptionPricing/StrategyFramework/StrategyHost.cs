@@ -69,7 +69,21 @@ public sealed class StrategyInstanceRunner : IDisposable
             _managedStrategy.CancelOrderRequested += OnCancelOrderRequested;
             _managedBroker.OrderLifecycleChanged += OnOrderLifecycleChanged;
         }
-        _strategy.Start(new StrategyRuntimeContext(universe, clock, ledger));
+        try
+        {
+            _strategy.Start(new StrategyRuntimeContext(universe, clock, ledger));
+        }
+        catch
+        {
+            _strategy.OrderRequested -= OnOrderRequested;
+            _strategy.CancelAllRequested -= OnCancelAllRequested;
+            _strategy.SnapshotChanged -= OnStrategySnapshotChanged;
+            _broker.Filled -= OnFilled;
+            if (_managedStrategy != null) _managedStrategy.CancelOrderRequested -= OnCancelOrderRequested;
+            if (_managedBroker != null) _managedBroker.OrderLifecycleChanged -= OnOrderLifecycleChanged;
+            try { if (_broker is IDisposable disposable) disposable.Dispose(); } catch { }
+            throw;
+        }
     }
 
     public bool UsesSymbol(string symbol) => _universe.AllProducts.Any(x =>
@@ -307,6 +321,7 @@ public sealed class StrategyHost : IDisposable
     private bool _disposed;
     private bool _disposing;
     private int _activeAdds;
+    private readonly Dictionary<int, int> _addThreadDepth = new();
     internal bool IsDisposed { get { lock (_sync) return _disposed; } }
 
     public event Action<StrategySnapshot>? SnapshotChanged;
@@ -330,20 +345,38 @@ public sealed class StrategyHost : IDisposable
         {
             if (_disposed || _disposing) throw new ObjectDisposedException(nameof(StrategyHost));
             _activeAdds++;
+            int threadId = Environment.CurrentManagedThreadId;
+            _addThreadDepth.TryGetValue(threadId, out int depth);
+            _addThreadDepth[threadId] = depth + 1;
         }
+        StrategyInstanceRunner? runner = null;
         try
         {
-            var runner = new StrategyInstanceRunner(strategy, universe, _ledger, _clock, commissionPerContract, executionService);
+            _source.Subscribe(universe.AllProducts);
+            runner = new StrategyInstanceRunner(strategy, universe, _ledger, _clock, commissionPerContract, executionService);
             runner.SnapshotChanged += snapshot => SnapshotChanged?.Invoke(snapshot);
             runner.ExecutionOccurred += execution => ExecutionOccurred?.Invoke(execution);
             lock (_sync) _runners.Add(runner);
-            _source.Subscribe(universe.AllProducts);
-            SnapshotChanged?.Invoke(runner.GetSnapshot());
             return runner;
         }
         finally
         {
-            lock (_sync) { _activeAdds--; Monitor.PulseAll(_sync); }
+            lock (_sync)
+            {
+                int threadId = Environment.CurrentManagedThreadId;
+                if (_addThreadDepth.TryGetValue(threadId, out int depth))
+                {
+                    if (depth <= 1) _addThreadDepth.Remove(threadId);
+                    else _addThreadDepth[threadId] = depth - 1;
+                }
+                _activeAdds--;
+                Monitor.PulseAll(_sync);
+            }
+            if (runner != null)
+            {
+                try { PublishSnapshotSafely(runner.GetSnapshot()); }
+                catch (ObjectDisposedException) { }
+            }
         }
     }
 
@@ -426,6 +459,8 @@ public sealed class StrategyHost : IDisposable
         lock (_sync)
         {
             if (_disposed) return;
+            if (_addThreadDepth.ContainsKey(Environment.CurrentManagedThreadId))
+                throw new InvalidOperationException("Add callback 不可同步 Dispose 同一個 StrategyHost。");
             if (_disposing) throw new InvalidOperationException("StrategyHost 正在釋放。");
             _disposing = true;
             while (_activeAdds > 0) Monitor.Wait(_sync);
@@ -445,6 +480,16 @@ public sealed class StrategyHost : IDisposable
         finally
         {
             lock (_sync) { _disposing = false; Monitor.PulseAll(_sync); }
+        }
+    }
+
+    private void PublishSnapshotSafely(StrategySnapshot snapshot)
+    {
+        Delegate[] handlers = SnapshotChanged?.GetInvocationList() ?? Array.Empty<Delegate>();
+        foreach (Action<StrategySnapshot> handler in handlers.Cast<Action<StrategySnapshot>>())
+        {
+            try { handler(snapshot); }
+            catch (Exception exception) { Debug.WriteLine($"Initial strategy snapshot subscriber failed: {exception}"); }
         }
     }
 }

@@ -261,6 +261,37 @@ using (var heartbeatHost = new StrategyHost(heartbeatSource, heartbeatClock))
         "StrategyHost.Pulse 必須以事件時鐘驅動 optional heartbeat strategy，測試不依賴 sleep");
 }
 
+var throwingSubscribeSource = new TransactionalSource { ThrowOnSubscribe = true };
+using (var transactionalHost = new StrategyHost(throwingSubscribeSource))
+{
+    AssertThrows<InvalidOperationException>(() => transactionalHost.Add(
+            new HeartbeatProbeStrategy("subscribe-throws"),
+            new ResolvedStrategyUniverse { Tradable = Product("225MC", "TXS", 5m, 10m) }),
+        "source.Subscribe 失敗時 Add 必須失敗");
+    Assert(transactionalHost.GetSnapshots().Count == 0,
+        "source.Subscribe 失敗不得留下 runner");
+}
+using (var startFailureHost = new StrategyHost(new FakeSource()))
+{
+    AssertThrows<InvalidOperationException>(() => startFailureHost.Add(
+            new ThrowingStartStrategy("start-throws"),
+            new ResolvedStrategyUniverse { Tradable = Product("225MC", "TXT", 5m, 10m) }),
+        "strategy.Start 失敗時 Add 必須失敗");
+    Assert(startFailureHost.GetSnapshots().Count == 0, "Start 失敗不得留下 runner");
+}
+var selfDisposeSource = new TransactionalSource();
+using (var selfDisposeHost = new StrategyHost(selfDisposeSource))
+{
+    selfDisposeSource.Host = selfDisposeHost;
+    selfDisposeHost.SnapshotChanged += _ => throw new InvalidOperationException("subscriber failure");
+    StrategyInstanceRunner added = selfDisposeHost.Add(
+        new HeartbeatProbeStrategy("self-dispose-add"),
+        new ResolvedStrategyUniverse { Tradable = Product("225MC", "TXD", 5m, 10m) });
+    Assert(selfDisposeSource.SelfDisposeFailure is InvalidOperationException &&
+           selfDisposeHost.GetSnapshots().Count == 1 && added.InstanceId == "self-dispose-add",
+        "Add owner thread self-dispose 必須 fail closed，初始 snapshot subscriber 例外不得回滾成功 Add");
+}
+
 var serializedClock = new MutableStrategyClock(heartbeatTime);
 var serializedLedger = new PaperPortfolioLedger();
 var serializedBroker = new ConcurrentCallbackExecutionService();
@@ -699,6 +730,13 @@ static void Assert(bool condition, string message)
     if (!condition) throw new InvalidOperationException(message);
 }
 
+static void AssertThrows<TException>(Action action, string message) where TException : Exception
+{
+    try { action(); }
+    catch (TException) { return; }
+    throw new InvalidOperationException(message);
+}
+
 static async Task RunActualMarketReplay(string path)
 {
     var symbols = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -747,6 +785,42 @@ sealed class FakeSource : IMarketEventSource
     public void Subscribe(IEnumerable<ResolvedProduct> products) { }
     public void Emit(MarketEvent marketEvent) => MarketEventReceived?.Invoke(marketEvent);
     public void Dispose() { }
+}
+
+sealed class TransactionalSource : IMarketEventSource
+{
+    public bool ThrowOnSubscribe { get; set; }
+    public StrategyHost? Host { get; set; }
+    public Exception? SelfDisposeFailure { get; private set; }
+    public event Action<MarketEvent>? MarketEventReceived { add { } remove { } }
+    public void Subscribe(IEnumerable<ResolvedProduct> products)
+    {
+        if (ThrowOnSubscribe) throw new InvalidOperationException("subscribe failed");
+        if (Host != null)
+        {
+            try { Host.Dispose(); }
+            catch (Exception exception) { SelfDisposeFailure = exception; }
+        }
+    }
+    public void Dispose() { }
+}
+
+sealed class ThrowingStartStrategy : ISimulationStrategy
+{
+    public ThrowingStartStrategy(string instanceId) => InstanceId = instanceId;
+    public string StrategyType => "ThrowingStart";
+    public string InstanceId { get; }
+    public StrategyLifecycleState State => StrategyLifecycleState.Created;
+    public event Action<PaperOrderRequest>? OrderRequested { add { } remove { } }
+    public event Action? CancelAllRequested { add { } remove { } }
+    public event Action<StrategySnapshot>? SnapshotChanged { add { } remove { } }
+    public void Start(StrategyRuntimeContext context) => throw new InvalidOperationException("start failed");
+    public void OnMarketEvent(MarketEvent marketEvent) { }
+    public void OnExecution(ExecutionEvent execution) { }
+    public void Pause(string reason) { }
+    public void Resume() { }
+    public void Stop(string reason) { }
+    public StrategySnapshot GetSnapshot() => new() { StrategyType = StrategyType, InstanceId = InstanceId };
 }
 
 sealed class ManagedProbeStrategy : ISimulationStrategy, IManagedOrderStrategy
