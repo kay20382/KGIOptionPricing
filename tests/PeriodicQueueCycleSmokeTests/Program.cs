@@ -35,6 +35,18 @@ TestPeriodicStrategyFaultsOnDistinctGenerationOverfill();
 TestPeriodicStrategyPreservesReentrantInitialRejection();
 TestPeriodicStrategyFaultsWhenExitCancellationFails();
 TestPeriodicStrategyPreservesSynchronousReplacementRejectionReason();
+TestPeriodicStrategyPauseCancelsFlatPairAndKeepsPositionProtection();
+TestPeriodicStrategyPreservesFaultDuringReentrantExitCancelFailure();
+TestPeriodicStrategyDoesNotRepriceOnUnhealthyBook();
+TestPeriodicStrategyStopsOnlyAfterOrdersAndPositionAreZero();
+TestPeriodicStrategySnapshotExposesFrozenCycleAndLegState();
+TestPeriodicStrategyFaultsWhenRunnerCannotRouteTargetedCancel();
+TestPeriodicStrategyPreservesFaultDuringReentrantStopCancelFailure();
+TestPeriodicRunnerStopUsesTargetedManagedCancellation();
+TestPeriodicStrategyResumeStartsFreshCycleAfterFlatPause();
+TestPeriodicStrategyStopsRepriceEvaluationAfterFirstRouteFailure();
+TestPeriodicStrategyFaultsOnLateFillFromRetiredCycle();
+TestPeriodicStrategyDoesNotStartCycleWithExistingPosition();
 
 Console.WriteLine("PeriodicQueueCycle smoke tests passed.");
 
@@ -997,15 +1009,353 @@ static void TestPeriodicStrategyPreservesSynchronousReplacementRejectionReason()
         "替代單同步拒絕的終端原因不得被外層 ReplacementSubmitted 覆寫");
 }
 
+static void TestPeriodicStrategyPauseCancelsFlatPairAndKeepsPositionProtection()
+{
+    DateTimeOffset start = new(2026, 9, 22, 15, 0, 0, TimeSpan.Zero);
+    (PeriodicQueueCycleStrategy flat, MutableClock _, List<PaperOrderRequest> flatOrders) =
+        StartWorkingUpStrategy("pause-flat", NoRepriceParameters(), start);
+    var flatCancels = new List<string>();
+    flat.CancelOrderRequested += flatCancels.Add;
+    flat.Pause("使用者暫停");
+    Assert(flat.State == StrategyLifecycleState.Suspended &&
+           flatCancels.OrderBy(x => x, StringComparer.Ordinal).SequenceEqual(
+               flatOrders.Select(x => x.ClientOrderId).OrderBy(x => x, StringComparer.Ordinal),
+               StringComparer.Ordinal),
+        "空手但雙邊工作中 Pause 必須定向撤銷兩張 entry，不得只切換畫面狀態");
+
+    var performance = new MutablePerformance();
+    IReadOnlyDictionary<string, string> parameters = Values(
+        ("DirectionWindowSeconds", "2"), ("ObiConfirmSeconds", "1"),
+        ("MinSideDepth", "1"), ("MinNearDepth", "1"), ("MaxChaseTicks", "20"),
+        ("TrendInitialAheadA", "5"), ("TrendRepriceThresholdB", "100000"), ("TrendRepriceTargetC", "1"),
+        ("OppositeInitialAheadA", "20"), ("OppositeRepriceThresholdB", "15"), ("OppositeRepriceTargetC", "0"));
+    (PeriodicQueueCycleStrategy held, MutableClock clock, List<PaperOrderRequest> heldOrders) =
+        StartWorkingUpStrategy("pause-held", parameters, start.AddHours(1), performance);
+    PaperOrderRequest buy = heldOrders.Single(x => x.Side == BuySell.Buy);
+    performance.NetQuantity = 1;
+    performance.AveragePrice = buy.Price;
+    held.OnExecution(Fill(buy.ClientOrderId, held.InstanceId, BuySell.Buy, buy.Price, clock.Now));
+    var heldCancels = new List<string>();
+    held.CancelOrderRequested += heldCancels.Add;
+    held.Pause("持倉暫停");
+    Assert(heldCancels.Count == 0, "持倉 Pause 不得撤掉仍可中和部位的 peer 完成單");
+
+    clock.Now = clock.Now.AddSeconds(1);
+    held.OnMarketEvent(StrategyBook(110m, 115m, 20, 10, 3, clock.Now));
+    string sellId = heldOrders.Single(x => x.Side == BuySell.Sell).ClientOrderId;
+    Assert(heldCancels.SequenceEqual(new[] { sellId }, StringComparer.Ordinal),
+        "持倉 Pause 後仍必須處理健康行情並保留 peer 的定向改掛生命週期");
+    held.OnOrderLifecycle(Cancelled(sellId, held.InstanceId, clock.Now));
+    Assert(heldOrders.Any(x => x.ClientOrderId.Contains("sell-g2", StringComparison.Ordinal)) &&
+           held.State == StrategyLifecycleState.Suspended,
+        "持倉 Pause 後仍必須接收 Cancelled 並建立 peer 新世代，同時維持 Suspended 公開狀態");
+}
+
+static void TestPeriodicStrategyPreservesFaultDuringReentrantExitCancelFailure()
+{
+    DateTimeOffset start = new(2026, 9, 22, 17, 0, 0, TimeSpan.Zero);
+    (PeriodicQueueCycleStrategy strategy, MutableClock clock, List<PaperOrderRequest> _) =
+        StartWorkingUpStrategy("reentrant-exit-cancel-fail", NoRepriceParameters(), start);
+    var cancels = new List<string>();
+    strategy.CancelOrderRequested += clientOrderId =>
+    {
+        cancels.Add(clientOrderId);
+        if (cancels.Count == 1)
+            strategy.OnOrderLifecycle(CancelFailed(clientOrderId, strategy.InstanceId, clock.Now));
+    };
+    foreach (MarketEvent item in new[]
+    {
+        StrategyBook(95m, 100m, 10, 20, 3, start.AddSeconds(2)),
+        StrategyBook(85m, 90m, 10, 20, 4, start.AddSeconds(3)),
+        StrategyBook(75m, 80m, 10, 20, 5, start.AddSeconds(4))
+    })
+    {
+        clock.Now = item.Timestamp;
+        strategy.OnMarketEvent(item);
+    }
+
+    Assert(cancels.Count == 2 && strategy.State == StrategyLifecycleState.Faulted &&
+           strategy.GetSnapshot().Reason == "CancelFailedDuringExit",
+        "退出撤單第一腿同步 CancelFailed 時仍須盡力撤第二腿，且最後不得覆寫 Faulted 與原因");
+    strategy.OnOrderLifecycle(CancelFailed(cancels[0], strategy.InstanceId, clock.Now));
+    Assert(strategy.State == StrategyLifecycleState.Faulted &&
+           strategy.GetSnapshot().Reason == "CancelFailedDuringExit",
+        "重複 CancelFailed 不得讓 Faulted 退回工作狀態");
+}
+
+static void TestPeriodicStrategyDoesNotRepriceOnUnhealthyBook()
+{
+    DateTimeOffset start = new(2026, 9, 22, 18, 0, 0, TimeSpan.Zero);
+    (PeriodicQueueCycleStrategy strategy, MutableClock clock, List<PaperOrderRequest> _) =
+        StartWorkingUpStrategy("unhealthy-no-reprice", RepriceParameters(), start);
+    var cancels = new List<string>();
+    strategy.CancelOrderRequested += cancels.Add;
+    clock.Now = start.AddSeconds(2);
+    strategy.OnMarketEvent(StrategyBook(110m, 125m, 20, 10, 3, clock.Now));
+
+    Assert(cancels.Count == 0 && strategy.GetSnapshot().Reason == "SpreadTooWide",
+        "當前 Book 未通過任一健康閘門時不得改掛成更積極價格");
+}
+
+static void TestPeriodicStrategyStopsOnlyAfterOrdersAndPositionAreZero()
+{
+    DateTimeOffset start = new(2026, 9, 22, 19, 0, 0, TimeSpan.Zero);
+    var flatPerformance = new MutablePerformance();
+    (PeriodicQueueCycleStrategy flat, MutableClock clock, List<PaperOrderRequest> flatOrders) =
+        StartWorkingUpStrategy("stop-flat", NoRepriceParameters(), start, flatPerformance);
+    var cancels = new List<string>();
+    flat.CancelOrderRequested += cancels.Add;
+    flat.Stop("使用者停止");
+    Assert(flat.State != StrategyLifecycleState.Stopped && cancels.Count == 2,
+        "工作委託尚未確認撤銷前 Stop 不得宣告 Stopped");
+    flat.OnOrderLifecycle(Cancelled(flatOrders[0].ClientOrderId, flat.InstanceId, clock.Now));
+    Assert(flat.State != StrategyLifecycleState.Stopped, "只撤一腿時仍不得宣告 Stopped");
+    flat.OnOrderLifecycle(Cancelled(flatOrders[1].ClientOrderId, flat.InstanceId, clock.Now));
+    Assert(flat.State == StrategyLifecycleState.Stopped, "兩腿 exact Cancelled 且部位為零後才能 Stopped");
+    flat.OnOrderLifecycle(Cancelled(flatOrders[1].ClientOrderId, flat.InstanceId, clock.Now));
+    Assert(flat.State == StrategyLifecycleState.Stopped, "重複 Cancelled 不得破壞終止狀態");
+
+    var heldPerformance = new MutablePerformance();
+    (PeriodicQueueCycleStrategy held, MutableClock heldClock, List<PaperOrderRequest> heldOrders) =
+        StartWorkingUpStrategy("stop-held", NoRepriceParameters(), start.AddHours(1), heldPerformance);
+    heldPerformance.NetQuantity = 1;
+    heldPerformance.AveragePrice = 110m;
+    PaperOrderRequest heldBuy = heldOrders.Single(x => x.Side == BuySell.Buy);
+    held.OnExecution(Fill(heldBuy.ClientOrderId, held.InstanceId, BuySell.Buy, heldBuy.Price, heldClock.Now));
+    var heldCancels = new List<string>();
+    held.CancelOrderRequested += heldCancels.Add;
+    held.Stop("持倉停止");
+    string heldSell = heldOrders.Single(x => x.Side == BuySell.Sell).ClientOrderId;
+    held.OnOrderLifecycle(Cancelled(heldSell, held.InstanceId, heldClock.Now));
+    Assert(held.State != StrategyLifecycleState.Stopped && heldPerformance.NetQuantity == 1,
+        "即使工作單都終止，只要共用帳本部位不為零就不得宣告 Stopped");
+}
+
+static void TestPeriodicStrategySnapshotExposesFrozenCycleAndLegState()
+{
+    DateTimeOffset start = new(2026, 9, 22, 21, 0, 0, TimeSpan.Zero);
+    (PeriodicQueueCycleStrategy strategy, MutableClock clock, List<PaperOrderRequest> orders) =
+        StartWorkingUpStrategy("snapshot-cycle", RepriceParameters(), start);
+    string initial = strategy.GetSnapshot().ReferenceSummary;
+    Assert(initial.Contains("Cycle=cycle-1", StringComparison.Ordinal) &&
+           initial.Contains("Direction=Up", StringComparison.Ordinal) &&
+           initial.Contains("buy-g1", StringComparison.Ordinal) &&
+           initial.Contains("sell-g1", StringComparison.Ordinal) &&
+           initial.Contains("State=Working", StringComparison.Ordinal) &&
+           initial.Contains("Intent=None", StringComparison.Ordinal),
+        "快照必須揭露週期、凍結方向與雙腿世代/狀態/價格/撤單意圖");
+
+    clock.Now = start.AddSeconds(2);
+    strategy.OnMarketEvent(StrategyBook(110m, 115m, 20, 10, 3, clock.Now));
+    string pending = strategy.GetSnapshot().ReferenceSummary;
+    Assert(pending.Contains(orders.Single(x => x.Side == BuySell.Buy).ClientOrderId, StringComparison.Ordinal) &&
+           pending.Contains("State=CancelPending", StringComparison.Ordinal) &&
+           pending.Contains("Intent=Reprice", StringComparison.Ordinal),
+        "快照必須在定向改掛期間揭露 current generation 與 cancel intent");
+}
+
+static void TestPeriodicStrategyFaultsWhenRunnerCannotRouteTargetedCancel()
+{
+    DateTimeOffset start = new(2026, 9, 22, 22, 0, 0, TimeSpan.Zero);
+    var clock = new MutableClock(start);
+    var broker = new UnroutableManagedExecutionService();
+    var strategy = (PeriodicQueueCycleStrategy)new PeriodicQueueCycleFactory().Create(
+        PeriodicDefinition("runner-unrouted", RepriceParameters()));
+    using var runner = new StrategyInstanceRunner(
+        strategy,
+        new ResolvedStrategyUniverse
+        {
+            Tradable = new ResolvedProduct
+            {
+                ProductId = "225MC", Symbol = "225MC", TickSize = 5m, ContractMultiplier = 10m
+            }
+        },
+        new KGIOptionPricing.StrategyFramework.Performance.PaperPortfolioLedger(),
+        clock,
+        0m,
+        broker);
+    runner.OnMarketEvent(StrategyBook(100m, 105m, 20, 10, 1, start));
+    clock.Now = start.AddSeconds(1);
+    runner.OnMarketEvent(StrategyBook(110m, 115m, 20, 10, 2, clock.Now));
+    clock.Now = start.AddSeconds(2);
+    runner.OnMarketEvent(StrategyBook(110m, 115m, 20, 10, 3, clock.Now));
+
+    StrategySnapshot snapshot = runner.GetSnapshot();
+    Assert(broker.CancelledClientOrderIds.Count == 1 &&
+           snapshot.State == StrategyLifecycleState.Faulted &&
+           snapshot.Reason == "CancelRequestNotRouted",
+        "真實 Runner 收到 targeted cancel=false 時必須把明確失敗回送 coordinator 並 Faulted");
+}
+
+static void TestPeriodicStrategyPreservesFaultDuringReentrantStopCancelFailure()
+{
+    DateTimeOffset start = new(2026, 9, 22, 23, 0, 0, TimeSpan.Zero);
+    (PeriodicQueueCycleStrategy strategy, MutableClock clock, List<PaperOrderRequest> _) =
+        StartWorkingUpStrategy("stop-reentrant-fail", NoRepriceParameters(), start);
+    var cancels = new List<string>();
+    strategy.CancelOrderRequested += clientOrderId =>
+    {
+        cancels.Add(clientOrderId);
+        if (cancels.Count == 1)
+            strategy.OnOrderLifecycle(CancelFailed(clientOrderId, strategy.InstanceId, clock.Now));
+    };
+    strategy.Stop("同步失敗停止");
+
+    Assert(cancels.Count == 2 && strategy.State == StrategyLifecycleState.Faulted &&
+           strategy.GetSnapshot().Reason == "CancelFailedDuringExit",
+        "Stop 第一腿同步撤單失敗時仍須嘗試第二腿，且不得在 Stop 結尾覆寫 Faulted");
+}
+
+static void TestPeriodicRunnerStopUsesTargetedManagedCancellation()
+{
+    DateTimeOffset start = new(2026, 9, 23, 0, 0, 0, TimeSpan.Zero);
+    var clock = new MutableClock(start);
+    var broker = new PendingManagedExecutionService();
+    var strategy = (PeriodicQueueCycleStrategy)new PeriodicQueueCycleFactory().Create(
+        PeriodicDefinition("runner-stop", NoRepriceParameters()));
+    using var runner = new StrategyInstanceRunner(
+        strategy,
+        new ResolvedStrategyUniverse
+        {
+            Tradable = new ResolvedProduct
+            {
+                ProductId = "225MC", Symbol = "225MC", TickSize = 5m, ContractMultiplier = 10m
+            }
+        },
+        new KGIOptionPricing.StrategyFramework.Performance.PaperPortfolioLedger(),
+        clock,
+        0m,
+        broker);
+    runner.OnMarketEvent(StrategyBook(100m, 105m, 20, 10, 1, start));
+    clock.Now = start.AddSeconds(1);
+    runner.OnMarketEvent(StrategyBook(110m, 115m, 20, 10, 2, clock.Now));
+    runner.Stop("runner stop");
+
+    Assert(broker.CancelAllCount == 0 && broker.CancelledClientOrderIds.Count == 2 &&
+           runner.GetSnapshot().State != StrategyLifecycleState.Stopped,
+        "managed strategy Runner.Stop 必須沿用 client-id targeted cancel，等待確認而非先做全撤並提前 Stopped");
+    foreach (string clientOrderId in broker.CancelledClientOrderIds.ToArray())
+        broker.ConfirmCancelled(strategy.InstanceId, clientOrderId, clock.Now);
+    Assert(runner.GetSnapshot().State == StrategyLifecycleState.Stopped,
+        "Runner.Stop 必須等兩張 targeted Cancelled 路由回 strategy 且部位為零才 Stopped");
+}
+
+static void TestPeriodicStrategyResumeStartsFreshCycleAfterFlatPause()
+{
+    DateTimeOffset start = new(2026, 9, 23, 1, 0, 0, TimeSpan.Zero);
+    (PeriodicQueueCycleStrategy strategy, MutableClock clock, List<PaperOrderRequest> orders) =
+        StartWorkingUpStrategy("pause-resume-cycle", NoRepriceParameters(), start);
+    var cancels = new List<string>();
+    strategy.CancelOrderRequested += cancels.Add;
+    strategy.Pause("暫停後重啟");
+    foreach (string clientOrderId in cancels.ToArray())
+        strategy.OnOrderLifecycle(Cancelled(clientOrderId, strategy.InstanceId, clock.Now));
+    strategy.Resume();
+    Assert(strategy.State == StrategyLifecycleState.WarmingUp,
+        "空手 Pause 的雙腿都 Cancelled 後 Resume 必須清除舊方向窗並重新 WarmingUp");
+
+    clock.Now = start.AddSeconds(10);
+    strategy.OnMarketEvent(StrategyBook(100m, 105m, 20, 10, 10, clock.Now));
+    Assert(orders.Count == 2, "Resume 後第一秒不得沿用舊方向立即送新週期");
+    clock.Now = start.AddSeconds(11);
+    strategy.OnMarketEvent(StrategyBook(110m, 115m, 20, 10, 11, clock.Now));
+    Assert(orders.Count == 4 && orders.Skip(2).All(x => x.ClientOrderId.Contains("cycle-2", StringComparison.Ordinal)),
+        "Resume 完整重新暖機後必須能建立 cycle-2，不得卡在 CancellingForExit");
+}
+
+static void TestPeriodicStrategyStopsRepriceEvaluationAfterFirstRouteFailure()
+{
+    DateTimeOffset start = new(2026, 9, 23, 2, 0, 0, TimeSpan.Zero);
+    IReadOnlyDictionary<string, string> parameters = Values(
+        ("DirectionWindowSeconds", "2"), ("ObiConfirmSeconds", "1"),
+        ("MinSideDepth", "1"), ("MinNearDepth", "1"), ("MaxChaseTicks", "20"),
+        ("TrendInitialAheadA", "5"), ("TrendRepriceThresholdB", "15"), ("TrendRepriceTargetC", "0"),
+        ("OppositeInitialAheadA", "5"), ("OppositeRepriceThresholdB", "15"), ("OppositeRepriceTargetC", "0"));
+    var clock = new MutableClock(start);
+    var broker = new FirstCancelFailsManagedExecutionService();
+    var strategy = (PeriodicQueueCycleStrategy)new PeriodicQueueCycleFactory().Create(
+        PeriodicDefinition("mixed-route", parameters));
+    using var runner = new StrategyInstanceRunner(
+        strategy,
+        new ResolvedStrategyUniverse
+        {
+            Tradable = new ResolvedProduct
+            {
+                ProductId = "225MC", Symbol = "225MC", TickSize = 5m, ContractMultiplier = 10m
+            }
+        },
+        new KGIOptionPricing.StrategyFramework.Performance.PaperPortfolioLedger(),
+        clock,
+        0m,
+        broker);
+    runner.OnMarketEvent(StrategyBook(100m, 105m, 20, 10, 1, start));
+    clock.Now = start.AddSeconds(1);
+    runner.OnMarketEvent(StrategyBook(110m, 115m, 20, 10, 2, clock.Now));
+    clock.Now = start.AddSeconds(2);
+    runner.OnMarketEvent(StrategyBook(110m, 115m, 20, 20, 3, clock.Now));
+
+    StrategySnapshot snapshot = runner.GetSnapshot();
+    Assert(broker.CancelAttempts.Count == 1 && snapshot.State == StrategyLifecycleState.Faulted &&
+           snapshot.Reason == "CancelRequestNotRouted",
+        "第一腿 cancel=false 後必須立即停止評估第二腿，不得由後續成功路由覆寫 fail-closed 狀態");
+}
+
+static void TestPeriodicStrategyFaultsOnLateFillFromRetiredCycle()
+{
+    DateTimeOffset start = new(2026, 9, 23, 3, 0, 0, TimeSpan.Zero);
+    (PeriodicQueueCycleStrategy strategy, MutableClock clock, List<PaperOrderRequest> orders) =
+        StartWorkingUpStrategy("retired-late-fill", NoRepriceParameters(), start);
+    var cancels = new List<string>();
+    strategy.CancelOrderRequested += cancels.Add;
+    strategy.Pause("退休週期測試");
+    string retiredBuy = orders.Single(x => x.Side == BuySell.Buy).ClientOrderId;
+    foreach (string clientOrderId in cancels.ToArray())
+        strategy.OnOrderLifecycle(Cancelled(clientOrderId, strategy.InstanceId, clock.Now));
+    strategy.Resume();
+    strategy.OnExecution(Fill(retiredBuy, strategy.InstanceId, BuySell.Buy, 110m, clock.Now.AddMilliseconds(1)));
+    Assert(strategy.State == StrategyLifecycleState.Faulted &&
+           strategy.GetSnapshot().Reason == "LateFillRetiredCycle",
+        "週期重設後仍必須保留退休 ClientOrderId tombstone，合法延遲成交要進入風險 Faulted");
+
+    clock.Now = start.AddSeconds(10);
+    strategy.OnMarketEvent(StrategyBook(100m, 105m, 20, 10, 10, clock.Now));
+    clock.Now = start.AddSeconds(11);
+    strategy.OnMarketEvent(StrategyBook(110m, 115m, 20, 10, 11, clock.Now));
+    Assert(orders.Count == 2, "退休週期延遲成交後不得再建立 cycle-2");
+}
+
+static void TestPeriodicStrategyDoesNotStartCycleWithExistingPosition()
+{
+    DateTimeOffset start = new(2026, 9, 23, 4, 0, 0, TimeSpan.Zero);
+    var performance = new MutablePerformance { NetQuantity = 1, AveragePrice = 100m };
+    var clock = new MutableClock(start);
+    var strategy = (PeriodicQueueCycleStrategy)new PeriodicQueueCycleFactory().Create(
+        PeriodicDefinition("existing-position", NoRepriceParameters()));
+    var orders = new List<PaperOrderRequest>();
+    strategy.OrderRequested += orders.Add;
+    strategy.Start(PeriodicContext(clock, performance));
+    strategy.OnMarketEvent(StrategyBook(100m, 105m, 20, 10, 1, start));
+    clock.Now = start.AddSeconds(1);
+    strategy.OnMarketEvent(StrategyBook(110m, 115m, 20, 10, 2, clock.Now));
+
+    Assert(orders.Count == 0 && strategy.State == StrategyLifecycleState.Suspended &&
+           strategy.GetSnapshot().Reason == "PositionNotFlat",
+        "共用績效顯示既有部位時不得啟動新週期或疊加雙邊 entry");
+}
+
 static (PeriodicQueueCycleStrategy Strategy, MutableClock Clock, List<PaperOrderRequest> Orders)
-    StartWorkingUpStrategy(string instanceId, IReadOnlyDictionary<string, string> parameters, DateTimeOffset start)
+    StartWorkingUpStrategy(
+        string instanceId,
+        IReadOnlyDictionary<string, string> parameters,
+        DateTimeOffset start,
+        IStrategyPerformanceView? performance = null)
 {
     var clock = new MutableClock(start);
     var strategy = (PeriodicQueueCycleStrategy)new PeriodicQueueCycleFactory().Create(
         PeriodicDefinition(instanceId, parameters));
     var orders = new List<PaperOrderRequest>();
     strategy.OrderRequested += orders.Add;
-    strategy.Start(PeriodicContext(clock));
+    strategy.Start(PeriodicContext(clock, performance));
     strategy.OnMarketEvent(StrategyBook(100m, 105m, 20, 10, 1, start));
     clock.Now = start.AddSeconds(1);
     strategy.OnMarketEvent(StrategyBook(110m, 115m, 20, 10, 2, clock.Now));
@@ -1113,7 +1463,9 @@ static StrategyDefinition PeriodicDefinition(string instanceId, IReadOnlyDiction
     Parameters = parameters
 };
 
-static StrategyRuntimeContext PeriodicContext(IStrategyClock clock) => new(
+static StrategyRuntimeContext PeriodicContext(
+    IStrategyClock clock,
+    IStrategyPerformanceView? performance = null) => new(
     new ResolvedStrategyUniverse
     {
         Tradable = new ResolvedProduct
@@ -1122,7 +1474,7 @@ static StrategyRuntimeContext PeriodicContext(IStrategyClock clock) => new(
         }
     },
     clock,
-    new ZeroPerformance());
+    performance ?? new ZeroPerformance());
 
 static MarketEvent StrategyBook(
     decimal bestBid,
@@ -1235,4 +1587,133 @@ sealed class ZeroPerformance : IStrategyPerformanceView
         StrategyInstanceId = strategyInstanceId,
         Symbol = symbol
     };
+}
+
+sealed class MutablePerformance : IStrategyPerformanceView
+{
+    public int NetQuantity { get; set; }
+    public decimal AveragePrice { get; set; }
+
+    public PositionSnapshot GetPosition(string strategyInstanceId, string symbol) => new()
+    {
+        StrategyInstanceId = strategyInstanceId,
+        Symbol = symbol,
+        NetQuantity = NetQuantity,
+        AveragePrice = AveragePrice
+    };
+}
+
+sealed class UnroutableManagedExecutionService : IManagedStrategyExecutionService
+{
+    private int _orderNumber;
+    public List<string> CancelledClientOrderIds { get; } = new();
+
+    public event Action<ExecutionEvent>? Filled { add { } remove { } }
+    public event Action<string>? Failed { add { } remove { } }
+    public event Action<OrderLifecycleEvent>? OrderLifecycleChanged { add { } remove { } }
+
+    public PaperOrder Submit(PaperOrderRequest request, DateTimeOffset now) => new()
+    {
+        OrderId = $"UNROUTED-{++_orderNumber}",
+        ClientOrderId = request.ClientOrderId,
+        StrategyInstanceId = request.StrategyInstanceId,
+        Symbol = request.Symbol,
+        Side = request.Side,
+        Type = request.Type,
+        Role = request.Role,
+        Price = request.Price,
+        Quantity = request.Quantity,
+        State = PaperOrderState.Working,
+        CreatedAt = now
+    };
+
+    public bool CancelByClientOrderId(string strategyInstanceId, string clientOrderId)
+    {
+        CancelledClientOrderIds.Add(clientOrderId);
+        return false;
+    }
+
+    public bool Cancel(string orderId) => false;
+    public int CancelAll(string strategyInstanceId) => 0;
+    public IReadOnlyList<PaperOrder> GetWorkingOrders(string strategyInstanceId) => Array.Empty<PaperOrder>();
+    public void OnMarketEvent(MarketEvent marketEvent) { }
+}
+
+sealed class PendingManagedExecutionService : IManagedStrategyExecutionService
+{
+    private int _orderNumber;
+    public int CancelAllCount { get; private set; }
+    public List<string> CancelledClientOrderIds { get; } = new();
+
+    public event Action<ExecutionEvent>? Filled { add { } remove { } }
+    public event Action<string>? Failed { add { } remove { } }
+    public event Action<OrderLifecycleEvent>? OrderLifecycleChanged;
+
+    public PaperOrder Submit(PaperOrderRequest request, DateTimeOffset now) => new()
+    {
+        OrderId = $"PENDING-{++_orderNumber}",
+        ClientOrderId = request.ClientOrderId,
+        StrategyInstanceId = request.StrategyInstanceId,
+        Symbol = request.Symbol,
+        Side = request.Side,
+        Type = request.Type,
+        Role = request.Role,
+        Price = request.Price,
+        Quantity = request.Quantity,
+        State = PaperOrderState.Working,
+        CreatedAt = now
+    };
+
+    public bool CancelByClientOrderId(string strategyInstanceId, string clientOrderId)
+    {
+        CancelledClientOrderIds.Add(clientOrderId);
+        return true;
+    }
+
+    public void ConfirmCancelled(string instanceId, string clientOrderId, DateTimeOffset timestamp) =>
+        OrderLifecycleChanged?.Invoke(new OrderLifecycleEvent
+        {
+            Timestamp = timestamp,
+            StrategyInstanceId = instanceId,
+            ClientOrderId = clientOrderId,
+            PreviousState = OrderLifecycleState.CancelPending,
+            State = OrderLifecycleState.Cancelled,
+            Quantity = 1,
+            RemainingQuantity = 1
+        });
+
+    public bool Cancel(string orderId) => false;
+    public int CancelAll(string strategyInstanceId) { CancelAllCount++; return 0; }
+    public IReadOnlyList<PaperOrder> GetWorkingOrders(string strategyInstanceId) => Array.Empty<PaperOrder>();
+    public void OnMarketEvent(MarketEvent marketEvent) { }
+}
+
+sealed class FirstCancelFailsManagedExecutionService : IManagedStrategyExecutionService
+{
+    private int _orderNumber;
+    public List<string> CancelAttempts { get; } = new();
+
+    public event Action<ExecutionEvent>? Filled { add { } remove { } }
+    public event Action<string>? Failed { add { } remove { } }
+    public event Action<OrderLifecycleEvent>? OrderLifecycleChanged { add { } remove { } }
+
+    public PaperOrder Submit(PaperOrderRequest request, DateTimeOffset now) => new()
+    {
+        OrderId = $"MIXED-{++_orderNumber}", ClientOrderId = request.ClientOrderId,
+        StrategyInstanceId = request.StrategyInstanceId, Symbol = request.Symbol,
+        Side = request.Side, Type = request.Type, Role = request.Role,
+        Price = request.Price, Quantity = request.Quantity,
+        State = PaperOrderState.Working, CreatedAt = now
+    };
+
+    public bool CancelByClientOrderId(string strategyInstanceId, string clientOrderId)
+    {
+        CancelAttempts.Add(clientOrderId);
+        return CancelAttempts.Count != 1;
+    }
+
+    public bool Cancel(string orderId) => false;
+    public int CancelAll(string strategyInstanceId) => 0;
+    public IReadOnlyList<PaperOrder> GetWorkingOrders(string strategyInstanceId) => Array.Empty<PaperOrder>();
+    public void OnMarketEvent(MarketEvent marketEvent) { }
 }

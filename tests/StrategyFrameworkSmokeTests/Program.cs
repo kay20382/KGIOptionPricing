@@ -119,6 +119,20 @@ using (var secondManagedRunner = new StrategyInstanceRunner(
         "共用執行器的成交事件只能路由至擁有該委託的策略 instance");
 }
 
+var pausedFillBroker = new CrossPricePaperExecutionService();
+var pausedFillProbe = new ManagedProbeStrategy("managed-paused-fill", "MGP");
+using (var pausedFillRunner = new StrategyInstanceRunner(
+    pausedFillProbe,
+    new ResolvedStrategyUniverse { Tradable = Product("225MC", "MGP", 5m, 10m) },
+    new PaperPortfolioLedger(), new SystemStrategyClock(), 0m, pausedFillBroker))
+{
+    pausedFillProbe.Request("paused-buy-g1", BuySell.Buy, 100m);
+    Assert(pausedFillRunner.Pause(), "持有工作單的 managed strategy 應可暫停");
+    pausedFillRunner.OnMarketEvent(Trade("MGP", "225MC", 95m, 4, DateTimeOffset.UtcNow));
+    Assert(pausedFillProbe.Executions.Count == 1 && pausedFillProbe.MarketEvents.Count == 1,
+        "Runner 暫停期間 broker 先成交後，更新後部位非零時仍必須把同一行情交給策略保護路徑");
+}
+
 DateTimeOffset lifecycleT0 = new(2026, 9, 22, 0, 0, 0, TimeSpan.Zero);
 DateTimeOffset lifecycleT1 = lifecycleT0.AddSeconds(7);
 var deterministicLifecycleRuns = new List<OrderLifecycleEvent[]>();
@@ -142,6 +156,39 @@ for (int run = 0; run < 2; run++)
 }
 Assert(deterministicLifecycleRuns[0].SequenceEqual(deterministicLifecycleRuns[1]),
     "相同 clock 與委託序列必須產生完全一致的生命週期事件");
+
+DateTimeOffset unroutedAt = new(2026, 9, 22, 0, 30, 0, TimeSpan.Zero);
+var unroutedClock = new MutableStrategyClock(unroutedAt);
+var unroutedBroker = new TrackingManagedExecutionService();
+var unroutedProbe = new ManagedProbeStrategy("managed-unrouted", "MGU");
+using (var unroutedRunner = new StrategyInstanceRunner(
+    unroutedProbe,
+    new ResolvedStrategyUniverse { Tradable = Product("225MC", "MGU", 5m, 10m) },
+    new PaperPortfolioLedger(), unroutedClock, 0m, unroutedBroker))
+{
+    unroutedProbe.Cancel("missing-g1");
+    OrderLifecycleEvent failure = unroutedProbe.Lifecycle.Single();
+    Assert(failure.StrategyInstanceId == "managed-unrouted" &&
+           failure.ClientOrderId == "missing-g1" &&
+           failure.Timestamp == unroutedAt &&
+           failure.State == OrderLifecycleState.CancelPending &&
+           failure.ReasonCode == "CancelRequestNotRouted",
+        "managed targeted cancel 無法路由時 Runner 必須明確回送失敗 lifecycle，不得丟棄 bool=false 或偽造 Cancelled");
+}
+
+var silentStopBroker = new TrackingManagedExecutionService();
+var silentStopProbe = new ManagedProbeStrategy("managed-silent-stop", "MGS", cancelAllOnStop: false);
+using (var silentStopRunner = new StrategyInstanceRunner(
+    silentStopProbe,
+    new ResolvedStrategyUniverse { Tradable = Product("225MC", "MGS", 5m, 10m) },
+    new PaperPortfolioLedger(), new SystemStrategyClock(), 0m, silentStopBroker))
+{
+    silentStopProbe.Request("silent-stop-g1", BuySell.Buy, 100m);
+    silentStopRunner.Stop("generic managed stop");
+    Assert(silentStopBroker.CancelAllCount == 1 &&
+           silentStopBroker.GetWorkingOrders("managed-silent-stop").Count == 0,
+        "managed strategy 若宣告 Stopped 卻未自行撤掉工作單，Runner 必須 fail-closed 補做 instance 全撤");
+}
 
 var detachedBroker = new TrackingManagedExecutionService();
 var detachedProbe = new ManagedProbeStrategy("managed-detached", "MGD");
@@ -555,11 +602,13 @@ sealed class FakeSource : IMarketEventSource
 sealed class ManagedProbeStrategy : ISimulationStrategy, IManagedOrderStrategy
 {
     private readonly string _symbol;
+    private readonly bool _cancelAllOnStop;
 
-    public ManagedProbeStrategy(string instanceId, string? symbol = null)
+    public ManagedProbeStrategy(string instanceId, string? symbol = null, bool cancelAllOnStop = true)
     {
         InstanceId = instanceId;
         _symbol = symbol ?? (instanceId == "managed-fill" ? "MGF" : "MGR");
+        _cancelAllOnStop = cancelAllOnStop;
     }
 
     public string StrategyType => "ManagedProbe";
@@ -567,6 +616,7 @@ sealed class ManagedProbeStrategy : ISimulationStrategy, IManagedOrderStrategy
     public StrategyLifecycleState State { get; private set; } = StrategyLifecycleState.Created;
     public List<OrderLifecycleEvent> Lifecycle { get; } = new();
     public List<ExecutionEvent> Executions { get; } = new();
+    public List<MarketEvent> MarketEvents { get; } = new();
 
     public event Action<PaperOrderRequest>? OrderRequested;
     public event Action? CancelAllRequested;
@@ -594,13 +644,13 @@ sealed class ManagedProbeStrategy : ISimulationStrategy, IManagedOrderStrategy
         State = StrategyLifecycleState.Ready;
         SnapshotChanged?.Invoke(GetSnapshot());
     }
-    public void OnMarketEvent(MarketEvent marketEvent) { }
+    public void OnMarketEvent(MarketEvent marketEvent) => MarketEvents.Add(marketEvent);
     public void OnExecution(ExecutionEvent execution) => Executions.Add(execution);
     public void Pause(string reason) => State = StrategyLifecycleState.Suspended;
     public void Resume() => State = StrategyLifecycleState.Ready;
     public void Stop(string reason)
     {
-        CancelAllRequested?.Invoke();
+        if (_cancelAllOnStop) CancelAllRequested?.Invoke();
         State = StrategyLifecycleState.Stopped;
     }
     public StrategySnapshot GetSnapshot() => new()
@@ -615,6 +665,7 @@ sealed class ManagedProbeStrategy : ISimulationStrategy, IManagedOrderStrategy
 
 sealed class TrackingManagedExecutionService : IManagedStrategyExecutionService
 {
+    private readonly List<PaperOrder> _working = new();
     public int SubmitCount { get; private set; }
     public int CancelAllCount { get; private set; }
 
@@ -625,7 +676,7 @@ sealed class TrackingManagedExecutionService : IManagedStrategyExecutionService
     public PaperOrder Submit(PaperOrderRequest request, DateTimeOffset now)
     {
         SubmitCount++;
-        return new PaperOrder
+        var order = new PaperOrder
         {
             OrderId = $"TRACK-{SubmitCount}", ClientOrderId = request.ClientOrderId,
             StrategyInstanceId = request.StrategyInstanceId, Symbol = request.Symbol,
@@ -633,12 +684,22 @@ sealed class TrackingManagedExecutionService : IManagedStrategyExecutionService
             Price = request.Price, Quantity = request.Quantity,
             State = PaperOrderState.Working, CreatedAt = now
         };
+        _working.Add(order);
+        return order;
     }
 
     public bool Cancel(string orderId) => false;
-    public int CancelAll(string strategyInstanceId) { CancelAllCount++; return 0; }
+    public int CancelAll(string strategyInstanceId)
+    {
+        CancelAllCount++;
+        int cancelled = _working.RemoveAll(x =>
+            string.Equals(x.StrategyInstanceId, strategyInstanceId, StringComparison.OrdinalIgnoreCase));
+        return cancelled;
+    }
     public bool CancelByClientOrderId(string strategyInstanceId, string clientOrderId) => false;
-    public IReadOnlyList<PaperOrder> GetWorkingOrders(string strategyInstanceId) => Array.Empty<PaperOrder>();
+    public IReadOnlyList<PaperOrder> GetWorkingOrders(string strategyInstanceId) => _working
+        .Where(x => string.Equals(x.StrategyInstanceId, strategyInstanceId, StringComparison.OrdinalIgnoreCase))
+        .ToArray();
     public void OnMarketEvent(MarketEvent marketEvent) { }
 }
 

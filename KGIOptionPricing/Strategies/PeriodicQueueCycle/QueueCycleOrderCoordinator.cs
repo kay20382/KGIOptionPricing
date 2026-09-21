@@ -46,6 +46,8 @@ internal sealed class QueueCycleOrderCoordinator
     private readonly string _symbol;
     private readonly PeriodicQueueCycleParameters _parameters;
     private readonly QueueCyclePricingPolicy _pricing = new();
+    private readonly HashSet<string> _retiredClientOrderIds = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _retiredFilledClientOrderIds = new(StringComparer.Ordinal);
     private OrderLeg? _buy;
     private OrderLeg? _sell;
 
@@ -68,6 +70,10 @@ internal sealed class QueueCycleOrderCoordinator
     internal bool IsFaulted => Phase == QueueCyclePhase.Faulted;
     internal bool BothUnfilled => _buy is not null && _sell is not null &&
         !_buy.HasFill && !_sell.HasFill;
+    internal bool HasOutstandingOrders => IsOutstanding(_buy) || IsOutstanding(_sell);
+    internal string CycleSummary =>
+        $"Cycle={_buy?.CycleId ?? "none"};Direction={FrozenDirection};" +
+        $"Buy={LegSummary(_buy)};Sell={LegSummary(_sell)}";
 
     internal event Action<PaperOrderRequest>? OrderRequested;
     internal event Action<string>? CancelOrderRequested;
@@ -123,16 +129,38 @@ internal sealed class QueueCycleOrderCoordinator
 
     internal void EvaluateReprices(MarketEvent book)
     {
-        if (FrozenBounds is null) return;
+        if (FrozenBounds is null || IsFaulted) return;
         EvaluateReprice(_buy, book);
+        if (IsFaulted) return;
         EvaluateReprice(_sell, book);
         UpdateWorkingPhase();
     }
 
+    internal bool ResetCancelledFlatCycle()
+    {
+        if (HasOutstandingOrders || _buy?.HasFill == true || _sell?.HasFill == true) return false;
+        Retire(_buy);
+        Retire(_sell);
+        _buy = null;
+        _sell = null;
+        FrozenDirection = CycleDirection.Neutral;
+        FrozenAssessment = null;
+        FrozenBounds = null;
+        Phase = QueueCyclePhase.Ready;
+        ReasonCode = "WarmupIncomplete";
+        return true;
+    }
+
     internal void OnExecution(ExecutionEvent execution)
     {
+        if (execution.Quantity <= 0) return;
+        if (_retiredClientOrderIds.Contains(execution.ClientOrderId))
+        {
+            FaultForRetiredFill(execution.ClientOrderId);
+            return;
+        }
         OrderLeg? leg = FindKnown(execution.ClientOrderId);
-        if (leg is null || execution.Quantity <= 0 ||
+        if (leg is null ||
             !leg.FilledClientOrderIds.Add(execution.ClientOrderId)) return;
 
         if (leg.HasFill)
@@ -164,11 +192,24 @@ internal sealed class QueueCycleOrderCoordinator
 
     internal void OnOrderLifecycle(OrderLifecycleEvent orderEvent)
     {
+        if (orderEvent.State == OrderLifecycleState.Filled &&
+            _retiredClientOrderIds.Contains(orderEvent.ClientOrderId))
+        {
+            FaultForRetiredFill(orderEvent.ClientOrderId);
+            return;
+        }
         OrderLeg? leg = FindCurrent(orderEvent.ClientOrderId);
         if (leg is null || leg.State is LegState.Filled or LegState.Cancelled) return;
 
         switch (orderEvent.State)
         {
+            case OrderLifecycleState.CancelPending when
+                leg.State == LegState.CancelPending &&
+                string.Equals(orderEvent.ReasonCode, "CancelRequestNotRouted", StringComparison.Ordinal):
+                leg.PendingReplacementPrice = null;
+                Phase = QueueCyclePhase.Faulted;
+                ReasonCode = "CancelRequestNotRouted";
+                return;
             case OrderLifecycleState.CancelPending when leg.State == LegState.CancelPending:
                 return;
             case OrderLifecycleState.Filled:
@@ -237,16 +278,24 @@ internal sealed class QueueCycleOrderCoordinator
     internal bool CancelBothBeforeFill(string reasonCode)
     {
         if (!BothUnfilled) return false;
-        CancelWithoutReplacement(_buy, CancelIntent.Exit);
-        CancelWithoutReplacement(_sell, CancelIntent.Exit);
         Phase = QueueCyclePhase.CancellingForExit;
         ReasonCode = reasonCode;
+        CancelWithoutReplacement(_buy, CancelIntent.Exit);
+        CancelWithoutReplacement(_sell, CancelIntent.Exit);
         return true;
+    }
+
+    internal void CancelAllWorking(string reasonCode)
+    {
+        Phase = QueueCyclePhase.CancellingForExit;
+        ReasonCode = reasonCode;
+        CancelWithoutReplacement(_buy, CancelIntent.Exit);
+        CancelWithoutReplacement(_sell, CancelIntent.Exit);
     }
 
     private void EvaluateReprice(OrderLeg? leg, MarketEvent book)
     {
-        if (leg is null || leg.State != LegState.Working || FrozenBounds is null) return;
+        if (IsFaulted || leg is null || leg.State != LegState.Working || FrozenBounds is null) return;
         int samePriceAhead = QuantityAtPrice(leg.Side, book, leg.CurrentPrice);
         QueuePriceDecision decision = _pricing.EvaluateReprice(
             leg.Side,
@@ -279,6 +328,22 @@ internal sealed class QueueCycleOrderCoordinator
         if (leg.State == LegState.CancelPending) return;
         leg.State = LegState.CancelPending;
         CancelOrderRequested?.Invoke(leg.ClientOrderId);
+    }
+
+    private void FaultForRetiredFill(string clientOrderId)
+    {
+        if (!_retiredFilledClientOrderIds.Add(clientOrderId)) return;
+        Phase = QueueCyclePhase.Faulted;
+        ReasonCode = "LateFillRetiredCycle";
+        CancelWithoutReplacement(_buy, CancelIntent.Fault);
+        CancelWithoutReplacement(_sell, CancelIntent.Fault);
+    }
+
+    private void Retire(OrderLeg? leg)
+    {
+        if (leg is null) return;
+        foreach (string clientOrderId in leg.ClientOrderIds)
+            _retiredClientOrderIds.Add(clientOrderId);
     }
 
     private void UpdateWorkingPhase()
@@ -359,4 +424,11 @@ internal sealed class QueueCycleOrderCoordinator
 
     private string ClientOrderId(string cycleId, BuySell side, int generation) =>
         $"{_instanceId}-{cycleId}-{(side == BuySell.Buy ? "buy" : "sell")}-g{generation}";
+
+    private static bool IsOutstanding(OrderLeg? leg) =>
+        leg is { Submitted: true, State: LegState.Working or LegState.CancelPending };
+
+    private static string LegSummary(OrderLeg? leg) => leg is null
+        ? "none"
+        : $"{leg.ClientOrderId},Generation={leg.Generation},State={leg.State},Price={leg.CurrentPrice},Intent={leg.CancelIntent}";
 }

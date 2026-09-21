@@ -14,6 +14,9 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
     private string _reason = "尚未啟動";
     private int _oppositeDirectionSeconds;
     private long _lastOppositeUtcSecond = long.MinValue;
+    private bool _paused;
+    private bool _stopRequested;
+    private string _stopReason = string.Empty;
 
     internal PeriodicQueueCycleStrategy(
         StrategyDefinition definition,
@@ -28,7 +31,7 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
     public StrategyLifecycleState State { get; private set; } = StrategyLifecycleState.Created;
 
     public event Action<PaperOrderRequest>? OrderRequested;
-    public event Action? CancelAllRequested;
+    public event Action? CancelAllRequested { add { } remove { } }
     public event Action<StrategySnapshot>? SnapshotChanged;
     public event Action<string>? CancelOrderRequested;
 
@@ -53,10 +56,11 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
     public void OnMarketEvent(MarketEvent marketEvent)
     {
         if (_context is null || _directionWindow is null || _coordinator is null ||
-            State is StrategyLifecycleState.Stopped or StrategyLifecycleState.Faulted or StrategyLifecycleState.Suspended ||
+            State is StrategyLifecycleState.Stopped or StrategyLifecycleState.Faulted ||
             marketEvent.Kind != MarketEventKind.Book ||
             !string.Equals(marketEvent.Symbol, _context.Universe.Tradable.Symbol, StringComparison.OrdinalIgnoreCase))
             return;
+        if (_paused && Position().NetQuantity == 0) return;
 
         _lastBook = marketEvent;
         bool added = _directionWindow.TryAdd(marketEvent, _context.Clock.Now);
@@ -66,16 +70,21 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
         if (_coordinator.Phase is QueueCyclePhase.WorkingBoth or QueueCyclePhase.WorkingOneLeg or
             QueueCyclePhase.CancellingForReprice or QueueCyclePhase.CancellingForExit)
         {
-            if (added && ManagePreFillReversal(marketEvent.Timestamp))
+            bool currentBookHealthy = added && !IsHealthFailure(_lastAssessment.PrimaryReasonCode);
+            if (currentBookHealthy && ManagePreFillReversal(marketEvent.Timestamp))
             {
-                State = StrategyLifecycleState.Running;
+                State = _coordinator.IsFaulted
+                    ? StrategyLifecycleState.Faulted
+                    : _paused ? StrategyLifecycleState.Suspended : StrategyLifecycleState.Running;
                 _reason = _coordinator.ReasonCode;
                 Publish();
                 return;
             }
-            _coordinator.EvaluateReprices(marketEvent);
-            State = StrategyLifecycleState.Running;
-            _reason = _coordinator.ReasonCode;
+            if (currentBookHealthy) _coordinator.EvaluateReprices(marketEvent);
+            State = _coordinator.IsFaulted
+                ? StrategyLifecycleState.Faulted
+                : _paused ? StrategyLifecycleState.Suspended : StrategyLifecycleState.Running;
+            _reason = currentBookHealthy ? _coordinator.ReasonCode : _lastAssessment.PrimaryReasonCode;
             Publish();
             return;
         }
@@ -92,6 +101,13 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
         _reason = _lastAssessment.PrimaryReasonCode;
         Publish();
         if (_lastAssessment.Direction == CycleDirection.Neutral) return;
+        if (Position().NetQuantity != 0)
+        {
+            State = StrategyLifecycleState.Suspended;
+            _reason = "PositionNotFlat";
+            Publish();
+            return;
+        }
 
         FrozenPriceBounds bounds = QueueCyclePricingPolicy.CreateBounds(
             marketEvent.MidPrice,
@@ -116,6 +132,7 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
         _oppositeDirectionSeconds = 0;
         _reason = _coordinator?.ReasonCode ?? _reason;
         if (_coordinator?.IsFaulted == true) State = StrategyLifecycleState.Faulted;
+        TryCompleteStop();
         Publish();
     }
 
@@ -125,33 +142,61 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
         _coordinator?.OnOrderLifecycle(orderEvent);
         _reason = _coordinator?.ReasonCode ?? _reason;
         if (_coordinator?.IsFaulted == true) State = StrategyLifecycleState.Faulted;
+        TryCompleteStop();
         Publish();
     }
 
     public void Pause(string reason)
     {
         if (State is StrategyLifecycleState.Stopped or StrategyLifecycleState.Faulted) return;
-        State = StrategyLifecycleState.Suspended;
-        _reason = string.IsNullOrWhiteSpace(reason) ? "使用者暫停" : reason;
+        _paused = true;
+        string pauseReason = string.IsNullOrWhiteSpace(reason) ? "使用者暫停" : reason;
+        if (Position().NetQuantity == 0) _coordinator?.CancelAllWorking("Paused");
+        State = _coordinator?.IsFaulted == true
+            ? StrategyLifecycleState.Faulted
+            : StrategyLifecycleState.Suspended;
+        _reason = _coordinator?.IsFaulted == true ? _coordinator.ReasonCode : pauseReason;
         Publish();
     }
 
     public void Resume()
     {
-        if (State != StrategyLifecycleState.Suspended) return;
-        State = _directionWindow?.SampleCount >= _parameters.DirectionWindowSeconds
-            ? StrategyLifecycleState.Ready
-            : StrategyLifecycleState.WarmingUp;
-        _reason = State == StrategyLifecycleState.Ready ? "等待方向訊號" : "WarmupIncomplete";
+        if (State != StrategyLifecycleState.Suspended || _stopRequested) return;
+        if (Position().NetQuantity == 0)
+        {
+            if (_coordinator?.HasOutstandingOrders == true) return;
+            if (_coordinator?.ResetCancelledFlatCycle() == true && _context is not null)
+                _directionWindow = new DirectionWindow(_context.Universe.Tradable.TickSize, _parameters);
+            _paused = false;
+            State = StrategyLifecycleState.WarmingUp;
+            _reason = "WarmupIncomplete";
+            Publish();
+            return;
+        }
+        _paused = false;
+        State = StrategyLifecycleState.Running;
+        _reason = _coordinator?.ReasonCode ?? "持倉保護恢復";
         Publish();
     }
 
     public void Stop(string reason)
     {
-        if (State == StrategyLifecycleState.Stopped) return;
-        CancelAllRequested?.Invoke();
-        State = StrategyLifecycleState.Stopped;
-        _reason = string.IsNullOrWhiteSpace(reason) ? "策略已停止" : reason;
+        if (State is StrategyLifecycleState.Stopped or StrategyLifecycleState.Faulted) return;
+        _stopRequested = true;
+        _paused = true;
+        _stopReason = string.IsNullOrWhiteSpace(reason) ? "策略已停止" : reason;
+        _coordinator?.CancelAllWorking("StopRequested");
+        if (_coordinator?.IsFaulted == true)
+        {
+            State = StrategyLifecycleState.Faulted;
+            _reason = _coordinator.ReasonCode;
+        }
+        else
+        {
+            State = StrategyLifecycleState.Suspended;
+            _reason = "StopPending";
+            TryCompleteStop();
+        }
         Publish();
     }
 
@@ -166,7 +211,9 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
             ParameterSummary = _parameters.ParameterSummary,
             TradableProductId = _context?.Universe.Tradable.ProductId ?? _definition.Universe.Tradable.ProductId,
             TradableSymbol = _context?.Universe.Tradable.Symbol ?? _definition.Universe.Tradable.Symbol ?? string.Empty,
-            ReferenceSummary = "十檔方向與雙邊獨立完成單",
+            ReferenceSummary = _coordinator is null
+                ? "Cycle=none;Direction=Neutral;Buy=none;Sell=none"
+                : _coordinator.CycleSummary,
             State = State,
             Reason = _reason,
             LastPrice = _lastBook?.LastPrice ?? 0m,
@@ -211,4 +258,23 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
         if (_oppositeDirectionSeconds < _parameters.DirectionReverseSeconds) return false;
         return _coordinator.CancelBothBeforeFill("SignalReversedBeforeFill");
     }
+
+    private void TryCompleteStop()
+    {
+        if (!_stopRequested || State == StrategyLifecycleState.Faulted) return;
+        if (_coordinator?.IsFaulted == true)
+        {
+            State = StrategyLifecycleState.Faulted;
+            _reason = _coordinator.ReasonCode;
+            return;
+        }
+        if (_coordinator?.HasOutstandingOrders == true || Position().NetQuantity != 0) return;
+        State = StrategyLifecycleState.Stopped;
+        _reason = _stopReason;
+    }
+
+    private static bool IsHealthFailure(string reasonCode) => reasonCode is
+        "StaleQuote" or "InvalidBook" or "InsufficientSideDepth" or
+        "InsufficientNearDepth" or "DepthImbalance" or "SpreadTooWide" or
+        "VolatilityTooHigh";
 }

@@ -119,8 +119,13 @@ public sealed class StrategyInstanceRunner : IDisposable
         lock (_sync)
         {
             _paused = false;
-            _broker.CancelAll(_strategy.InstanceId);
+            bool managed = _managedStrategy is not null && _managedBroker is not null;
+            if (!managed)
+                _broker.CancelAll(_strategy.InstanceId);
             _strategy.Stop(reason);
+            if (managed && _strategy.State == StrategyLifecycleState.Stopped &&
+                _broker.GetWorkingOrders(_strategy.InstanceId).Count > 0)
+                _broker.CancelAll(_strategy.InstanceId);
         }
     }
 
@@ -132,8 +137,19 @@ public sealed class StrategyInstanceRunner : IDisposable
     private void OnStrategySnapshotChanged(StrategySnapshot snapshot) =>
         SnapshotChanged?.Invoke(WithPnl(snapshot));
 
-    private void OnCancelOrderRequested(string clientOrderId) =>
-        _managedBroker?.CancelByClientOrderId(_strategy.InstanceId, clientOrderId);
+    private void OnCancelOrderRequested(string clientOrderId)
+    {
+        if (_managedBroker?.CancelByClientOrderId(_strategy.InstanceId, clientOrderId) != false) return;
+        _managedStrategy?.OnOrderLifecycle(new OrderLifecycleEvent
+        {
+            Timestamp = _clock.Now,
+            StrategyInstanceId = _strategy.InstanceId,
+            ClientOrderId = clientOrderId,
+            PreviousState = OrderLifecycleState.CancelPending,
+            State = OrderLifecycleState.CancelPending,
+            ReasonCode = "CancelRequestNotRouted"
+        });
+    }
 
     private void OnOrderLifecycleChanged(OrderLifecycleEvent orderEvent)
     {
@@ -167,7 +183,8 @@ public sealed class StrategyInstanceRunner : IDisposable
     private StrategySnapshot GetSnapshotCore()
     {
         StrategySnapshot snapshot = WithPnl(_strategy.GetSnapshot());
-        return !_paused ? snapshot : snapshot with
+        return !_paused || snapshot.State is StrategyLifecycleState.Faulted or StrategyLifecycleState.Stopped
+            ? snapshot : snapshot with
         {
             State = StrategyLifecycleState.Suspended,
             Reason = "使用者暫停",
