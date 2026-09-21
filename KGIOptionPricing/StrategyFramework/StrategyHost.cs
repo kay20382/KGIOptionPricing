@@ -47,8 +47,8 @@ public sealed class StrategyInstanceRunner : IDisposable
         _broker = executionService ?? new CrossPricePaperExecutionService(commissionPerContract);
         foreach (ResolvedProduct product in universe.AllProducts) ledger.RegisterProduct(strategy.InstanceId, product);
         _strategy.OrderRequested += OnOrderRequested;
-        _strategy.CancelAllRequested += () => _broker.CancelAll(_strategy.InstanceId);
-        _strategy.SnapshotChanged += snapshot => SnapshotChanged?.Invoke(WithPnl(snapshot));
+        _strategy.CancelAllRequested += OnCancelAllRequested;
+        _strategy.SnapshotChanged += OnStrategySnapshotChanged;
         _broker.Filled += OnFilled;
         if (_strategy is IManagedOrderStrategy managedStrategy &&
             _broker is IManagedStrategyExecutionService managedBroker)
@@ -125,6 +125,11 @@ public sealed class StrategyInstanceRunner : IDisposable
     private void OnOrderRequested(PaperOrderRequest request) =>
         _broker.Submit(request, DateTimeOffset.Now);
 
+    private void OnCancelAllRequested() => _broker.CancelAll(_strategy.InstanceId);
+
+    private void OnStrategySnapshotChanged(StrategySnapshot snapshot) =>
+        SnapshotChanged?.Invoke(WithPnl(snapshot));
+
     private void OnCancelOrderRequested(string clientOrderId) =>
         _managedBroker?.CancelByClientOrderId(_strategy.InstanceId, clientOrderId);
 
@@ -173,6 +178,9 @@ public sealed class StrategyInstanceRunner : IDisposable
         if (_disposed) return;
         Stop("執行個體已釋放");
         _disposed = true;
+        _strategy.OrderRequested -= OnOrderRequested;
+        _strategy.CancelAllRequested -= OnCancelAllRequested;
+        _strategy.SnapshotChanged -= OnStrategySnapshotChanged;
         _broker.Filled -= OnFilled;
         if (_managedStrategy != null) _managedStrategy.CancelOrderRequested -= OnCancelOrderRequested;
         if (_managedBroker != null) _managedBroker.OrderLifecycleChanged -= OnOrderLifecycleChanged;

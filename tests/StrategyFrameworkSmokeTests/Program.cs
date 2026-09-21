@@ -118,6 +118,26 @@ using (var secondManagedRunner = new StrategyInstanceRunner(
     Assert(firstManagedProbe.Executions.Count == 1 && secondManagedProbe.Executions.Count == 0,
         "共用執行器的成交事件只能路由至擁有該委託的策略 instance");
 }
+
+var detachedBroker = new TrackingManagedExecutionService();
+var detachedProbe = new ManagedProbeStrategy("managed-detached", "MGD");
+var detachedRunner = new StrategyInstanceRunner(
+    detachedProbe,
+    new ResolvedStrategyUniverse { Tradable = Product("225MC", "MGD", 5m, 10m) },
+    new PaperPortfolioLedger(), new SystemStrategyClock(), 0m, detachedBroker);
+int detachedSnapshots = 0;
+detachedRunner.SnapshotChanged += _ => detachedSnapshots++;
+detachedRunner.Dispose();
+int submitsAfterDispose = detachedBroker.SubmitCount;
+int cancelAllAfterDispose = detachedBroker.CancelAllCount;
+int snapshotsAfterDispose = detachedSnapshots;
+detachedProbe.Request("after-dispose", BuySell.Buy, 100m);
+detachedProbe.CancelAll();
+detachedProbe.PublishSnapshot();
+Assert(detachedBroker.SubmitCount == submitsAfterDispose &&
+       detachedBroker.CancelAllCount == cancelAllAfterDispose &&
+       detachedSnapshots == snapshotsAfterDispose,
+    "Runner 釋放後必須解除策略送單、全撤與快照事件訂閱");
 Assert(correlatedOrder.ClientOrderId == "cycle-1-buy-g1" &&
        correlatedExecution.ClientOrderId == "cycle-1-buy-g1",
     "工作委託與成交事件必須保留策略用戶端識別");
@@ -542,6 +562,8 @@ sealed class ManagedProbeStrategy : ISimulationStrategy, IManagedOrderStrategy
     });
 
     public void Cancel(string clientOrderId) => CancelOrderRequested?.Invoke(clientOrderId);
+    public void CancelAll() => CancelAllRequested?.Invoke();
+    public void PublishSnapshot() => SnapshotChanged?.Invoke(GetSnapshot());
     public void OnOrderLifecycle(OrderLifecycleEvent orderEvent) => Lifecycle.Add(orderEvent);
     public void Start(StrategyRuntimeContext context)
     {
@@ -565,4 +587,33 @@ sealed class ManagedProbeStrategy : ISimulationStrategy, IManagedOrderStrategy
         Reason = "probe",
         UpdatedAt = DateTimeOffset.UtcNow
     };
+}
+
+sealed class TrackingManagedExecutionService : IManagedStrategyExecutionService
+{
+    public int SubmitCount { get; private set; }
+    public int CancelAllCount { get; private set; }
+
+    public event Action<ExecutionEvent>? Filled { add { } remove { } }
+    public event Action<string>? Failed { add { } remove { } }
+    public event Action<OrderLifecycleEvent>? OrderLifecycleChanged { add { } remove { } }
+
+    public PaperOrder Submit(PaperOrderRequest request, DateTimeOffset now)
+    {
+        SubmitCount++;
+        return new PaperOrder
+        {
+            OrderId = $"TRACK-{SubmitCount}", ClientOrderId = request.ClientOrderId,
+            StrategyInstanceId = request.StrategyInstanceId, Symbol = request.Symbol,
+            Side = request.Side, Type = request.Type, Role = request.Role,
+            Price = request.Price, Quantity = request.Quantity,
+            State = PaperOrderState.Working, CreatedAt = now
+        };
+    }
+
+    public bool Cancel(string orderId) => false;
+    public int CancelAll(string strategyInstanceId) { CancelAllCount++; return 0; }
+    public bool CancelByClientOrderId(string strategyInstanceId, string clientOrderId) => false;
+    public IReadOnlyList<PaperOrder> GetWorkingOrders(string strategyInstanceId) => Array.Empty<PaperOrder>();
+    public void OnMarketEvent(MarketEvent marketEvent) { }
 }
