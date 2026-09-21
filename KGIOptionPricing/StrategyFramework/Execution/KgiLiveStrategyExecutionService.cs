@@ -46,6 +46,8 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
     private bool _disposing;
     private int _inflightCallbacks;
     private readonly Dictionary<int, int> _callbackThreadDepth = new();
+    private int _inflightOperations;
+    private readonly Dictionary<int, int> _operationThreadDepth = new();
 
     public event Action<ExecutionEvent>? Filled;
     public event Action<string>? Failed;
@@ -100,11 +102,10 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
 
     public PaperOrder Submit(PaperOrderRequest request, DateTimeOffset now)
     {
-        lock (_sync)
+        EnterOperation();
+        try
         {
-            ThrowIfClosingLocked();
-            PurgeExpiredTerminalsLocked(_now());
-        }
+        lock (_sync) PurgeExpiredTerminalsLocked(_now());
         if (!_gateway.IsLoggedIn) throw new InvalidOperationException("交易服務尚未登入，禁止實盤送單。");
         if (!string.Equals(request.StrategyInstanceId, _instanceId, StringComparison.OrdinalIgnoreCase))
             throw new InvalidOperationException("策略實例與實盤執行器不一致。");
@@ -141,10 +142,15 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
             StateChanged?.Invoke();
         }
         return order;
+        }
+        finally { ExitOperation(); }
     }
 
     public bool Cancel(string orderId)
     {
+        EnterOperation();
+        try
+        {
         bool removedCondition;
         string? realId;
         lock (_sync)
@@ -162,10 +168,15 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
             return true;
         }
         return !string.IsNullOrEmpty(realId) && RequestCancel(realId);
+        }
+        finally { ExitOperation(); }
     }
 
     public bool CancelByClientOrderId(string strategyInstanceId, string clientOrderId)
     {
+        EnterOperation();
+        try
+        {
         if (!string.Equals(strategyInstanceId, _instanceId, StringComparison.OrdinalIgnoreCase) ||
             string.IsNullOrWhiteSpace(clientOrderId)) return false;
 
@@ -184,10 +195,15 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
             realId = matches[0];
         }
         return RequestCancel(realId);
+        }
+        finally { ExitOperation(); }
     }
 
     public int CancelAll(string strategyInstanceId)
     {
+        EnterOperation();
+        try
+        {
         if (!string.Equals(strategyInstanceId, _instanceId, StringComparison.OrdinalIgnoreCase)) return 0;
         string[] realIds;
         int conditionCount;
@@ -202,6 +218,8 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         foreach (string realId in realIds) RequestCancel(realId);
         if (conditionCount > 0) StateChanged?.Invoke();
         return conditionCount + realIds.Length;
+        }
+        finally { ExitOperation(); }
     }
 
     public IReadOnlyList<PaperOrder> GetWorkingOrders(string strategyInstanceId)
@@ -218,6 +236,9 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
 
     public void OnMarketEvent(MarketEvent marketEvent)
     {
+        EnterOperation();
+        try
+        {
         if (marketEvent.Kind != MarketEventKind.Trade || marketEvent.LastPrice <= 0m ||
             !string.Equals(marketEvent.Symbol, _quoteSymbol, StringComparison.OrdinalIgnoreCase)) return;
 
@@ -236,12 +257,16 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
             if (triggered != null) _conditions.Clear(); // Existing local OCO behavior.
         }
         if (triggered != null) SendMarket(triggered, marketEvent.LastPrice);
+        }
+        finally { ExitOperation(); }
     }
 
     public void Flatten(int netPosition)
     {
+        EnterOperation();
+        try
+        {
         if (netPosition == 0) return;
-        lock (_sync) ThrowIfClosingLocked();
         var order = new PaperOrder
         {
             OrderId = $"FLAT-{_instanceId}-{Interlocked.Increment(ref _localSequence)}",
@@ -256,6 +281,8 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
             CreatedAt = _now()
         };
         SendMarket(order, 0m);
+        }
+        finally { ExitOperation(); }
     }
 
     private void SendBrokerLimit(PaperOrderRequest request, PaperOrder order, DateTimeOffset now)
@@ -697,8 +724,8 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
             int active = _realOrders.Values.Count(x => !x.Terminal);
             if (active > 0)
                 throw new InvalidOperationException($"仍有 {active} 張實盤委託未終結，禁止釋放執行器。");
-            if (_inflightCallbacks > 0)
-                throw new InvalidOperationException($"仍有 {_inflightCallbacks} 個 broker callback 尚未發布完成，禁止釋放執行器。");
+            if (_inflightCallbacks > 0 || _inflightOperations > 0)
+                throw new InvalidOperationException($"仍有 {_inflightCallbacks} 個 callback／{_inflightOperations} 個操作尚未完成，禁止釋放執行器。");
             _disposing = true;
         }
         _gateway.OrderFilled -= OnOrderFilled;
@@ -722,7 +749,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
     {
         lock (_sync)
         {
-            if (_disposed) return false;
+            if (_disposed || _disposing) return false;
             _inflightCallbacks++;
             int threadId = Environment.CurrentManagedThreadId;
             _callbackThreadDepth.TryGetValue(threadId, out int depth);
@@ -750,5 +777,31 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
     {
         if (_disposed || _disposing)
             throw new ObjectDisposedException(nameof(KgiLiveStrategyExecutionService));
+    }
+
+    private void EnterOperation()
+    {
+        lock (_sync)
+        {
+            ThrowIfClosingLocked();
+            _inflightOperations++;
+            int threadId = Environment.CurrentManagedThreadId;
+            _operationThreadDepth.TryGetValue(threadId, out int depth);
+            _operationThreadDepth[threadId] = depth + 1;
+        }
+    }
+
+    private void ExitOperation()
+    {
+        lock (_sync)
+        {
+            int threadId = Environment.CurrentManagedThreadId;
+            if (_operationThreadDepth.TryGetValue(threadId, out int depth))
+            {
+                if (depth <= 1) _operationThreadDepth.Remove(threadId);
+                else _operationThreadDepth[threadId] = depth - 1;
+            }
+            _inflightOperations--;
+        }
     }
 }

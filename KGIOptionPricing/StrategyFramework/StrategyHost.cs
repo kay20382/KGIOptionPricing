@@ -38,6 +38,7 @@ public sealed class StrategyInstanceRunner : IDisposable
     private bool _paused;
 
     public string InstanceId => _strategy.InstanceId;
+    internal bool IsDisposed { get { lock (_sync) return _disposed; } }
     public event Action<StrategySnapshot>? SnapshotChanged;
     public event Action<ExecutionEvent>? ExecutionOccurred;
 
@@ -259,6 +260,7 @@ public sealed class StrategyInstanceRunner : IDisposable
         try
         {
             if (_broker is IDisposable disposable) disposable.Dispose();
+            Exception? cleanupError = null;
             lock (_sync)
             {
                 _strategy.OrderRequested -= OnOrderRequested;
@@ -266,11 +268,13 @@ public sealed class StrategyInstanceRunner : IDisposable
                 _strategy.SnapshotChanged -= OnStrategySnapshotChanged;
                 if (_managedStrategy != null) _managedStrategy.CancelOrderRequested -= OnCancelOrderRequested;
                 _paused = false;
-                _strategy.Stop("執行個體已釋放");
+                try { _strategy.Stop("執行個體已釋放"); }
+                catch (Exception exception) { cleanupError = exception; }
                 _disposed = true;
                 _broker.Filled -= OnFilled;
                 if (_managedBroker != null) _managedBroker.OrderLifecycleChanged -= OnOrderLifecycleChanged;
             }
+            if (cleanupError != null) ExceptionDispatchInfo.Capture(cleanupError).Throw();
         }
         catch (Exception exception)
         {
@@ -300,6 +304,8 @@ public sealed class StrategyHost : IDisposable
     private readonly PaperPortfolioLedger _ledger = new();
     private readonly IStrategyClock _clock;
     private readonly IMarketEventSource _source;
+    private bool _disposed;
+    internal bool IsDisposed { get { lock (_sync) return _disposed; } }
 
     public event Action<StrategySnapshot>? SnapshotChanged;
     public event Action<ExecutionEvent>? ExecutionOccurred;
@@ -363,8 +369,12 @@ public sealed class StrategyHost : IDisposable
         if (runner == null) return false;
         // Dispose may fail while a live order is still active. Remove only
         // after success so the runner continues routing late fills.
-        runner.Dispose();
-        lock (_sync) return _runners.Remove(runner);
+        try { runner.Dispose(); }
+        finally
+        {
+            if (runner.IsDisposed) lock (_sync) _runners.Remove(runner);
+        }
+        return true;
     }
 
     public void StopAll(string reason = "全部停止")
@@ -396,9 +406,10 @@ public sealed class StrategyHost : IDisposable
         lock (_sync) runners = _runners.ToArray();
         foreach (StrategyInstanceRunner runner in runners)
         {
-            runner.Dispose();
-            lock (_sync) _runners.Remove(runner);
+            try { runner.Dispose(); }
+            finally { if (runner.IsDisposed) lock (_sync) _runners.Remove(runner); }
         }
+        lock (_sync) _disposed = true;
         _source.MarketEventReceived -= OnMarketEvent;
         _source.Dispose();
     }

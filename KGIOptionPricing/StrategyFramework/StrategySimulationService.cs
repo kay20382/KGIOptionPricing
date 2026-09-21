@@ -24,9 +24,7 @@ public sealed class StrategySimulationService : IDisposable
     private readonly StrategyHost _liveHost;
     private StrategyHeartbeatTimer _heartbeat;
     private readonly object _disposeSync = new();
-    private bool _disposing;
-    private int _disposeOwnerThreadId, _disposeAttempt, _failedDisposeAttempt;
-    private Exception? _lastDisposeException;
+    private DisposeAttempt? _disposeAttempt;
     private readonly SimulationRunRecorder _liveRecorder;
     private readonly string _root;
     private bool _disposed;
@@ -149,21 +147,20 @@ public sealed class StrategySimulationService : IDisposable
 
     public void Dispose()
     {
+        DisposeAttempt attempt;
+        bool owner;
         lock (_disposeSync)
         {
             if (_disposed) return;
-            if (_disposing)
+            if (_disposeAttempt != null)
             {
-                if (_disposeOwnerThreadId == Environment.CurrentManagedThreadId) throw new InvalidOperationException("服務不可在自己的 callback 中同步 Dispose。");
-                int waitingAttempt = _disposeAttempt;
-                while (_disposing) Monitor.Wait(_disposeSync);
-                if (_disposed) return;
-                if (_failedDisposeAttempt == waitingAttempt && _lastDisposeException != null) ExceptionDispatchInfo.Capture(_lastDisposeException).Throw();
+                if (_disposeAttempt.OwnerThreadId == Environment.CurrentManagedThreadId) throw new InvalidOperationException("服務不可在自己的 callback 中同步 Dispose。");
+                attempt = _disposeAttempt;
+                owner = false;
             }
-            _disposing = true;
-            _disposeOwnerThreadId = Environment.CurrentManagedThreadId;
-            _disposeAttempt++;
+            else { attempt = _disposeAttempt = new DisposeAttempt(Environment.CurrentManagedThreadId); owner = true; }
         }
+        if (!owner) { attempt.Completed.Wait(); if (attempt.Error != null) ExceptionDispatchInfo.Capture(attempt.Error).Throw(); return; }
         bool timerDrained = false;
         try
         {
@@ -177,14 +174,24 @@ public sealed class StrategySimulationService : IDisposable
         }
         catch (Exception exception)
         {
-            if (timerDrained) _heartbeat = new StrategyHeartbeatTimer(_liveHost.Pulse);
-            lock (_disposeSync) { _lastDisposeException = exception; _failedDisposeAttempt = _disposeAttempt; }
+            if (timerDrained && !_liveHost.IsDisposed) _heartbeat = new StrategyHeartbeatTimer(_liveHost.Pulse);
+            if (_liveHost.IsDisposed) _disposed = true;
+            attempt.Error = exception;
             throw;
         }
         finally
         {
-            lock (_disposeSync) { _disposing = false; _disposeOwnerThreadId = 0; Monitor.PulseAll(_disposeSync); }
+            lock (_disposeSync) { if (ReferenceEquals(_disposeAttempt, attempt)) _disposeAttempt = null; }
+            attempt.Completed.Set();
         }
+    }
+
+    private sealed class DisposeAttempt
+    {
+        internal DisposeAttempt(int ownerThreadId) => OwnerThreadId = ownerThreadId;
+        internal int OwnerThreadId { get; }
+        internal ManualResetEventSlim Completed { get; } = new(false);
+        internal Exception? Error { get; set; }
     }
 
     private sealed class ReplayStrategyClock : IEventDrivenStrategyClock
