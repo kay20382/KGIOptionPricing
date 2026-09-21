@@ -421,6 +421,164 @@ AssertThrows<ArgumentException>(() => LiveStrategyOrderMapper.CreateBrokerLimit(
 AssertThrows<ArgumentException>(() => LiveStrategyOrderMapper.CreateBrokerLimit(
     liveBuy, liveInstrument, "BRK", "ACC", ""),
     "BrokerLimit 必須拒絕空白真實委託識別");
+AssertThrows<ArgumentException>(() => LiveStrategyOrderMapper.CreateBrokerLimit(
+    liveBuy with { Type = PaperOrderType.Limit }, liveInstrument, "BRK", "ACC", "REAL-T"),
+    "live mapper 必須拒絕非 BrokerLimit 委託");
+AssertThrows<ArgumentException>(() => LiveStrategyOrderMapper.CreateBrokerLimit(
+    liveBuy with { ClientOrderId = "" }, liveInstrument, "BRK", "ACC", "REAL-C"),
+    "BrokerLimit 必須拒絕空白 ClientOrderId");
+AssertThrows<ArgumentException>(() => LiveStrategyOrderMapper.CreateBrokerLimit(
+    liveBuy with { StrategyInstanceId = "" }, liveInstrument, "BRK", "ACC", "REAL-I"),
+    "BrokerLimit 必須拒絕空白 StrategyInstanceId");
+AssertThrows<ArgumentException>(() => LiveStrategyOrderMapper.CreateBrokerLimit(
+    liveBuy with { Symbol = "" }, liveInstrument, "BRK", "ACC", "REAL-S"),
+    "BrokerLimit 必須拒絕空白商品代碼");
+
+InstrumentKey mappedFuture = LiveStrategyOrderMapper.ToInstrument(new ContractInfo
+{
+    ExchangeNm = "JPX",
+    ProductId = "225MC",
+    Symbol = "JPX.225MC-202609",
+    ComYM2 = "202609",
+    CPF = CPFEnum.Futures,
+    ComType = '0'
+});
+Assert(mappedFuture.Market == MarketType.ForeignFuture && mappedFuture.Symbol == "225MC",
+    "CPF=Futures、ComType='0' 的國外契約必須走 ForeignFuture/MF_FUT，不得誤判 ForeignOption");
+
+var liveGateway = new FakeLiveStrategyOrderGateway();
+var managedLifecycles = new List<OrderLifecycleEvent>();
+var managedExecutions = new List<ExecutionEvent>();
+var managedEventOrder = new List<string>();
+var managedFailures = new List<string>();
+using (var liveService = new KgiLiveStrategyExecutionService(
+    liveGateway,
+    "managed-live",
+    new ResolvedProduct { ProductId = "225MC", Symbol = "225MC", TickSize = 5m, ContractMultiplier = 10m },
+    new ContractInfo
+    {
+        ExchangeNm = "JPX", ProductId = "225MC", Symbol = "JPX.225MC-202609",
+        ComYM2 = "202609", CPF = CPFEnum.Futures, ComType = '0'
+    },
+    36m))
+{
+    liveService.OrderLifecycleChanged += lifecycle =>
+    {
+        managedLifecycles.Add(lifecycle);
+        managedEventOrder.Add("lifecycle:" + lifecycle.State);
+        _ = liveService.GetWorkingOrders("managed-live");
+    };
+    liveService.Filled += execution =>
+    {
+        managedExecutions.Add(execution);
+        managedEventOrder.Add("execution");
+        _ = liveService.GetWorkingOrders("managed-live");
+    };
+    liveService.Failed += failure =>
+    {
+        managedFailures.Add(failure);
+        _ = liveService.GetWorkingOrders("managed-live");
+    };
+    liveService.StateChanged += () => _ = liveService.GetWorkingOrders("managed-live");
+
+    PaperOrder managedBuy = liveService.Submit(liveBuy, DateTimeOffset.UtcNow);
+    PaperOrder managedSell = liveService.Submit(
+        liveBuy with
+        {
+            ClientOrderId = "cycle-1-sell-g1",
+            Side = BuySell.Sell,
+            Role = PaperOrderRole.EntryShort,
+            Price = 65005m
+        },
+        DateTimeOffset.UtcNow);
+    Assert(liveService.LocalConditionCount == 0 && liveService.ActiveBrokerOrderCount == 2 &&
+           liveService.GetWorkingOrders("managed-live").Select(x => x.ClientOrderId)
+               .OrderBy(x => x).SequenceEqual(new[] { "cycle-1-buy-g1", "cycle-1-sell-g1" }),
+        "兩張 BrokerLimit 必須立即獨立工作，不得進入 local OCO 或清除另一張");
+    liveService.OnMarketEvent(new MarketEvent
+    {
+        Timestamp = DateTimeOffset.UtcNow, Symbol = "225MC", Kind = MarketEventKind.Trade, LastPrice = 66000m
+    });
+    Assert(liveService.ActiveBrokerOrderCount == 2,
+        "BrokerLimit 不得被 local OCO 行情觸發流程清除");
+    Assert(!liveService.CancelByClientOrderId("other-instance", "cycle-1-buy-g1") &&
+           !liveService.CancelByClientOrderId("managed-live", "missing-client") &&
+           liveService.GetWorkingOrders("other-instance").Count == 0,
+        "精準刪單與工作委託查詢必須隔離策略 instance/client");
+
+    OrderLifecycleEvent buyWorking = managedLifecycles.Last(x =>
+        x.ClientOrderId == "cycle-1-buy-g1" && x.State == OrderLifecycleState.Working);
+    Assert(!string.IsNullOrWhiteSpace(buyWorking.BrokerOrderId),
+        "Working 回報必須保存券商委託識別");
+    Assert(liveService.CancelByClientOrderId("managed-live", "cycle-1-buy-g1") &&
+           liveService.ActiveBrokerOrderCount == 2,
+        "CancelPending 期間仍必須視為有效 broker order");
+    OrderLifecycleEvent buyCancelPending = managedLifecycles.Last(x =>
+        x.ClientOrderId == "cycle-1-buy-g1" && x.State == OrderLifecycleState.CancelPending);
+    Assert(buyCancelPending.BrokerOrderId == buyWorking.BrokerOrderId,
+        "CancelPending 必須延續先前保存的 BrokerOrderId");
+    liveGateway.EmitState(managedBuy.OrderId, OrderStatus.Cancelled, 0, 0);
+    OrderLifecycleEvent buyCancelled = managedLifecycles.Last(x =>
+        x.ClientOrderId == "cycle-1-buy-g1" && x.State == OrderLifecycleState.Cancelled);
+    Assert(buyCancelled.BrokerOrderId == buyWorking.BrokerOrderId &&
+           liveService.ActiveBrokerOrderCount == 1 &&
+           liveService.GetWorkingOrders("managed-live").All(x => x.ClientOrderId != "cycle-1-buy-g1"),
+        "Cancelled 終結後不得列為工作單，但 tombstone 必須保留券商識別");
+
+    managedEventOrder.Clear();
+    int executionsBeforeLateBuy = managedExecutions.Count;
+    liveGateway.EmitFill(managedBuy.OrderId, cumulativeQuantity: 1, remainingQuantity: 0,
+        OrderStatus.Filled, dealQuantity: 1, dealPrice: 65000d);
+    liveGateway.EmitFill(managedBuy.OrderId, cumulativeQuantity: 1, remainingQuantity: 0,
+        OrderStatus.Filled, dealQuantity: 1, dealPrice: 65000d);
+    Assert(managedExecutions.Count == executionsBeforeLateBuy + 1,
+        "Cancelled 後 late fill 必須入帳一次，重複成交 callback 不得重複發送 ExecutionEvent");
+    Assert(managedEventOrder.Take(2).SequenceEqual(new[] { "execution", "lifecycle:Filled" }),
+        "成交必須先送入共用 ledger，再發布 lifecycle Filled");
+
+    liveGateway.EmitState(managedSell.OrderId, OrderStatus.Rejected, 0, 1, "exchange rejected");
+    Assert(liveService.ActiveBrokerOrderCount == 0 && managedFailures.Count > 0,
+        "Rejected 必須退出工作集合並保留失敗通知");
+    managedEventOrder.Clear();
+    int executionsBeforeLateSell = managedExecutions.Count;
+    liveGateway.EmitFill(managedSell.OrderId, cumulativeQuantity: 1, remainingQuantity: 0,
+        OrderStatus.Filled, dealQuantity: 1, dealPrice: 65005d);
+    Assert(managedExecutions.Count == executionsBeforeLateSell + 1 &&
+           managedEventOrder.Take(2).SequenceEqual(new[] { "execution", "lifecycle:Filled" }),
+        "Rejected 後 late fill 仍必須入帳，且 lifecycle Filled 不得早於 ledger");
+}
+
+var partialGateway = new FakeLiveStrategyOrderGateway();
+var partialLifecycle = new List<OrderLifecycleEvent>();
+var partialExecutions = new List<ExecutionEvent>();
+var partialService = new KgiLiveStrategyExecutionService(
+    partialGateway,
+    "partial-live",
+    new ResolvedProduct { ProductId = "225MC", Symbol = "225MC", TickSize = 5m, ContractMultiplier = 10m },
+    new ContractInfo
+    {
+        ExchangeNm = "JPX", ProductId = "225MC", Symbol = "JPX.225MC-202609",
+        ComYM2 = "202609", CPF = CPFEnum.Futures, ComType = '0'
+    },
+    36m);
+partialService.OrderLifecycleChanged += partialLifecycle.Add;
+partialService.Filled += partialExecutions.Add;
+PaperOrder partialOrder = partialService.Submit(
+    liveBuy with { StrategyInstanceId = "partial-live", ClientOrderId = "partial-g1" },
+    DateTimeOffset.UtcNow);
+partialGateway.EmitFill(partialOrder.OrderId, cumulativeQuantity: 1, remainingQuantity: 1,
+    OrderStatus.PartiallyFilled, dealQuantity: 1, dealPrice: 65000d);
+Assert(partialLifecycle.Last().State == OrderLifecycleState.PartiallyFilled &&
+       partialLifecycle.Last().FilledQuantity == 1 && partialLifecycle.Last().RemainingQuantity == 1 &&
+       partialExecutions.Count == 1 && partialService.ActiveBrokerOrderCount == 1,
+    "部分成交必須回報準確累計／剩餘量且繼續列為工作單");
+partialService.Dispose();
+Assert(partialService.ActiveBrokerOrderCount == 0 && partialService.LocalConditionCount == 0,
+    "Dispose 必須清除 live tombstone 與本地條件");
+int partialLifecycleCountAfterDispose = partialLifecycle.Count;
+partialGateway.EmitState(partialOrder.OrderId, OrderStatus.Cancelled, 1, 0);
+Assert(partialLifecycle.Count == partialLifecycleCountAfterDispose,
+    "Dispose 後必須解除 gateway callback 訂閱");
 
 Console.WriteLine("OrderManagement smoke tests passed.");
 
@@ -518,4 +676,79 @@ sealed class FakeGateway : IOrderGateway
     }
 
     public void Emit(OrderEvent ev) => OrderEventReceived?.Invoke(ev);
+}
+
+sealed class FakeLiveStrategyOrderGateway : ILiveStrategyOrderGateway
+{
+    private readonly Dictionary<string, OrderInfo> _orders = new(StringComparer.OrdinalIgnoreCase);
+
+    public bool IsLoggedIn { get; set; } = true;
+    public string BrokerId { get; set; } = "BRK";
+    public string Account { get; set; } = "ACC";
+
+    public event Action<OrderInfo>? OrderStateChanged;
+    public event Action<OrderInfo, int, double>? OrderFilled;
+    public event Action<OrderInfo, string>? OrderFailed;
+    public event Action<OrderInfo, string>? CancelFailed;
+
+    public void PlaceOrder(OrderRequest request)
+    {
+        var order = new OrderInfo
+        {
+            OrderId = request.OrderId,
+            Instrument = request.Instrument,
+            BuySell = request.BuySell,
+            OrderPrice = request.Price,
+            OrderQty = request.Quantity,
+            LeavesQty = request.Quantity,
+            Status = OrderStatus.Accepted,
+            BrokerId = request.BrokerId,
+            Account = request.Account,
+            Identity = new ExternalOrderIdentity { OrdNo = "ORD-" + request.OrderId }
+        };
+        _orders[request.OrderId] = order;
+        OrderStateChanged?.Invoke(order);
+    }
+
+    public void CancelOrder(string orderId)
+    {
+        if (!_orders.TryGetValue(orderId, out OrderInfo? order)) return;
+        order.Status = OrderStatus.CancelPending;
+        OrderStateChanged?.Invoke(order);
+    }
+
+    public void EmitState(
+        string orderId,
+        OrderStatus status,
+        int cumulativeQuantity,
+        int remainingQuantity,
+        string message = "")
+    {
+        OrderInfo order = _orders[orderId];
+        order.Status = status;
+        order.FilledQty = cumulativeQuantity;
+        order.LeavesQty = remainingQuantity;
+        order.Message = message;
+        OrderStateChanged?.Invoke(order);
+    }
+
+    public void EmitFill(
+        string orderId,
+        int cumulativeQuantity,
+        int remainingQuantity,
+        OrderStatus status,
+        int dealQuantity,
+        double dealPrice)
+    {
+        OrderInfo order = _orders[orderId];
+        order.Status = status;
+        order.FilledQty = cumulativeQuantity;
+        order.LeavesQty = remainingQuantity;
+        order.AvgFilledPrice = dealPrice;
+        OrderFilled?.Invoke(order, dealQuantity, dealPrice);
+        OrderStateChanged?.Invoke(order);
+    }
+
+    public void EmitOrderFailed(string orderId, string reason) => OrderFailed?.Invoke(_orders[orderId], reason);
+    public void EmitCancelFailed(string orderId, string reason) => CancelFailed?.Invoke(_orders[orderId], reason);
 }

@@ -3,9 +3,10 @@ using KGIOptionPricing.OrderManagement.Core;
 namespace KGIOptionPricing.StrategyFramework.Execution;
 
 /// <summary>
-/// Routes strategy orders to the existing KGI OrderManager. Legacy Limit and
+/// Routes strategy orders through the shared OrderManager. Legacy Limit and
 /// Stop requests remain local OCO conditions. BrokerLimit requests are sent
-/// immediately as independent working ROD limit orders.
+/// immediately as independent ROD limit orders and retain terminal tombstones
+/// so cancel/fill races can still reach the shared ledger.
 /// </summary>
 public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionService, IDisposable
 {
@@ -16,11 +17,15 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         public OrderLifecycleState? LifecycleState { get; set; }
         public int FilledQuantity { get; set; }
         public int RemainingQuantity { get; set; }
+        public int DeliveredFilledQuantity { get; set; }
+        public string BrokerOrderId { get; set; } = string.Empty;
+        public bool Terminal { get; set; }
+        public bool FailurePublished { get; set; }
+        public bool IsManaged => !string.IsNullOrWhiteSpace(Order.ClientOrderId);
     }
 
     private readonly object _sync = new();
-    private readonly OrderManager _orders;
-    private readonly KGITradeService _trade;
+    private readonly ILiveStrategyOrderGateway _gateway;
     private readonly string _instanceId;
     private readonly string _quoteSymbol;
     private readonly InstrumentKey _instrument;
@@ -35,7 +40,10 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
     public event Action<string>? Failed;
     public event Action<OrderLifecycleEvent>? OrderLifecycleChanged;
     public event Action? StateChanged;
-    public int ActiveBrokerOrderCount { get { lock (_sync) return _realOrders.Count; } }
+    public int ActiveBrokerOrderCount
+    {
+        get { lock (_sync) return _realOrders.Values.Count(x => !x.Terminal); }
+    }
     public int LocalConditionCount { get { lock (_sync) return _conditions.Count; } }
 
     public KgiLiveStrategyExecutionService(
@@ -45,23 +53,32 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         ResolvedProduct product,
         ContractInfo contract,
         decimal commissionPerContract)
+        : this(new OrderManagerLiveStrategyOrderGateway(orders, trade), instanceId, product, contract, commissionPerContract)
     {
-        _orders = orders;
-        _trade = trade;
+    }
+
+    public KgiLiveStrategyExecutionService(
+        ILiveStrategyOrderGateway gateway,
+        string instanceId,
+        ResolvedProduct product,
+        ContractInfo contract,
+        decimal commissionPerContract)
+    {
+        _gateway = gateway ?? throw new ArgumentNullException(nameof(gateway));
         _instanceId = instanceId;
         _quoteSymbol = product.Symbol;
         _commission = Math.Max(0m, commissionPerContract);
-        _instrument = ToInstrument(contract);
-        _orders.OnOrderFilled += OnOrderFilled;
-        _orders.OnOrderFailed += OnOrderFailed;
-        _orders.OnCancelFailed += OnCancelFailed;
-        _orders.OnOrderStateChanged += OnOrderChanged;
+        _instrument = LiveStrategyOrderMapper.ToInstrument(contract);
+        _gateway.OrderFilled += OnOrderFilled;
+        _gateway.OrderFailed += OnOrderFailed;
+        _gateway.CancelFailed += OnCancelFailed;
+        _gateway.OrderStateChanged += OnOrderChanged;
     }
 
     public PaperOrder Submit(PaperOrderRequest request, DateTimeOffset now)
     {
         if (_disposed) throw new ObjectDisposedException(nameof(KgiLiveStrategyExecutionService));
-        if (!_trade.IsLoggedIn) throw new InvalidOperationException("交易服務尚未登入，禁止實盤送單。");
+        if (!_gateway.IsLoggedIn) throw new InvalidOperationException("交易服務尚未登入，禁止實盤送單。");
         if (!string.Equals(request.StrategyInstanceId, _instanceId, StringComparison.OrdinalIgnoreCase))
             throw new InvalidOperationException("策略實例與實盤執行器不一致。");
         if (!string.Equals(request.Symbol, _quoteSymbol, StringComparison.OrdinalIgnoreCase))
@@ -101,15 +118,19 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
 
     public bool Cancel(string orderId)
     {
+        bool removedCondition;
         string? realId;
         lock (_sync)
         {
-            if (_conditions.Remove(orderId))
-            {
-                StateChanged?.Invoke();
-                return true;
-            }
-            realId = _realOrders.FirstOrDefault(x => x.Value.Order.OrderId == orderId).Key;
+            removedCondition = _conditions.Remove(orderId);
+            realId = removedCondition
+                ? null
+                : _realOrders.FirstOrDefault(x => !x.Value.Terminal && x.Value.Order.OrderId == orderId).Key;
+        }
+        if (removedCondition)
+        {
+            StateChanged?.Invoke();
+            return true;
         }
         return !string.IsNullOrEmpty(realId) && RequestCancel(realId);
     }
@@ -124,7 +145,9 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         lock (_sync)
         {
             string[] matches = _realOrders
-                .Where(x => string.Equals(x.Value.Order.ClientOrderId, clientOrderId, StringComparison.OrdinalIgnoreCase))
+                .Where(x => !x.Value.Terminal &&
+                            string.Equals(x.Value.Order.StrategyInstanceId, strategyInstanceId, StringComparison.OrdinalIgnoreCase) &&
+                            string.Equals(x.Value.Order.ClientOrderId, clientOrderId, StringComparison.OrdinalIgnoreCase))
                 .Select(x => x.Key)
                 .ToArray();
             if (matches.Length != 1) return false;
@@ -137,22 +160,25 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
     {
         if (!string.Equals(strategyInstanceId, _instanceId, StringComparison.OrdinalIgnoreCase)) return 0;
         string[] realIds;
-        int count;
+        int conditionCount;
         lock (_sync)
         {
-            count = _conditions.Count + _realOrders.Count;
+            conditionCount = _conditions.Count;
             _conditions.Clear();
-            realIds = _realOrders.Keys.ToArray();
+            realIds = _realOrders.Where(x => !x.Value.Terminal).Select(x => x.Key).ToArray();
         }
         foreach (string realId in realIds) RequestCancel(realId);
-        StateChanged?.Invoke();
-        return count;
+        if (conditionCount > 0) StateChanged?.Invoke();
+        return conditionCount + realIds.Length;
     }
 
     public IReadOnlyList<PaperOrder> GetWorkingOrders(string strategyInstanceId)
     {
         if (!string.Equals(strategyInstanceId, _instanceId, StringComparison.OrdinalIgnoreCase)) return Array.Empty<PaperOrder>();
-        lock (_sync) return _conditions.Values.Concat(_realOrders.Values.Select(x => x.Order)).ToArray();
+        lock (_sync)
+            return _conditions.Values
+                .Concat(_realOrders.Values.Where(x => !x.Terminal).Select(x => x.Order))
+                .ToArray();
     }
 
     public void OnMarketEvent(MarketEvent marketEvent)
@@ -197,32 +223,36 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
 
     private void SendBrokerLimit(PaperOrderRequest request, PaperOrder order, DateTimeOffset now)
     {
-        var tracked = new TrackedRealOrder
+        OrderRequest brokerRequest = LiveStrategyOrderMapper.CreateBrokerLimit(
+            request, _instrument, _gateway.BrokerId, _gateway.Account, order.OrderId);
+        lock (_sync)
         {
-            Order = order,
-            Trigger = request.Price,
-            RemainingQuantity = order.Quantity
-        };
-        lock (_sync) _realOrders[order.OrderId] = tracked;
-        Transition(order.OrderId, OrderLifecycleState.Submitted, null, "Submitted", now);
-        StateChanged?.Invoke();
+            if (_realOrders.Values.Any(x => string.Equals(
+                    x.Order.ClientOrderId, request.ClientOrderId, StringComparison.OrdinalIgnoreCase)))
+                throw new InvalidOperationException($"ClientOrderId 已存在：{request.ClientOrderId}");
+            _realOrders[order.OrderId] = new TrackedRealOrder
+            {
+                Order = order,
+                Trigger = request.Price,
+                RemainingQuantity = order.Quantity
+            };
+        }
+        PublishTransition(order.OrderId, OrderLifecycleState.Submitted, null, "Submitted", now);
 
         try
         {
-            OrderRequest brokerRequest = LiveStrategyOrderMapper.CreateBrokerLimit(
-                request, _instrument, _trade.BrokerID, _trade.Account, order.OrderId);
-            _orders.PlaceOrder(brokerRequest);
+            _gateway.PlaceOrder(brokerRequest);
         }
         catch (Exception ex)
         {
-            Transition(order.OrderId, OrderLifecycleState.Rejected, null, "SubmitException", DateTimeOffset.Now, terminal: true);
-            Failed?.Invoke("實盤限價單送單例外：" + ex.GetBaseException().Message);
+            PublishTransition(order.OrderId, OrderLifecycleState.Rejected, null, "SubmitException", DateTimeOffset.Now);
+            PublishFailureOnce(order.OrderId, "實盤限價單送單例外：" + ex.GetBaseException().Message);
         }
     }
 
     private void SendMarket(PaperOrder condition, decimal trigger)
     {
-        if (!_trade.IsLoggedIn)
+        if (!_gateway.IsLoggedIn)
         {
             Failed?.Invoke("交易服務已離線，實盤市價單未送出。");
             return;
@@ -240,7 +270,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         StateChanged?.Invoke();
         try
         {
-            _orders.PlaceOrder(new OrderRequest
+            _gateway.PlaceOrder(new OrderRequest
             {
                 OrderId = realId,
                 Instrument = _instrument,
@@ -249,186 +279,280 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
                 Quantity = 1,
                 TimeInForce = TimeInForce.IOC,
                 PositionEffect = PositionEffect.Auto,
-                BrokerId = _trade.BrokerID,
-                Account = _trade.Account
+                BrokerId = _gateway.BrokerId,
+                Account = _gateway.Account
             });
         }
         catch (Exception ex)
         {
             lock (_sync) _realOrders.Remove(realId);
             Failed?.Invoke("實盤送單例外：" + ex.GetBaseException().Message);
+            StateChanged?.Invoke();
         }
     }
 
     private bool RequestCancel(string realId)
     {
-        TrackedRealOrder tracked;
+        OrderLifecycleEvent? lifecycle = null;
+        bool managed;
         lock (_sync)
         {
-            if (!_realOrders.TryGetValue(realId, out tracked!)) return false;
-            if (tracked.LifecycleState is OrderLifecycleState.CancelPending or
-                OrderLifecycleState.Cancelled or OrderLifecycleState.Filled or OrderLifecycleState.Rejected)
-                return false;
+            if (!_realOrders.TryGetValue(realId, out TrackedRealOrder? tracked) || tracked.Terminal ||
+                tracked.LifecycleState == OrderLifecycleState.CancelPending) return false;
+            managed = tracked.IsManaged;
+            if (managed)
+                lifecycle = CreateTransitionLocked(tracked, OrderLifecycleState.CancelPending, null,
+                    "CancelRequested", DateTimeOffset.Now);
         }
+        PublishLifecycle(lifecycle);
 
-        if (!string.IsNullOrWhiteSpace(tracked.Order.ClientOrderId))
-            Transition(realId, OrderLifecycleState.CancelPending, null, "CancelRequested", DateTimeOffset.Now);
-        _orders.CancelOrder(realId);
-        return true;
+        try
+        {
+            _gateway.CancelOrder(realId);
+            if (!managed) StateChanged?.Invoke();
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Failed?.Invoke("實盤刪單例外：" + ex.GetBaseException().Message);
+            return false;
+        }
     }
 
     private void OnOrderFilled(OrderInfo brokerOrder, int quantity, double price)
     {
-        TrackedRealOrder tracked;
+        if (_disposed) return;
+        ExecutionEvent? execution = null;
+        OrderLifecycleEvent? lifecycle = null;
+        bool legacyTerminal = false;
         lock (_sync)
-            if (!_realOrders.TryGetValue(brokerOrder.OrderId, out tracked!)) return;
-
-        int filled = Math.Max(tracked.FilledQuantity, brokerOrder.FilledQty);
-        int remaining = brokerOrder.LeavesQty >= 0
-            ? brokerOrder.LeavesQty
-            : Math.Max(0, tracked.Order.Quantity - filled);
-        bool terminal = brokerOrder.Status == OrderStatus.Filled || (filled >= tracked.Order.Quantity && remaining == 0);
-
-        if (!string.IsNullOrWhiteSpace(tracked.Order.ClientOrderId))
         {
-            Transition(
-                brokerOrder.OrderId,
-                terminal ? OrderLifecycleState.Filled : OrderLifecycleState.PartiallyFilled,
-                brokerOrder,
-                terminal ? "Filled" : "PartiallyFilled",
-                DateTimeOffset.Now,
-                terminal);
+            if (!_realOrders.TryGetValue(brokerOrder.OrderId, out TrackedRealOrder? tracked)) return;
+            UpdateBrokerOrderId(tracked, brokerOrder);
+
+            int cumulative = brokerOrder.FilledQty > 0
+                ? brokerOrder.FilledQty
+                : tracked.DeliveredFilledQuantity + Math.Max(0, quantity);
+            if (cumulative <= tracked.DeliveredFilledQuantity) return;
+            int delta = cumulative - tracked.DeliveredFilledQuantity;
+            tracked.DeliveredFilledQuantity = cumulative;
+            tracked.FilledQuantity = Math.Max(tracked.FilledQuantity, cumulative);
+            tracked.RemainingQuantity = brokerOrder.LeavesQty >= 0
+                ? brokerOrder.LeavesQty
+                : Math.Max(0, tracked.Order.Quantity - cumulative);
+
+            execution = new ExecutionEvent
+            {
+                Sequence = Interlocked.Increment(ref _executionSequence),
+                Timestamp = DateTimeOffset.Now,
+                StrategyInstanceId = _instanceId,
+                ClientOrderId = tracked.Order.ClientOrderId,
+                OrderId = brokerOrder.OrderId,
+                Symbol = _quoteSymbol,
+                Side = tracked.Order.Side,
+                Role = tracked.Order.Role,
+                Price = (decimal)price,
+                Quantity = delta,
+                Commission = _commission * delta,
+                TriggerMarketPrice = tracked.Trigger,
+                MarketSequence = 0
+            };
+
+            bool partial = brokerOrder.Status == OrderStatus.PartiallyFilled || tracked.RemainingQuantity > 0;
+            if (tracked.IsManaged)
+                lifecycle = CreateTransitionLocked(
+                    tracked,
+                    partial ? OrderLifecycleState.PartiallyFilled : OrderLifecycleState.Filled,
+                    brokerOrder,
+                    partial ? "PartiallyFilled" : "Filled",
+                    DateTimeOffset.Now);
+            else if (!partial)
+            {
+                _realOrders.Remove(brokerOrder.OrderId);
+                legacyTerminal = true;
+            }
         }
-        else if (terminal)
-        {
-            lock (_sync) _realOrders.Remove(brokerOrder.OrderId);
-        }
 
-        Filled?.Invoke(new ExecutionEvent
-        {
-            Sequence = Interlocked.Increment(ref _executionSequence),
-            Timestamp = DateTimeOffset.Now,
-            StrategyInstanceId = _instanceId,
-            ClientOrderId = tracked.Order.ClientOrderId,
-            OrderId = brokerOrder.OrderId,
-            Symbol = _quoteSymbol,
-            Side = tracked.Order.Side,
-            Role = tracked.Order.Role,
-            Price = (decimal)price,
-            Quantity = quantity,
-            Commission = _commission * quantity,
-            TriggerMarketPrice = tracked.Trigger,
-            MarketSequence = 0
-        });
-        StateChanged?.Invoke();
+        // Match paper execution ordering: ledger first, then terminal lifecycle.
+        Filled?.Invoke(execution);
+        if (lifecycle != null) OrderLifecycleChanged?.Invoke(lifecycle);
+        if (execution != null || lifecycle != null || legacyTerminal) StateChanged?.Invoke();
     }
 
     private void OnOrderFailed(OrderInfo brokerOrder, string reason)
     {
-        TrackedRealOrder? tracked;
-        lock (_sync) _realOrders.TryGetValue(brokerOrder.OrderId, out tracked);
-        if (tracked == null) return;
-
-        if (!string.IsNullOrWhiteSpace(tracked.Order.ClientOrderId))
-            Transition(brokerOrder.OrderId, OrderLifecycleState.Rejected, brokerOrder, "Rejected", DateTimeOffset.Now, terminal: true);
-        else
-            lock (_sync) _realOrders.Remove(brokerOrder.OrderId);
-        Failed?.Invoke($"實盤委託失敗：{reason}");
-        StateChanged?.Invoke();
+        if (_disposed) return;
+        OrderLifecycleEvent? lifecycle = null;
+        string? failure = null;
+        bool legacyRemoved = false;
+        lock (_sync)
+        {
+            if (!_realOrders.TryGetValue(brokerOrder.OrderId, out TrackedRealOrder? tracked)) return;
+            UpdateBrokerOrderId(tracked, brokerOrder);
+            if (tracked.IsManaged)
+                lifecycle = CreateTransitionLocked(tracked, OrderLifecycleState.Rejected, brokerOrder,
+                    "Rejected", DateTimeOffset.Now);
+            else
+                legacyRemoved = _realOrders.Remove(brokerOrder.OrderId);
+            if (!tracked.FailurePublished)
+            {
+                tracked.FailurePublished = true;
+                failure = $"實盤委託失敗：{reason}";
+            }
+        }
+        if (lifecycle != null) OrderLifecycleChanged?.Invoke(lifecycle);
+        if (failure != null) Failed?.Invoke(failure);
+        if (lifecycle != null || legacyRemoved) StateChanged?.Invoke();
     }
 
     private void OnCancelFailed(OrderInfo brokerOrder, string reason)
     {
-        lock (_sync)
-            if (!_realOrders.ContainsKey(brokerOrder.OrderId)) return;
-        Failed?.Invoke($"實盤刪單失敗：{reason}");
+        if (_disposed) return;
+        bool owned;
+        lock (_sync) owned = _realOrders.TryGetValue(brokerOrder.OrderId, out TrackedRealOrder? tracked) && !tracked.Terminal;
+        if (owned) Failed?.Invoke($"實盤刪單失敗：{reason}");
     }
 
     private void OnOrderChanged(OrderInfo brokerOrder)
     {
-        TrackedRealOrder? tracked;
-        lock (_sync) _realOrders.TryGetValue(brokerOrder.OrderId, out tracked);
-        if (tracked == null) return;
-        if (string.IsNullOrWhiteSpace(tracked.Order.ClientOrderId))
+        if (_disposed) return;
+        OrderLifecycleEvent? lifecycle = null;
+        string? failure = null;
+        bool legacyChanged = false;
+        lock (_sync)
         {
-            if (brokerOrder.Status is OrderStatus.Filled or OrderStatus.Cancelled or OrderStatus.Rejected)
+            if (!_realOrders.TryGetValue(brokerOrder.OrderId, out TrackedRealOrder? tracked)) return;
+            UpdateBrokerOrderId(tracked, brokerOrder);
+            if (!tracked.IsManaged)
             {
-                lock (_sync) _realOrders.Remove(brokerOrder.OrderId);
-                StateChanged?.Invoke();
+                if (brokerOrder.Status is OrderStatus.Filled or OrderStatus.Cancelled or OrderStatus.Rejected)
+                    legacyChanged = _realOrders.Remove(brokerOrder.OrderId);
             }
-            return;
+            else
+            {
+                // A terminal tombstone may only advance because of a real late fill.
+                if (tracked.Terminal && brokerOrder.Status != OrderStatus.Filled) return;
+                switch (brokerOrder.Status)
+                {
+                    case OrderStatus.Accepted:
+                        lifecycle = CreateTransitionLocked(tracked, OrderLifecycleState.Working, brokerOrder,
+                            "Working", DateTimeOffset.Now);
+                        break;
+                    case OrderStatus.CancelPending:
+                        lifecycle = CreateTransitionLocked(tracked, OrderLifecycleState.CancelPending, brokerOrder,
+                            "CancelPending", DateTimeOffset.Now);
+                        break;
+                    case OrderStatus.PartiallyFilled:
+                        lifecycle = CreateTransitionLocked(tracked, OrderLifecycleState.PartiallyFilled, brokerOrder,
+                            "PartiallyFilled", DateTimeOffset.Now);
+                        break;
+                    case OrderStatus.Filled:
+                        lifecycle = CreateTransitionLocked(tracked, OrderLifecycleState.Filled, brokerOrder,
+                            "Filled", DateTimeOffset.Now);
+                        break;
+                    case OrderStatus.Cancelled:
+                        lifecycle = CreateTransitionLocked(tracked, OrderLifecycleState.Cancelled, brokerOrder,
+                            "Cancelled", DateTimeOffset.Now);
+                        break;
+                    case OrderStatus.Rejected:
+                        lifecycle = CreateTransitionLocked(tracked, OrderLifecycleState.Rejected, brokerOrder,
+                            "Rejected", DateTimeOffset.Now);
+                        if (!tracked.FailurePublished)
+                        {
+                            tracked.FailurePublished = true;
+                            failure = string.IsNullOrWhiteSpace(brokerOrder.Message)
+                                ? "實盤委託遭券商拒絕。"
+                                : $"實盤委託失敗：{brokerOrder.Message}";
+                        }
+                        break;
+                }
+            }
         }
-
-        switch (brokerOrder.Status)
-        {
-            case OrderStatus.Accepted:
-                Transition(brokerOrder.OrderId, OrderLifecycleState.Working, brokerOrder, "Working", DateTimeOffset.Now);
-                break;
-            case OrderStatus.CancelPending:
-                Transition(brokerOrder.OrderId, OrderLifecycleState.CancelPending, brokerOrder, "CancelPending", DateTimeOffset.Now);
-                break;
-            case OrderStatus.PartiallyFilled:
-                Transition(brokerOrder.OrderId, OrderLifecycleState.PartiallyFilled, brokerOrder, "PartiallyFilled", DateTimeOffset.Now);
-                break;
-            case OrderStatus.Filled:
-                Transition(brokerOrder.OrderId, OrderLifecycleState.Filled, brokerOrder, "Filled", DateTimeOffset.Now, terminal: true);
-                break;
-            case OrderStatus.Cancelled:
-                Transition(brokerOrder.OrderId, OrderLifecycleState.Cancelled, brokerOrder, "Cancelled", DateTimeOffset.Now, terminal: true);
-                break;
-            case OrderStatus.Rejected:
-                Transition(brokerOrder.OrderId, OrderLifecycleState.Rejected, brokerOrder, "Rejected", DateTimeOffset.Now, terminal: true);
-                Failed?.Invoke(string.IsNullOrWhiteSpace(brokerOrder.Message)
-                    ? "實盤委託遭券商拒絕。"
-                    : $"實盤委託失敗：{brokerOrder.Message}");
-                break;
-        }
+        if (lifecycle != null) OrderLifecycleChanged?.Invoke(lifecycle);
+        if (failure != null) Failed?.Invoke(failure);
+        if (lifecycle != null || legacyChanged) StateChanged?.Invoke();
     }
 
-    private void Transition(
+    private void PublishTransition(
         string realId,
         OrderLifecycleState state,
         OrderInfo? brokerOrder,
         string reasonCode,
-        DateTimeOffset timestamp,
-        bool terminal = false)
+        DateTimeOffset timestamp)
     {
-        OrderLifecycleEvent? lifecycle = null;
+        OrderLifecycleEvent? lifecycle;
         lock (_sync)
         {
             if (!_realOrders.TryGetValue(realId, out TrackedRealOrder? tracked)) return;
+            lifecycle = CreateTransitionLocked(tracked, state, brokerOrder, reasonCode, timestamp);
+        }
+        PublishLifecycle(lifecycle);
+    }
 
-            int filled = brokerOrder == null ? tracked.FilledQuantity : Math.Max(tracked.FilledQuantity, brokerOrder.FilledQty);
-            int remaining = brokerOrder?.LeavesQty >= 0
-                ? brokerOrder.LeavesQty
-                : Math.Max(0, tracked.Order.Quantity - filled);
-            if (tracked.LifecycleState == state &&
-                tracked.FilledQuantity == filled && tracked.RemainingQuantity == remaining) return;
-
-            OrderLifecycleState previous = tracked.LifecycleState ?? OrderLifecycleState.Submitted;
-            tracked.LifecycleState = state;
-            tracked.FilledQuantity = filled;
-            tracked.RemainingQuantity = remaining;
-            lifecycle = new OrderLifecycleEvent
-            {
-                Timestamp = timestamp,
-                StrategyInstanceId = _instanceId,
-                ClientOrderId = tracked.Order.ClientOrderId,
-                OrderId = tracked.Order.OrderId,
-                BrokerOrderId = BrokerOrderId(brokerOrder),
-                PreviousState = previous,
-                State = state,
-                Price = tracked.Order.Price,
-                Quantity = tracked.Order.Quantity,
-                FilledQuantity = filled,
-                RemainingQuantity = remaining,
-                ReasonCode = reasonCode
-            };
-            if (terminal) _realOrders.Remove(realId);
+    private OrderLifecycleEvent? CreateTransitionLocked(
+        TrackedRealOrder tracked,
+        OrderLifecycleState state,
+        OrderInfo? brokerOrder,
+        string reasonCode,
+        DateTimeOffset timestamp)
+    {
+        UpdateBrokerOrderId(tracked, brokerOrder);
+        int filled = brokerOrder == null ? tracked.FilledQuantity : Math.Max(tracked.FilledQuantity, brokerOrder.FilledQty);
+        int remaining = brokerOrder?.LeavesQty >= 0
+            ? brokerOrder.LeavesQty
+            : tracked.RemainingQuantity;
+        bool terminal = state is OrderLifecycleState.Filled or OrderLifecycleState.Cancelled or OrderLifecycleState.Rejected;
+        if (tracked.LifecycleState == state &&
+            tracked.FilledQuantity == filled && tracked.RemainingQuantity == remaining)
+        {
+            if (terminal) tracked.Terminal = true;
+            return null;
         }
 
+        OrderLifecycleState previous = tracked.LifecycleState ?? OrderLifecycleState.Submitted;
+        tracked.LifecycleState = state;
+        tracked.FilledQuantity = filled;
+        tracked.RemainingQuantity = remaining;
+        tracked.Terminal = terminal;
+        return new OrderLifecycleEvent
+        {
+            Timestamp = timestamp,
+            StrategyInstanceId = _instanceId,
+            ClientOrderId = tracked.Order.ClientOrderId,
+            OrderId = tracked.Order.OrderId,
+            BrokerOrderId = tracked.BrokerOrderId,
+            PreviousState = previous,
+            State = state,
+            Price = tracked.Order.Price,
+            Quantity = tracked.Order.Quantity,
+            FilledQuantity = filled,
+            RemainingQuantity = remaining,
+            ReasonCode = reasonCode
+        };
+    }
+
+    private void PublishLifecycle(OrderLifecycleEvent? lifecycle)
+    {
+        if (lifecycle == null) return;
         OrderLifecycleChanged?.Invoke(lifecycle);
         StateChanged?.Invoke();
+    }
+
+    private void PublishFailureOnce(string realId, string message)
+    {
+        bool publish;
+        lock (_sync)
+        {
+            publish = _realOrders.TryGetValue(realId, out TrackedRealOrder? tracked) && !tracked.FailurePublished;
+            if (publish) tracked!.FailurePublished = true;
+        }
+        if (publish) Failed?.Invoke(message);
+    }
+
+    private static void UpdateBrokerOrderId(TrackedRealOrder tracked, OrderInfo? order)
+    {
+        string brokerOrderId = BrokerOrderId(order);
+        if (!string.IsNullOrWhiteSpace(brokerOrderId)) tracked.BrokerOrderId = brokerOrderId;
     }
 
     private static string BrokerOrderId(OrderInfo? order)
@@ -439,31 +563,22 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         return order.Identity.Cnt;
     }
 
-    private static InstrumentKey ToInstrument(ContractInfo contract)
-    {
-        bool foreign = !string.IsNullOrWhiteSpace(contract.ExchangeNm) &&
-                       !contract.ExchangeNm.Equals("TIMEX", StringComparison.OrdinalIgnoreCase) &&
-                       !contract.ExchangeNm.Equals("TAIFEX", StringComparison.OrdinalIgnoreCase);
-        bool option = contract.CPF is CPFEnum.Call or CPFEnum.Put || (contract.ComType != '\0' && contract.ComType != 'F');
-        return new InstrumentKey
-        {
-            Market = foreign ? (option ? MarketType.ForeignOption : MarketType.ForeignFuture) :
-                (option ? MarketType.DomesticOption : MarketType.DomesticFuture),
-            Exchange = contract.ExchangeNm,
-            Symbol = foreign && !string.IsNullOrWhiteSpace(contract.ProductId) ? contract.ProductId : contract.Symbol,
-            ContractMonth = !string.IsNullOrWhiteSpace(contract.ComYM2) ? contract.ComYM2 :
-                !string.IsNullOrWhiteSpace(contract.ComYM) ? contract.ComYM : contract.Month
-        };
-    }
-
     public void Dispose()
     {
         if (_disposed) return;
-        _disposed = true;
         CancelAll(_instanceId);
-        _orders.OnOrderFilled -= OnOrderFilled;
-        _orders.OnOrderFailed -= OnOrderFailed;
-        _orders.OnCancelFailed -= OnCancelFailed;
-        _orders.OnOrderStateChanged -= OnOrderChanged;
+        _disposed = true;
+        _gateway.OrderFilled -= OnOrderFilled;
+        _gateway.OrderFailed -= OnOrderFailed;
+        _gateway.CancelFailed -= OnCancelFailed;
+        _gateway.OrderStateChanged -= OnOrderChanged;
+        bool changed;
+        lock (_sync)
+        {
+            changed = _conditions.Count > 0 || _realOrders.Count > 0;
+            _conditions.Clear();
+            _realOrders.Clear();
+        }
+        if (changed) StateChanged?.Invoke();
     }
 }
