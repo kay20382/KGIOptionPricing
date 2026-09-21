@@ -276,10 +276,10 @@ public sealed class StrategyInstanceRunner : IDisposable
         // state or detaching routes so a failure leaves late fills observable.
         try
         {
-            PositionSnapshot position = _ledger.GetPosition(_strategy.InstanceId, _universe.Tradable.Symbol);
-            if (_broker is KgiLiveStrategyExecutionService && position.NetQuantity != 0)
-                throw new InvalidOperationException($"Runner 尚有部位 {position.NetQuantity} 口，禁止釋放。");
-            if (_broker is IDisposable disposable) disposable.Dispose();
+            if (_broker is KgiLiveStrategyExecutionService liveBroker)
+                liveBroker.DisposeIfSafe(() =>
+                    _ledger.GetPosition(_strategy.InstanceId, _universe.Tradable.Symbol).NetQuantity == 0);
+            else if (_broker is IDisposable disposable) disposable.Dispose();
             Exception? cleanupError = null;
             lock (_sync)
             {
@@ -326,8 +326,7 @@ public sealed class StrategyHost : IDisposable
     private readonly IMarketEventSource _source;
     private bool _disposed;
     private bool _disposing;
-    private int _activeAdds;
-    private readonly Dictionary<int, int> _addThreadDepth = new();
+    private readonly Dictionary<string, int> _addOwners = new(StringComparer.OrdinalIgnoreCase);
     internal bool IsDisposed { get { lock (_sync) return _disposed; } }
 
     public event Action<StrategySnapshot>? SnapshotChanged;
@@ -350,12 +349,10 @@ public sealed class StrategyHost : IDisposable
         lock (_sync)
         {
             if (_disposed || _disposing) throw new ObjectDisposedException(nameof(StrategyHost));
-            if (_runners.Any(x => string.Equals(x.InstanceId, strategy.InstanceId, StringComparison.OrdinalIgnoreCase)))
+            if (_addOwners.ContainsKey(strategy.InstanceId) ||
+                _runners.Any(x => string.Equals(x.InstanceId, strategy.InstanceId, StringComparison.OrdinalIgnoreCase)))
                 throw new InvalidOperationException($"策略實例已存在：{strategy.InstanceId}");
-            _activeAdds++;
-            int threadId = Environment.CurrentManagedThreadId;
-            _addThreadDepth.TryGetValue(threadId, out int depth);
-            _addThreadDepth[threadId] = depth + 1;
+            _addOwners.Add(strategy.InstanceId, Environment.CurrentManagedThreadId);
         }
         StrategyInstanceRunner? runner = null;
         bool addSucceeded = false;
@@ -365,17 +362,18 @@ public sealed class StrategyHost : IDisposable
             runner = new StrategyInstanceRunner(strategy, universe, _ledger, _clock, commissionPerContract, executionService, deferStart: true);
             runner.SnapshotChanged += PublishSnapshotSafely;
             runner.ExecutionOccurred += execution => ExecutionOccurred?.Invoke(execution);
-            lock (_sync) _runners.Add(runner);
             try { runner.Initialize(); }
             catch (Exception startError)
             {
-                try { runner.Dispose(); lock (_sync) _runners.Remove(runner); }
+                try { runner.Dispose(); }
                 catch (Exception cleanupError)
                 {
+                    lock (_sync) _runners.Add(runner);
                     throw new AggregateException("策略 Start 失敗且仍有活動執行資源；Runner 已保留供安全關閉。", startError, cleanupError);
                 }
                 throw;
             }
+            lock (_sync) _runners.Add(runner);
             addSucceeded = true;
             return runner;
         }
@@ -388,13 +386,7 @@ public sealed class StrategyHost : IDisposable
             }
             lock (_sync)
             {
-                int threadId = Environment.CurrentManagedThreadId;
-                if (_addThreadDepth.TryGetValue(threadId, out int depth))
-                {
-                    if (depth <= 1) _addThreadDepth.Remove(threadId);
-                    else _addThreadDepth[threadId] = depth - 1;
-                }
-                _activeAdds--;
+                _addOwners.Remove(strategy.InstanceId);
                 Monitor.PulseAll(_sync);
             }
         }
@@ -466,11 +458,11 @@ public sealed class StrategyHost : IDisposable
         lock (_sync)
         {
             if (_disposed) return;
-            if (_addThreadDepth.ContainsKey(Environment.CurrentManagedThreadId))
+            if (_addOwners.Values.Contains(Environment.CurrentManagedThreadId))
                 throw new InvalidOperationException("Add callback 不可同步 Dispose 同一個 StrategyHost。");
             if (_disposing) throw new InvalidOperationException("StrategyHost 正在釋放。");
             _disposing = true;
-            while (_activeAdds > 0) Monitor.Wait(_sync);
+            while (_addOwners.Count > 0) Monitor.Wait(_sync);
             runners = _runners.ToArray();
         }
         try
@@ -501,17 +493,28 @@ public sealed class StrategyHost : IDisposable
     }
 
     private StrategyInstanceRunner? FindForOperation(string instanceId) =>
-        GetRunnersForOperation(throwIfDisposed: false).FirstOrDefault(x =>
-            string.Equals(x.InstanceId, instanceId, StringComparison.OrdinalIgnoreCase));
+        GetRunnerForTargetedOperation(instanceId);
+
+    private StrategyInstanceRunner? GetRunnerForTargetedOperation(string instanceId)
+    {
+        lock (_sync)
+        {
+            while (_addOwners.TryGetValue(instanceId, out int ownerThreadId))
+            {
+                if (ownerThreadId == Environment.CurrentManagedThreadId)
+                    throw new InvalidOperationException("Add/Start callback 不可同步操作自己的 partial runner。");
+                Monitor.Wait(_sync);
+            }
+            if (_disposed || _disposing) return null;
+            return _runners.FirstOrDefault(x =>
+                string.Equals(x.InstanceId, instanceId, StringComparison.OrdinalIgnoreCase));
+        }
+    }
 
     private StrategyInstanceRunner[] GetRunnersForOperation(bool throwIfDisposed)
     {
         lock (_sync)
         {
-            int threadId = Environment.CurrentManagedThreadId;
-            if (_addThreadDepth.ContainsKey(threadId))
-                throw new InvalidOperationException("Add/Start callback 不可同步操作 partial runner。");
-            while (_activeAdds > 0 && !_disposing) Monitor.Wait(_sync);
             if (_disposed || _disposing)
             {
                 if (throwIfDisposed) throw new ObjectDisposedException(nameof(StrategyHost));

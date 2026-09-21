@@ -334,6 +334,36 @@ using (var publishBarrierHost = new StrategyHost(new FakeSource()))
         "外部 Dispose 必須等待 initial snapshot 發布與 add lease 完整結束");
 }
 
+using (var perInstanceSource = new FakeSource())
+using (var perInstanceHost = new StrategyHost(perInstanceSource, new MutableStrategyClock(heartbeatTime)))
+{
+    var activeA = new ManagedHeartbeatProbeStrategy("active-a", "PIA");
+    perInstanceHost.Add(activeA,
+        new ResolvedStrategyUniverse { Tradable = Product("225MC", "PIA", 5m, 10m) });
+    using var slowEntered = new ManualResetEventSlim(false);
+    using var releaseSlow = new ManualResetEventSlim(false);
+    var slowB = new BlockingStartStrategy("slow-b", slowEntered, releaseSlow);
+    Task<StrategyInstanceRunner> slowAdd = Task.Factory.StartNew(
+        () => perInstanceHost.Add(slowB,
+            new ResolvedStrategyUniverse { Tradable = Product("225MC", "PIB", 5m, 10m) }),
+        TaskCreationOptions.LongRunning);
+    Assert(slowEntered.Wait(TimeSpan.FromSeconds(5)), "B Start barrier 未進入");
+    perInstanceSource.Emit(Book("PIA", "225MC", 100m, 105m, 1, heartbeatTime.AddSeconds(1)));
+    perInstanceHost.Pulse(heartbeatTime.AddSeconds(1));
+    Assert(activeA.MarketCount == 1 && activeA.HeartbeatCount == 1 &&
+           perInstanceHost.Stop("active-a", "A emergency stop"),
+        "B 慢 Start 不得阻塞既有 A 的 market/heartbeat/targeted stop");
+    AssertThrows<InvalidOperationException>(() => perInstanceHost.Add(
+            new HeartbeatProbeStrategy("slow-b"),
+            new ResolvedStrategyUniverse { Tradable = Product("225MC", "PIB", 5m, 10m) }),
+        "同 instanceId Host.Add 必須在第一個 Start 完成前原子拒絕");
+    Assert(perInstanceHost.GetSnapshots().Count == 1,
+        "GetSnapshots 不得等待或暴露 partial B runner");
+    releaseSlow.Set();
+    Assert(slowAdd.Wait(TimeSpan.FromSeconds(5)) && perInstanceHost.GetSnapshots().Count == 2,
+        "B Start 完成後才可公開 runner");
+}
+
 var serializedClock = new MutableStrategyClock(heartbeatTime);
 var serializedLedger = new PaperPortfolioLedger();
 var serializedBroker = new ConcurrentCallbackExecutionService();
@@ -927,6 +957,49 @@ sealed class ManagedProbeStrategy : ISimulationStrategy, IManagedOrderStrategy
         Reason = "probe",
         UpdatedAt = DateTimeOffset.UtcNow
     };
+}
+
+sealed class ManagedHeartbeatProbeStrategy : ISimulationStrategy, IStrategyHeartbeat
+{
+    public ManagedHeartbeatProbeStrategy(string instanceId, string symbol) { InstanceId = instanceId; Symbol = symbol; }
+    public string StrategyType => "ManagedHeartbeatProbe";
+    public string InstanceId { get; }
+    public string Symbol { get; }
+    public StrategyLifecycleState State { get; private set; } = StrategyLifecycleState.Created;
+    public int MarketCount { get; private set; }
+    public int HeartbeatCount { get; private set; }
+    public event Action<PaperOrderRequest>? OrderRequested;
+    public event Action? CancelAllRequested;
+    public event Action<StrategySnapshot>? SnapshotChanged;
+    public void Start(StrategyRuntimeContext context) => State = StrategyLifecycleState.Ready;
+    public void OnMarketEvent(MarketEvent marketEvent) => MarketCount++;
+    public void OnHeartbeat(DateTimeOffset now) => HeartbeatCount++;
+    public void OnExecution(ExecutionEvent execution) { }
+    public void Pause(string reason) => State = StrategyLifecycleState.Suspended;
+    public void Resume() => State = StrategyLifecycleState.Ready;
+    public void Stop(string reason) => State = StrategyLifecycleState.Stopped;
+    public StrategySnapshot GetSnapshot() => new() { StrategyType = StrategyType, InstanceId = InstanceId, TradableSymbol = Symbol, State = State };
+}
+
+sealed class BlockingStartStrategy : ISimulationStrategy
+{
+    private readonly ManualResetEventSlim _entered;
+    private readonly ManualResetEventSlim _release;
+    public BlockingStartStrategy(string instanceId, ManualResetEventSlim entered, ManualResetEventSlim release)
+    { InstanceId = instanceId; _entered = entered; _release = release; }
+    public string StrategyType => "BlockingStart";
+    public string InstanceId { get; }
+    public StrategyLifecycleState State { get; private set; } = StrategyLifecycleState.Created;
+    public event Action<PaperOrderRequest>? OrderRequested;
+    public event Action? CancelAllRequested;
+    public event Action<StrategySnapshot>? SnapshotChanged;
+    public void Start(StrategyRuntimeContext context) { _entered.Set(); _release.Wait(); State = StrategyLifecycleState.Ready; }
+    public void OnMarketEvent(MarketEvent marketEvent) { }
+    public void OnExecution(ExecutionEvent execution) { }
+    public void Pause(string reason) => State = StrategyLifecycleState.Suspended;
+    public void Resume() => State = StrategyLifecycleState.Ready;
+    public void Stop(string reason) => State = StrategyLifecycleState.Stopped;
+    public StrategySnapshot GetSnapshot() => new() { StrategyType = StrategyType, InstanceId = InstanceId, State = State };
 }
 
 sealed class HeartbeatProbeStrategy : ISimulationStrategy, IStrategyHeartbeat

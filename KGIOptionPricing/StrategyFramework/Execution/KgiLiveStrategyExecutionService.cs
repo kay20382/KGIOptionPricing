@@ -27,6 +27,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         public bool Terminal { get; set; }
         public DateTimeOffset? TerminalAt { get; set; }
         public bool FailurePublished { get; set; }
+        public bool AwaitingSettlement { get; set; }
         public bool IsManaged => !string.IsNullOrWhiteSpace(Order.ClientOrderId);
     }
 
@@ -65,6 +66,10 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         }
     }
     public int LocalConditionCount { get { lock (_sync) return _conditions.Count; } }
+    public int QuarantinedBrokerOrderCount
+    {
+        get { lock (_sync) return _realOrders.Values.Count(x => x.AwaitingSettlement); }
+    }
 
     public KgiLiveStrategyExecutionService(
         OrderManager orders,
@@ -524,14 +529,31 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
             UpdateBrokerOrderId(tracked, brokerOrder);
             if (!tracked.IsManaged)
             {
-                if (brokerOrder.Status is OrderStatus.Filled or OrderStatus.Cancelled or OrderStatus.Rejected)
+                if (brokerOrder.Status == OrderStatus.Cancelled)
+                {
+                    tracked.Terminal = true;
+                    tracked.TerminalAt = _now();
+                    tracked.AwaitingSettlement = true;
+                    legacyChanged = true;
+                }
+                else if (brokerOrder.Status is OrderStatus.Filled or OrderStatus.Rejected)
                     legacyChanged = _realOrders.Remove(brokerOrder.OrderId);
             }
             else
             {
                 // A terminal tombstone advances only in OnOrderFilled, which
                 // guarantees the execution reaches the ledger first.
-                if (tracked.Terminal) return;
+                if (tracked.Terminal)
+                {
+                    if (tracked.AwaitingSettlement && brokerOrder.Status == OrderStatus.Rejected)
+                    {
+                        tracked.AwaitingSettlement = false;
+                        tracked.TerminalAt = _now();
+                        legacyChanged = true;
+                    }
+                    else return;
+                }
+                else
                 switch (brokerOrder.Status)
                 {
                     case OrderStatus.Accepted:
@@ -625,6 +647,8 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         tracked.RemainingQuantity = remaining;
         tracked.Terminal = tracked.Terminal || terminal;
         if (terminal) tracked.TerminalAt = timestamp;
+        if (state == OrderLifecycleState.Cancelled) tracked.AwaitingSettlement = true;
+        else if (state is OrderLifecycleState.Filled or OrderLifecycleState.Rejected) tracked.AwaitingSettlement = false;
         return new OrderLifecycleEvent
         {
             Timestamp = timestamp,
@@ -706,14 +730,16 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
     private void PurgeExpiredTerminalsLocked(DateTimeOffset now)
     {
         string[] expired = _realOrders
-            .Where(x => x.Value.Terminal && x.Value.TerminalAt.HasValue &&
+            .Where(x => x.Value.Terminal && !x.Value.AwaitingSettlement && x.Value.TerminalAt.HasValue &&
                         now - x.Value.TerminalAt.Value > TerminalRetention)
             .Select(x => x.Key)
             .ToArray();
         foreach (string realId in expired) _realOrders.Remove(realId);
     }
 
-    public void Dispose()
+    public void Dispose() => DisposeIfSafe(() => true);
+
+    internal void DisposeIfSafe(Func<bool> isLedgerFlat)
     {
         lock (_sync)
         {
@@ -726,6 +752,11 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
                 throw new InvalidOperationException($"仍有 {active} 張實盤委託未終結，禁止釋放執行器。");
             if (_inflightCallbacks > 0 || _inflightOperations > 0)
                 throw new InvalidOperationException($"仍有 {_inflightCallbacks} 個 callback／{_inflightOperations} 個操作尚未完成，禁止釋放執行器。");
+            int quarantined = _realOrders.Values.Count(x => x.AwaitingSettlement);
+            if (quarantined > 0)
+                throw new InvalidOperationException($"仍有 {quarantined} 張已撤委託等待 late-fill settlement，禁止釋放執行器。");
+            if (!isLedgerFlat())
+                throw new InvalidOperationException("策略 ledger 尚未歸零，禁止釋放執行器。");
             _disposing = true;
         }
         _gateway.OrderFilled -= OnOrderFilled;
