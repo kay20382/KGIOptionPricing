@@ -20,6 +20,21 @@ TestQueuePricingHandlesZeroTargetOneTickSpreadAndInvalidBooks();
 TestQueuePricingSupportsDifferentTickSizes();
 TestQueuePricingRejectsOffTickBooksAndInvalidBounds();
 TestQueuePricingAllowsZeroChaseWithHalfTickAnchor();
+TestPeriodicStrategyWarmsUpAndSubmitsBothSidesTogether();
+TestPeriodicStrategyMapsDirectionalQueueParameters();
+TestPeriodicStrategyRepricesOnlyAfterExactCancellation();
+TestPeriodicStrategyIsNotOcoWhenOneSideFills();
+TestPeriodicStrategySuppressesReplacementAfterCancelFillRace();
+TestPeriodicStrategyCancelsBothOnConfirmedPreFillReversal();
+TestPeriodicStrategyHandlesLateFillFromReplacedGeneration();
+TestPeriodicStrategyHandlesRejectedAndCancelFailedLifecycle();
+TestPeriodicStrategyCountsDistinctOppositeSeconds();
+TestPeriodicStrategyPreservesReentrantFirstLegFill();
+TestPeriodicStrategyHandlesSynchronousLateFillCancellation();
+TestPeriodicStrategyFaultsOnDistinctGenerationOverfill();
+TestPeriodicStrategyPreservesReentrantInitialRejection();
+TestPeriodicStrategyFaultsWhenExitCancellationFails();
+TestPeriodicStrategyPreservesSynchronousReplacementRejectionReason();
 
 Console.WriteLine("PeriodicQueueCycle smoke tests passed.");
 
@@ -584,6 +599,550 @@ static void TestQueuePricingAllowsZeroChaseWithHalfTickAnchor()
         "只要兩側界線各自為正且對齊 Tick，就不得以跨側關係拒絕 FrozenPriceBounds");
 }
 
+static void TestPeriodicStrategyWarmsUpAndSubmitsBothSidesTogether()
+{
+    DateTimeOffset start = new(2026, 9, 22, 0, 0, 0, TimeSpan.Zero);
+    var clock = new MutableClock(start);
+    var factory = new PeriodicQueueCycleFactory();
+    Assert(factory.StrategyType == PeriodicQueueCycleFactory.TypeName &&
+           factory.StrategyType == "PeriodicQueueCycle",
+        "Factory 必須提供穩定的 PeriodicQueueCycle 型別名稱");
+
+    var definition = PeriodicDefinition("periodic-up", Values(
+        ("DirectionWindowSeconds", "2"), ("ObiConfirmSeconds", "1"),
+        ("MinSideDepth", "1"), ("MinNearDepth", "1"),
+        ("MaxChaseTicks", "20"),
+        ("TrendInitialAheadA", "5"), ("TrendRepriceThresholdB", "100000"), ("TrendRepriceTargetC", "1"),
+        ("OppositeInitialAheadA", "20"), ("OppositeRepriceThresholdB", "100000"), ("OppositeRepriceTargetC", "1")));
+    var strategy = (PeriodicQueueCycleStrategy)factory.Create(definition);
+    var orders = new List<(int Callback, PaperOrderRequest Order)>();
+    int callback = 0;
+    strategy.OrderRequested += order => orders.Add((callback, order));
+
+    Assert(strategy.State == StrategyLifecycleState.Created, "策略建立後必須處於 Created");
+    strategy.Start(PeriodicContext(clock));
+    Assert(strategy.State == StrategyLifecycleState.WarmingUp, "啟動後必須進入 WarmingUp");
+
+    callback = 1;
+    strategy.OnMarketEvent(StrategyBook(100m, 105m, 20, 10, 1, start));
+    Assert(orders.Count == 0 && strategy.State == StrategyLifecycleState.WarmingUp,
+        "完整方向視窗以前不得送單");
+
+    callback = 2;
+    clock.Now = start.AddSeconds(1);
+    strategy.OnMarketEvent(StrategyBook(110m, 115m, 20, 10, 2, clock.Now));
+    Assert(orders.Count == 2 && orders.All(x => x.Callback == 2) &&
+           orders.Any(x => x.Order.Side == BuySell.Buy) &&
+           orders.Any(x => x.Order.Side == BuySell.Sell),
+        "方向成立時必須在同一市場回呼建立買賣兩張完成單");
+    Assert(orders.All(x => x.Order.Type == PaperOrderType.BrokerLimit && x.Order.Quantity == 1),
+        "雙邊完成單必須是一口 BrokerLimit");
+    Assert(orders.Single(x => x.Order.Side == BuySell.Buy).Order.ClientOrderId.Contains("buy-g1", StringComparison.Ordinal) &&
+           orders.Single(x => x.Order.Side == BuySell.Sell).Order.ClientOrderId.Contains("sell-g1", StringComparison.Ordinal) &&
+           orders.Select(x => x.Order.ClientOrderId).Distinct(StringComparer.Ordinal).Count() == 2,
+        "雙邊完成單必須有不同且可追蹤的世代識別");
+    Assert(strategy.State == StrategyLifecycleState.Running,
+        "送出雙邊完成單後公開生命週期必須是 Running");
+    Assert(strategy.GetSnapshot().ParameterSummary == PeriodicQueueCycleParameters.Parse(definition.Parameters).ParameterSummary,
+        "策略快照必須揭露每個實際生效參數");
+}
+
+static void TestPeriodicStrategyMapsDirectionalQueueParameters()
+{
+    IReadOnlyDictionary<string, string> parameters = Values(
+        ("DirectionWindowSeconds", "2"), ("ObiConfirmSeconds", "1"),
+        ("MinSideDepth", "1"), ("MinNearDepth", "1"),
+        ("MaxChaseTicks", "20"),
+        ("TrendInitialAheadA", "5"), ("TrendRepriceThresholdB", "100000"), ("TrendRepriceTargetC", "1"),
+        ("OppositeInitialAheadA", "20"), ("OppositeRepriceThresholdB", "100000"), ("OppositeRepriceTargetC", "1"));
+    DateTimeOffset start = new(2026, 9, 22, 1, 0, 0, TimeSpan.Zero);
+
+    List<PaperOrderRequest> up = RunInitialPair(
+        "mapping-up", parameters, start,
+        StrategyBook(100m, 105m, 20, 10, 1, start),
+        StrategyBook(110m, 115m, 20, 10, 2, start.AddSeconds(1)));
+    Assert(up.Single(x => x.Side == BuySell.Buy).Price == 110m &&
+           up.Single(x => x.Side == BuySell.Sell).Price == 120m,
+        "向上時買方必須採趨勢 A、賣方採反方向 A");
+
+    List<PaperOrderRequest> down = RunInitialPair(
+        "mapping-down", parameters, start,
+        StrategyBook(110m, 115m, 10, 20, 1, start),
+        StrategyBook(100m, 105m, 10, 20, 2, start.AddSeconds(1)));
+    Assert(down.Single(x => x.Side == BuySell.Buy).Price == 95m &&
+           down.Single(x => x.Side == BuySell.Sell).Price == 105m,
+        "向下時買方必須採反方向 A、賣方採趨勢 A");
+}
+
+static void TestPeriodicStrategyRepricesOnlyAfterExactCancellation()
+{
+    DateTimeOffset start = new(2026, 9, 22, 2, 0, 0, TimeSpan.Zero);
+    (PeriodicQueueCycleStrategy strategy, MutableClock clock, List<PaperOrderRequest> orders) =
+        StartWorkingUpStrategy("reprice", RepriceParameters(), start);
+    var cancels = new List<string>();
+    strategy.CancelOrderRequested += cancels.Add;
+    string oldBuy = orders.Single(x => x.Side == BuySell.Buy).ClientOrderId;
+    string oldSell = orders.Single(x => x.Side == BuySell.Sell).ClientOrderId;
+
+    clock.Now = start.AddSeconds(2);
+    strategy.OnMarketEvent(StrategyBook(110m, 115m, 20, 10, 3, clock.Now));
+    Assert(cancels.SequenceEqual(new[] { oldBuy }, StringComparer.Ordinal),
+        "B 超過時只能針對需要改掛的買單要求撤單");
+    Assert(orders.Count == 2, "撤單確認前不得提前送出替代世代");
+
+    strategy.OnOrderLifecycle(Cancelled(oldSell, strategy.InstanceId, clock.Now));
+    Assert(orders.Count == 2, "非目標 client 或另一側 Cancelled 不得建立替代單");
+    strategy.OnOrderLifecycle(Cancelled(oldBuy, strategy.InstanceId, clock.Now));
+    Assert(orders.Count == 3 && orders[^1].Side == BuySell.Buy &&
+           orders[^1].ClientOrderId.Contains("buy-g2", StringComparison.Ordinal) &&
+           orders[^1].Price == 115m,
+        "只有目標舊世代 Cancelled 才能建立 g+1 替代單");
+    strategy.OnOrderLifecycle(Cancelled(oldBuy, strategy.InstanceId, clock.Now));
+    Assert(orders.Count == 3, "重複或過期的舊世代 Cancelled 必須忽略");
+}
+
+static void TestPeriodicStrategyIsNotOcoWhenOneSideFills()
+{
+    DateTimeOffset start = new(2026, 9, 22, 3, 0, 0, TimeSpan.Zero);
+    (PeriodicQueueCycleStrategy strategy, MutableClock _, List<PaperOrderRequest> orders) =
+        StartWorkingUpStrategy("non-oco", NoRepriceParameters(), start);
+    var cancels = new List<string>();
+    strategy.CancelOrderRequested += cancels.Add;
+    PaperOrderRequest buy = orders.Single(x => x.Side == BuySell.Buy);
+
+    strategy.OnExecution(Fill(buy.ClientOrderId, strategy.InstanceId, BuySell.Buy, buy.Price, start.AddSeconds(2)));
+    Assert(cancels.Count == 0,
+        "一側成交不得自動取消另一側；雙邊完成單不是 OCO");
+    Assert(orders.Count == 2 && orders.Any(x => x.Side == BuySell.Sell),
+        "一側成交後另一側完成單必須維持獨立工作");
+}
+
+static void TestPeriodicStrategySuppressesReplacementAfterCancelFillRace()
+{
+    DateTimeOffset start = new(2026, 9, 22, 4, 0, 0, TimeSpan.Zero);
+    (PeriodicQueueCycleStrategy strategy, MutableClock clock, List<PaperOrderRequest> orders) =
+        StartWorkingUpStrategy("cancel-fill-race", RepriceParameters(), start);
+    var cancels = new List<string>();
+    strategy.CancelOrderRequested += cancels.Add;
+    PaperOrderRequest oldBuy = orders.Single(x => x.Side == BuySell.Buy);
+
+    clock.Now = start.AddSeconds(2);
+    strategy.OnMarketEvent(StrategyBook(110m, 115m, 20, 10, 3, clock.Now));
+    Assert(cancels.SequenceEqual(new[] { oldBuy.ClientOrderId }, StringComparer.Ordinal),
+        "競速測試必須先進入指定買單撤單中");
+    strategy.OnOrderLifecycle(CancelPending(oldBuy.ClientOrderId, strategy.InstanceId, clock.Now));
+    strategy.OnExecution(Fill(oldBuy.ClientOrderId, strategy.InstanceId, BuySell.Buy, 110m, clock.Now));
+    strategy.OnOrderLifecycle(Cancelled(oldBuy.ClientOrderId, strategy.InstanceId, clock.Now));
+    Assert(orders.Count(x => x.ClientOrderId.Contains("buy-g2", StringComparison.Ordinal)) == 0,
+        "撤單競速期間已成交的舊世代不得再建立替代買單");
+}
+
+static void TestPeriodicStrategyCancelsBothOnConfirmedPreFillReversal()
+{
+    DateTimeOffset start = new(2026, 9, 22, 5, 0, 0, TimeSpan.Zero);
+    (PeriodicQueueCycleStrategy strategy, MutableClock clock, List<PaperOrderRequest> orders) =
+        StartWorkingUpStrategy("reverse", NoRepriceParameters(), start);
+    var cancels = new List<string>();
+    strategy.CancelOrderRequested += cancels.Add;
+
+    var reverseBooks = new[]
+    {
+        StrategyBook(95m, 100m, 10, 20, 3, start.AddSeconds(2)),
+        StrategyBook(85m, 90m, 10, 20, 4, start.AddSeconds(3)),
+        StrategyBook(75m, 80m, 10, 20, 5, start.AddSeconds(4))
+    };
+    foreach (MarketEvent item in reverseBooks)
+    {
+        clock.Now = item.Timestamp;
+        strategy.OnMarketEvent(item);
+    }
+
+    string[] originalIds = orders.Take(2).Select(x => x.ClientOrderId).OrderBy(x => x, StringComparer.Ordinal).ToArray();
+    Assert(cancels.OrderBy(x => x, StringComparer.Ordinal).SequenceEqual(originalIds, StringComparer.Ordinal),
+        "兩側都未成交且完整反向訊號連續三秒時必須定向撤銷雙邊");
+    Assert(strategy.GetSnapshot().Reason == "SignalReversedBeforeFill",
+        "反向撤單必須使用穩定原因碼 SignalReversedBeforeFill");
+    Assert(orders.All(x => x.Role is not PaperOrderRole.StopLoss and not PaperOrderRole.Flatten),
+        "成交前訊號反轉不是停損或中性平倉");
+}
+
+static void TestPeriodicStrategyHandlesLateFillFromReplacedGeneration()
+{
+    DateTimeOffset start = new(2026, 9, 22, 6, 0, 0, TimeSpan.Zero);
+    (PeriodicQueueCycleStrategy strategy, MutableClock clock, List<PaperOrderRequest> orders) =
+        StartWorkingUpStrategy("late-old-fill", RepriceParameters(), start);
+    var cancels = new List<string>();
+    strategy.CancelOrderRequested += cancels.Add;
+    PaperOrderRequest oldBuy = orders.Single(x => x.Side == BuySell.Buy);
+
+    clock.Now = start.AddSeconds(2);
+    strategy.OnMarketEvent(StrategyBook(110m, 115m, 20, 10, 3, clock.Now));
+    strategy.OnOrderLifecycle(Cancelled(oldBuy.ClientOrderId, strategy.InstanceId, clock.Now));
+    PaperOrderRequest replacement = orders.Single(x => x.ClientOrderId.Contains("buy-g2", StringComparison.Ordinal));
+    strategy.OnExecution(Fill(oldBuy.ClientOrderId, strategy.InstanceId, BuySell.Buy, oldBuy.Price, clock.Now.AddMilliseconds(1)));
+
+    Assert(cancels.Contains(replacement.ClientOrderId, StringComparer.Ordinal),
+        "舊世代在替代單送出後延遲成交時，必須撤銷目前替代世代以避免同側重複曝險");
+    strategy.OnOrderLifecycle(Cancelled(replacement.ClientOrderId, strategy.InstanceId, clock.Now.AddMilliseconds(2)));
+    Assert(orders.Count(x => x.Side == BuySell.Buy) == 2,
+        "舊世代延遲成交後撤掉替代單不得再建立 g3");
+}
+
+static void TestPeriodicStrategyHandlesRejectedAndCancelFailedLifecycle()
+{
+    DateTimeOffset start = new(2026, 9, 22, 7, 0, 0, TimeSpan.Zero);
+    (PeriodicQueueCycleStrategy rejected, MutableClock _, List<PaperOrderRequest> rejectedOrders) =
+        StartWorkingUpStrategy("rejected", NoRepriceParameters(), start);
+    var rejectedCancels = new List<string>();
+    rejected.CancelOrderRequested += rejectedCancels.Add;
+    PaperOrderRequest rejectedBuy = rejectedOrders.Single(x => x.Side == BuySell.Buy);
+    PaperOrderRequest rejectedSell = rejectedOrders.Single(x => x.Side == BuySell.Sell);
+    rejected.OnOrderLifecycle(Rejected(rejectedBuy.ClientOrderId, rejected.InstanceId, start.AddSeconds(2)));
+    Assert(rejected.State == StrategyLifecycleState.Faulted &&
+           rejected.GetSnapshot().Reason == "OrderRejected" &&
+           rejectedCancels.SequenceEqual(new[] { rejectedSell.ClientOrderId }, StringComparer.Ordinal),
+        "任一完成單被拒絕時必須進入 Faulted 並定向撤銷仍工作的另一側");
+
+    (PeriodicQueueCycleStrategy cancelFailed, MutableClock clock, List<PaperOrderRequest> orders) =
+        StartWorkingUpStrategy("cancel-failed", RepriceParameters(), start.AddMinutes(1));
+    var cancels = new List<string>();
+    cancelFailed.CancelOrderRequested += cancels.Add;
+    string buyId = orders.Single(x => x.Side == BuySell.Buy).ClientOrderId;
+    clock.Now = start.AddMinutes(1).AddSeconds(2);
+    MarketEvent repriceBook = StrategyBook(110m, 115m, 20, 10, 3, clock.Now);
+    cancelFailed.OnMarketEvent(repriceBook);
+    cancelFailed.OnOrderLifecycle(CancelFailed(buyId, cancelFailed.InstanceId, clock.Now));
+    clock.Now = clock.Now.AddSeconds(1);
+    cancelFailed.OnMarketEvent(repriceBook with { Timestamp = clock.Now, Sequence = 4 });
+    Assert(cancels.Count(x => x == buyId) == 2 && orders.Count == 2,
+        "CancelFailed 必須把該世代恢復為工作中，後續可重新要求撤單且不得提前重掛");
+}
+
+static void TestPeriodicStrategyCountsDistinctOppositeSeconds()
+{
+    DateTimeOffset start = new(2026, 9, 22, 8, 0, 0, TimeSpan.Zero);
+    (PeriodicQueueCycleStrategy strategy, MutableClock clock, List<PaperOrderRequest> orders) =
+        StartWorkingUpStrategy("same-second-reverse", NoRepriceParameters(), start);
+    var cancels = new List<string>();
+    strategy.CancelOrderRequested += cancels.Add;
+    long sequence = 3;
+    decimal bid = 95m;
+    for (int second = 2; second <= 4; second++)
+    {
+        for (int update = 0; update < 2; update++)
+        {
+            clock.Now = start.AddSeconds(second).AddMilliseconds(update * 500);
+            strategy.OnMarketEvent(StrategyBook(
+                bid, bid + 5m, 10, 20, sequence++, clock.Now));
+        }
+        bid -= 10m;
+    }
+
+    Assert(cancels.Count == 2 &&
+           cancels.OrderBy(x => x, StringComparer.Ordinal).SequenceEqual(
+               orders.Take(2).Select(x => x.ClientOrderId).OrderBy(x => x, StringComparer.Ordinal),
+               StringComparer.Ordinal),
+        "同秒較新報價只能更新該秒判斷，不得重設或重複增加連續反向秒數");
+}
+
+static void TestPeriodicStrategyPreservesReentrantFirstLegFill()
+{
+    DateTimeOffset start = new(2026, 9, 22, 9, 0, 0, TimeSpan.Zero);
+    var clock = new MutableClock(start);
+    var strategy = (PeriodicQueueCycleStrategy)new PeriodicQueueCycleFactory().Create(
+        PeriodicDefinition("reentrant-fill", NoRepriceParameters()));
+    bool filled = false;
+    strategy.OrderRequested += order =>
+    {
+        if (!filled && order.Side == BuySell.Buy)
+        {
+            filled = true;
+            strategy.OnExecution(Fill(order.ClientOrderId, strategy.InstanceId, order.Side, order.Price, clock.Now));
+        }
+    };
+    strategy.Start(PeriodicContext(clock));
+    strategy.OnMarketEvent(StrategyBook(100m, 105m, 20, 10, 1, start));
+    clock.Now = start.AddSeconds(1);
+    strategy.OnMarketEvent(StrategyBook(110m, 115m, 20, 10, 2, clock.Now));
+
+    Assert(filled && strategy.GetSnapshot().Reason == "OneLegFilled",
+        "首張委託回呼同步成交時不得被 TryStart 結尾覆寫回雙邊工作狀態");
+}
+
+static void TestPeriodicStrategyHandlesSynchronousLateFillCancellation()
+{
+    DateTimeOffset start = new(2026, 9, 22, 10, 0, 0, TimeSpan.Zero);
+    (PeriodicQueueCycleStrategy strategy, MutableClock clock, List<PaperOrderRequest> orders) =
+        StartWorkingUpStrategy("sync-late-cancel", RepriceParameters(), start);
+    var cancels = new List<string>();
+    strategy.CancelOrderRequested += clientOrderId =>
+    {
+        cancels.Add(clientOrderId);
+        if (clientOrderId.Contains("buy-g2", StringComparison.Ordinal))
+        {
+            strategy.OnOrderLifecycle(CancelPending(clientOrderId, strategy.InstanceId, clock.Now));
+            strategy.OnOrderLifecycle(Cancelled(clientOrderId, strategy.InstanceId, clock.Now));
+        }
+    };
+    PaperOrderRequest oldBuy = orders.Single(x => x.Side == BuySell.Buy);
+    clock.Now = start.AddSeconds(2);
+    strategy.OnMarketEvent(StrategyBook(110m, 115m, 20, 10, 3, clock.Now));
+    strategy.OnOrderLifecycle(Cancelled(oldBuy.ClientOrderId, strategy.InstanceId, clock.Now));
+    PaperOrderRequest replacement = orders.Single(x => x.ClientOrderId.Contains("buy-g2", StringComparison.Ordinal));
+    strategy.OnExecution(Fill(oldBuy.ClientOrderId, strategy.InstanceId, BuySell.Buy, oldBuy.Price, clock.Now));
+    strategy.OnOrderLifecycle(CancelFailed(replacement.ClientOrderId, strategy.InstanceId, clock.Now));
+    clock.Now = clock.Now.AddSeconds(1);
+    strategy.OnMarketEvent(StrategyBook(115m, 120m, 20, 10, 4, clock.Now));
+
+    Assert(cancels.Count(x => x == replacement.ClientOrderId) == 1,
+        "延遲成交撤銷替代單時必須先進入 CancelPending，才能接住同步 Cancelled 且不再重複撤單");
+}
+
+static void TestPeriodicStrategyFaultsOnDistinctGenerationOverfill()
+{
+    DateTimeOffset start = new(2026, 9, 22, 11, 0, 0, TimeSpan.Zero);
+    (PeriodicQueueCycleStrategy strategy, MutableClock clock, List<PaperOrderRequest> orders) =
+        StartWorkingUpStrategy("generation-overfill", RepriceParameters(), start);
+    clock.Now = start.AddSeconds(2);
+    strategy.OnMarketEvent(StrategyBook(110m, 115m, 20, 10, 3, clock.Now));
+    PaperOrderRequest oldBuy = orders.Single(x => x.Side == BuySell.Buy);
+    strategy.OnOrderLifecycle(Cancelled(oldBuy.ClientOrderId, strategy.InstanceId, clock.Now));
+    PaperOrderRequest replacement = orders.Single(x => x.ClientOrderId.Contains("buy-g2", StringComparison.Ordinal));
+    strategy.OnExecution(Fill(replacement.ClientOrderId, strategy.InstanceId, BuySell.Buy, replacement.Price, clock.Now));
+    strategy.OnExecution(Fill(oldBuy.ClientOrderId, strategy.InstanceId, BuySell.Buy, oldBuy.Price, clock.Now.AddMilliseconds(1)));
+
+    Assert(strategy.State == StrategyLifecycleState.Faulted &&
+           strategy.GetSnapshot().Reason == "DuplicateGenerationFill",
+        "同側兩個不同世代都真實成交時必須辨識為超額曝險並 Faulted，不得當成同一回報重複");
+}
+
+static void TestPeriodicStrategyPreservesReentrantInitialRejection()
+{
+    foreach (BuySell rejectedSide in new[] { BuySell.Buy, BuySell.Sell })
+    {
+        DateTimeOffset start = new(2026, 9, 22, 12, rejectedSide == BuySell.Buy ? 0 : 10, 0, TimeSpan.Zero);
+        var clock = new MutableClock(start);
+        var strategy = (PeriodicQueueCycleStrategy)new PeriodicQueueCycleFactory().Create(
+            PeriodicDefinition($"reentrant-reject-{rejectedSide}", NoRepriceParameters()));
+        var submitted = new List<PaperOrderRequest>();
+        var cancels = new List<string>();
+        strategy.CancelOrderRequested += cancels.Add;
+        strategy.OrderRequested += order =>
+        {
+            submitted.Add(order);
+            if (order.Side == rejectedSide)
+                strategy.OnOrderLifecycle(Rejected(order.ClientOrderId, strategy.InstanceId, clock.Now));
+        };
+        strategy.Start(PeriodicContext(clock));
+        strategy.OnMarketEvent(StrategyBook(100m, 105m, 20, 10, 1, start));
+        clock.Now = start.AddSeconds(1);
+        strategy.OnMarketEvent(StrategyBook(110m, 115m, 20, 10, 2, clock.Now));
+
+        Assert(strategy.State == StrategyLifecycleState.Faulted &&
+               strategy.GetSnapshot().Reason == "OrderRejected",
+            $"初始 {rejectedSide} 同步拒絕不得被 TryStart 覆寫 Faulted");
+        if (rejectedSide == BuySell.Buy)
+            Assert(submitted.Count == 1 && cancels.Count == 0,
+                "第一張買單同步拒絕後不得再送出或撤銷尚未送出的賣單");
+        else
+            Assert(submitted.Count == 2 && cancels.SequenceEqual(new[] { submitted[0].ClientOrderId }, StringComparer.Ordinal),
+                "第二張賣單同步拒絕後必須只撤銷已送出的買單");
+    }
+}
+
+static void TestPeriodicStrategyFaultsWhenExitCancellationFails()
+{
+    DateTimeOffset start = new(2026, 9, 22, 13, 0, 0, TimeSpan.Zero);
+    (PeriodicQueueCycleStrategy strategy, MutableClock clock, List<PaperOrderRequest> orders) =
+        StartWorkingUpStrategy("exit-cancel-failed", NoRepriceParameters(), start);
+    var cancels = new List<string>();
+    strategy.CancelOrderRequested += cancels.Add;
+    var reverseBooks = new[]
+    {
+        StrategyBook(95m, 100m, 10, 20, 3, start.AddSeconds(2)),
+        StrategyBook(85m, 90m, 10, 20, 4, start.AddSeconds(3)),
+        StrategyBook(75m, 80m, 10, 20, 5, start.AddSeconds(4))
+    };
+    foreach (MarketEvent item in reverseBooks)
+    {
+        clock.Now = item.Timestamp;
+        strategy.OnMarketEvent(item);
+    }
+    string failedId = cancels[0];
+    strategy.OnOrderLifecycle(CancelFailed(failedId, strategy.InstanceId, clock.Now));
+
+    Assert(strategy.State == StrategyLifecycleState.Faulted &&
+           strategy.GetSnapshot().Reason == "CancelFailedDuringExit" &&
+           orders.Count == 2,
+        "訊號反轉退出撤單失敗不得恢復工作或重掛，必須維持風險封鎖並 Faulted");
+}
+
+static void TestPeriodicStrategyPreservesSynchronousReplacementRejectionReason()
+{
+    DateTimeOffset start = new(2026, 9, 22, 14, 0, 0, TimeSpan.Zero);
+    (PeriodicQueueCycleStrategy strategy, MutableClock clock, List<PaperOrderRequest> orders) =
+        StartWorkingUpStrategy("replacement-reject", RepriceParameters(), start);
+    strategy.OrderRequested += order =>
+    {
+        if (order.ClientOrderId.Contains("buy-g2", StringComparison.Ordinal))
+            strategy.OnOrderLifecycle(Rejected(order.ClientOrderId, strategy.InstanceId, clock.Now));
+    };
+    clock.Now = start.AddSeconds(2);
+    strategy.OnMarketEvent(StrategyBook(110m, 115m, 20, 10, 3, clock.Now));
+    string oldBuy = orders.Single(x => x.Side == BuySell.Buy).ClientOrderId;
+    strategy.OnOrderLifecycle(Cancelled(oldBuy, strategy.InstanceId, clock.Now));
+
+    Assert(strategy.State == StrategyLifecycleState.Faulted &&
+           strategy.GetSnapshot().Reason == "OrderRejected",
+        "替代單同步拒絕的終端原因不得被外層 ReplacementSubmitted 覆寫");
+}
+
+static (PeriodicQueueCycleStrategy Strategy, MutableClock Clock, List<PaperOrderRequest> Orders)
+    StartWorkingUpStrategy(string instanceId, IReadOnlyDictionary<string, string> parameters, DateTimeOffset start)
+{
+    var clock = new MutableClock(start);
+    var strategy = (PeriodicQueueCycleStrategy)new PeriodicQueueCycleFactory().Create(
+        PeriodicDefinition(instanceId, parameters));
+    var orders = new List<PaperOrderRequest>();
+    strategy.OrderRequested += orders.Add;
+    strategy.Start(PeriodicContext(clock));
+    strategy.OnMarketEvent(StrategyBook(100m, 105m, 20, 10, 1, start));
+    clock.Now = start.AddSeconds(1);
+    strategy.OnMarketEvent(StrategyBook(110m, 115m, 20, 10, 2, clock.Now));
+    Assert(orders.Count == 2, "測試前置必須建立雙邊完成單");
+    return (strategy, clock, orders);
+}
+
+static IReadOnlyDictionary<string, string> RepriceParameters() => Values(
+    ("DirectionWindowSeconds", "2"), ("ObiConfirmSeconds", "1"),
+    ("DirectionReverseSeconds", "3"), ("MinSideDepth", "1"), ("MinNearDepth", "1"),
+    ("MaxChaseTicks", "20"),
+    ("TrendInitialAheadA", "5"), ("TrendRepriceThresholdB", "15"), ("TrendRepriceTargetC", "0"),
+    ("OppositeInitialAheadA", "20"), ("OppositeRepriceThresholdB", "100000"), ("OppositeRepriceTargetC", "1"));
+
+static IReadOnlyDictionary<string, string> NoRepriceParameters() => Values(
+    ("DirectionWindowSeconds", "2"), ("ObiConfirmSeconds", "1"),
+    ("DirectionReverseSeconds", "3"), ("MinSideDepth", "1"), ("MinNearDepth", "1"),
+    ("MaxChaseTicks", "20"),
+    ("TrendInitialAheadA", "5"), ("TrendRepriceThresholdB", "100000"), ("TrendRepriceTargetC", "1"),
+    ("OppositeInitialAheadA", "20"), ("OppositeRepriceThresholdB", "100000"), ("OppositeRepriceTargetC", "1"));
+
+static OrderLifecycleEvent CancelPending(string clientOrderId, string instanceId, DateTimeOffset timestamp) => new()
+{
+    StrategyInstanceId = instanceId,
+    ClientOrderId = clientOrderId,
+    Timestamp = timestamp,
+    State = OrderLifecycleState.CancelPending,
+    Quantity = 1,
+    RemainingQuantity = 1
+};
+
+static OrderLifecycleEvent Cancelled(string clientOrderId, string instanceId, DateTimeOffset timestamp) => new()
+{
+    StrategyInstanceId = instanceId,
+    ClientOrderId = clientOrderId,
+    Timestamp = timestamp,
+    State = OrderLifecycleState.Cancelled,
+    Quantity = 1,
+    RemainingQuantity = 1
+};
+
+static OrderLifecycleEvent Rejected(string clientOrderId, string instanceId, DateTimeOffset timestamp) => new()
+{
+    StrategyInstanceId = instanceId,
+    ClientOrderId = clientOrderId,
+    Timestamp = timestamp,
+    State = OrderLifecycleState.Rejected,
+    Quantity = 1,
+    RemainingQuantity = 1,
+    ReasonCode = "Rejected"
+};
+
+static OrderLifecycleEvent CancelFailed(string clientOrderId, string instanceId, DateTimeOffset timestamp) => new()
+{
+    StrategyInstanceId = instanceId,
+    ClientOrderId = clientOrderId,
+    Timestamp = timestamp,
+    State = OrderLifecycleState.Working,
+    Quantity = 1,
+    RemainingQuantity = 1,
+    ReasonCode = "CancelFailed"
+};
+
+static ExecutionEvent Fill(
+    string clientOrderId,
+    string instanceId,
+    BuySell side,
+    decimal price,
+    DateTimeOffset timestamp) => new()
+{
+    StrategyInstanceId = instanceId,
+    ClientOrderId = clientOrderId,
+    Timestamp = timestamp,
+    Symbol = "225MC",
+    Side = side,
+    Role = side == BuySell.Buy ? PaperOrderRole.EntryLong : PaperOrderRole.EntryShort,
+    Price = price,
+    Quantity = 1
+};
+
+static List<PaperOrderRequest> RunInitialPair(
+    string instanceId,
+    IReadOnlyDictionary<string, string> parameters,
+    DateTimeOffset start,
+    MarketEvent first,
+    MarketEvent second)
+{
+    var clock = new MutableClock(start);
+    var strategy = (PeriodicQueueCycleStrategy)new PeriodicQueueCycleFactory().Create(
+        PeriodicDefinition(instanceId, parameters));
+    var orders = new List<PaperOrderRequest>();
+    strategy.OrderRequested += orders.Add;
+    strategy.Start(PeriodicContext(clock));
+    strategy.OnMarketEvent(first);
+    clock.Now = start.AddSeconds(1);
+    strategy.OnMarketEvent(second);
+    return orders;
+}
+
+static StrategyDefinition PeriodicDefinition(string instanceId, IReadOnlyDictionary<string, string> parameters) => new()
+{
+    StrategyType = PeriodicQueueCycleFactory.TypeName,
+    InstanceId = instanceId,
+    Universe = new StrategyUniverse { Tradable = new ProductSelection("225MC", "225MC") },
+    Parameters = parameters
+};
+
+static StrategyRuntimeContext PeriodicContext(IStrategyClock clock) => new(
+    new ResolvedStrategyUniverse
+    {
+        Tradable = new ResolvedProduct
+        {
+            ProductId = "225MC", Symbol = "225MC", TickSize = 5m, ContractMultiplier = 10m
+        }
+    },
+    clock,
+    new ZeroPerformance());
+
+static MarketEvent StrategyBook(
+    decimal bestBid,
+    decimal bestAsk,
+    int bidQuantity,
+    int askQuantity,
+    long sequence,
+    DateTimeOffset timestamp) => new()
+{
+    Sequence = sequence,
+    Timestamp = timestamp,
+    Symbol = "225MC",
+    ProductId = "225MC",
+    Kind = MarketEventKind.Book,
+    BidPrices = Enumerable.Range(0, 10).Select(i => bestBid - i * 5m).ToArray(),
+    AskPrices = Enumerable.Range(0, 10).Select(i => bestAsk + i * 5m).ToArray(),
+    BidQuantities = Enumerable.Repeat(bidQuantity, 10).ToArray(),
+    AskQuantities = Enumerable.Repeat(askQuantity, 10).ToArray()
+};
+
 static MarketEvent QueueBook(decimal tick, decimal bestBid, decimal bestAsk,
     int[] bidQuantities, int[] askQuantities)
 {
@@ -661,4 +1220,19 @@ static void AssertThrows<T>(Action action, string? message = null) where T : Exc
     }
 
     throw new InvalidOperationException(message ?? $"預期拋出 {typeof(T).Name}");
+}
+
+sealed class MutableClock : IStrategyClock
+{
+    public MutableClock(DateTimeOffset now) => Now = now;
+    public DateTimeOffset Now { get; set; }
+}
+
+sealed class ZeroPerformance : IStrategyPerformanceView
+{
+    public PositionSnapshot GetPosition(string strategyInstanceId, string symbol) => new()
+    {
+        StrategyInstanceId = strategyInstanceId,
+        Symbol = symbol
+    };
 }
