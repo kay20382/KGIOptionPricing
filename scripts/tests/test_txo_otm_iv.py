@@ -65,5 +65,16 @@ class TxoOtmIvTests(unittest.TestCase):
         self.assertEqual(result.source_file, "official-source.csv")
 
 
+
+    def test_rejection_retains_source_file_for_audit(self):
+        rows = [
+            OptionRow(row.contract_type, row.expiry_month, row.expiry_date, row.strike, row.kind, row.settlement, row.oi, "official-source.csv")
+            for row in make_rows() if row.strike <= 20_000.0
+        ]
+        result = calculate_contract_iv(rows, date(2026, 9, 22), set(), {2026})
+        self.assertEqual(result.reason, "strict_otm_row_missing")
+        self.assertEqual(result.source_file, "official-source.csv")
+
+
 if __name__ == "__main__":
     unittest.main()

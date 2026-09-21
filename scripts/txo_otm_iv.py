@@ -138,26 +138,26 @@ def remaining_trading_days(trade_date: date, expiry_date: date, holidays: set[da
 def calculate_contract_iv(rows: Iterable[OptionRow], trade_date: date, holidays: set[date], covered_years: set[int]) -> IvResult:
     rows = tuple(rows)
     if not rows:
-        return IvResult("未知", None, None, reason="contract_rows_missing")
+        return IvResult("未知", None, None, reason="contract_rows_missing", source_file=source_file)
     first = rows[0]
     source_file = next((row.source_file for row in rows if row.source_file), None)
     if any(row.expiry_date != first.expiry_date or row.expiry_month != first.expiry_month for row in rows):
-        return IvResult(first.contract_type, first.expiry_month, first.expiry_date, reason="mixed_contract_rows")
+        return IvResult(first.contract_type, first.expiry_month, first.expiry_date, reason="mixed_contract_rows", source_file=source_file)
     if trade_date.year not in covered_years or first.expiry_date.year not in covered_years:
-        return IvResult(first.contract_type, first.expiry_month, first.expiry_date, reason="holiday_calendar_year_missing")
+        return IvResult(first.contract_type, first.expiry_month, first.expiry_date, reason="holiday_calendar_year_missing", source_file=source_file)
     days = remaining_trading_days(trade_date, first.expiry_date, holidays)
     if days <= 0:
-        return IvResult(first.contract_type, first.expiry_month, first.expiry_date, remaining_trading_days=days, reason="expiry_or_no_trading_days")
+        return IvResult(first.contract_type, first.expiry_month, first.expiry_date, remaining_trading_days=days, reason="expiry_or_no_trading_days", source_file=source_file)
     central = _select_central_pair(rows)
     if central is None:
-        return IvResult(first.contract_type, first.expiry_month, first.expiry_date, remaining_trading_days=days, reason="central_pair_missing")
+        return IvResult(first.contract_type, first.expiry_month, first.expiry_date, remaining_trading_days=days, reason="central_pair_missing", source_file=source_file)
     central_call, central_put = central
     forward = central_call.strike + central_call.settlement - central_put.settlement
     if forward <= 0:
-        return IvResult(first.contract_type, first.expiry_month, first.expiry_date, central_call.strike, central_call.settlement, central_put.settlement, forward, remaining_trading_days=days, reason="synthetic_forward_invalid")
+        return IvResult(first.contract_type, first.expiry_month, first.expiry_date, central_call.strike, central_call.settlement, central_put.settlement, forward, remaining_trading_days=days, reason="synthetic_forward_invalid", source_file=source_file)
     otm = _select_otm_rows(rows, forward)
     if otm is None:
-        return IvResult(first.contract_type, first.expiry_month, first.expiry_date, central_call.strike, central_call.settlement, central_put.settlement, forward, remaining_trading_days=days, reason="strict_otm_row_missing")
+        return IvResult(first.contract_type, first.expiry_month, first.expiry_date, central_call.strike, central_call.settlement, central_put.settlement, forward, remaining_trading_days=days, reason="strict_otm_row_missing", source_file=source_file)
     call, put = otm
     years = days / 252
     call_iv = implied_volatility("Call", call.settlement, forward, call.strike, years)
@@ -184,6 +184,7 @@ def load_holiday_calendar(path: Path) -> tuple[set[date], set[int]]:
             if row["是否休市"] == "true":
                 holidays.add(value)
     return holidays, covered_years
+
 
 
 
