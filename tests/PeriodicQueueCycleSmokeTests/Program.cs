@@ -5,6 +5,7 @@ using KGIOptionPricing.StrategyFramework;
 TestParameterDefaultsAndSummary();
 TestInvariantParsing();
 TestParameterSafetyRanges();
+TestParameterSafetyBoundariesAreAccepted();
 TestParameterCrossConstraints();
 TestDirectionalAssessments();
 TestNeutralDirectionConditions();
@@ -94,6 +95,72 @@ static void TestParameterSafetyRanges()
     }
 }
 
+static void TestParameterSafetyBoundariesAreAccepted()
+{
+    var valid = new (string Label, IReadOnlyDictionary<string, string> Values)[]
+    {
+        ("DirectionWindowSeconds lower", Values(("DirectionWindowSeconds", "2"), ("ObiConfirmSeconds", "2"))),
+        ("DirectionWindowSeconds upper", Values(("DirectionWindowSeconds", "300"))),
+        ("MinMoveTicks lower", Values(("MinMoveTicks", "0.5"))),
+        ("MinMoveTicks upper", Values(("MinMoveTicks", "50"))),
+        ("MinTrendEfficiency lower", Values(("MinTrendEfficiency", "0"))),
+        ("MinTrendEfficiency upper", Values(("MinTrendEfficiency", "1"))),
+        ("MinDepthObi lower", Values(("MinDepthObi", "0"))),
+        ("MinDepthObi upper", Values(("MinDepthObi", "1"))),
+        ("ObiConfirmSeconds lower", Values(("ObiConfirmSeconds", "1"))),
+        ("ObiConfirmSeconds upper", Values(("DirectionWindowSeconds", "30"), ("ObiConfirmSeconds", "30"))),
+        ("DirectionReverseSeconds lower", Values(("DirectionReverseSeconds", "1"))),
+        ("DirectionReverseSeconds upper", Values(("DirectionReverseSeconds", "30"))),
+        ("MinSideDepth lower", Values(("MinSideDepth", "1"))),
+        ("MinSideDepth upper", Values(("MinSideDepth", "1000000"))),
+        ("MinNearDepth lower", Values(("MinNearDepth", "1"))),
+        ("MinNearDepth upper", Values(("MinNearDepth", "1000000"))),
+        ("MinDepthRatio lower", Values(("MinDepthRatio", "0"))),
+        ("MinDepthRatio upper", Values(("MinDepthRatio", "1"))),
+        ("MaxSpreadTicks lower", Values(("MaxSpreadTicks", "1"))),
+        ("MaxSpreadTicks upper", Values(("MaxSpreadTicks", "20"))),
+        ("MaxVolatilityTicks lower", Values(("MaxVolatilityTicks", "1"))),
+        ("MaxVolatilityTicks upper", Values(("MaxVolatilityTicks", "100"))),
+        ("QuoteFreshnessSeconds lower", Values(("QuoteFreshnessSeconds", "0.1"))),
+        ("QuoteFreshnessSeconds upper", Values(("QuoteFreshnessSeconds", "30"))),
+        ("MaxChaseTicks lower", Values(("MaxChaseTicks", "0"))),
+        ("MaxChaseTicks upper", Values(("MaxChaseTicks", "20"))),
+        ("StopLossTicks lower", Values(("StopLossTicks", "1"))),
+        ("StopLossTicks upper", Values(("StopLossTicks", "100"))),
+        ("MaxOneLegSeconds lower", Values(("MaxOneLegSeconds", "1"))),
+        ("MaxOneLegSeconds upper", Values(("MaxOneLegSeconds", "300"))),
+        ("CycleCooldownSeconds lower", Values(("CycleCooldownSeconds", "0"))),
+        ("CycleCooldownSeconds upper", Values(("CycleCooldownSeconds", "3600"))),
+        ("StopLossCooldownSeconds lower", Values(("StopLossCooldownSeconds", "0"))),
+        ("StopLossCooldownSeconds upper", Values(("StopLossCooldownSeconds", "3600"))),
+        ("ShockCooldownSeconds lower", Values(("ShockCooldownSeconds", "0"))),
+        ("ShockCooldownSeconds upper", Values(("ShockCooldownSeconds", "3600"))),
+        ("MarketDataRecoverySeconds lower", Values(("MarketDataRecoverySeconds", "0.1"))),
+        ("MarketDataRecoverySeconds upper", Values(("MarketDataRecoverySeconds", "30"))),
+        ("CommissionPerContract lower", Values(("CommissionPerContract", "0"))),
+        ("ResearchValidated false", Values(("ResearchValidated", "false"))),
+        ("ResearchValidated true", Values(("ResearchValidated", "true"))),
+        ("TrendInitialAheadA lower", Values(("TrendInitialAheadA", "0"))),
+        ("TrendRepriceThresholdB lower", Values(("TrendRepriceThresholdB", "1"), ("TrendRepriceTargetC", "0"))),
+        ("TrendRepriceTargetC lower", Values(("TrendRepriceTargetC", "0"))),
+        ("OppositeInitialAheadA lower", Values(("OppositeInitialAheadA", "0"))),
+        ("OppositeRepriceThresholdB lower", Values(("OppositeRepriceThresholdB", "1"), ("OppositeRepriceTargetC", "0"))),
+        ("OppositeRepriceTargetC lower", Values(("OppositeRepriceTargetC", "0")))
+    };
+
+    foreach ((string label, IReadOnlyDictionary<string, string> values) in valid)
+    {
+        try
+        {
+            PeriodicQueueCycleParameters.Parse(values);
+        }
+        catch (Exception ex)
+        {
+            throw new InvalidOperationException($"安全邊界本身應可接受：{label}", ex);
+        }
+    }
+}
+
 static void TestParameterCrossConstraints()
 {
     AssertThrows<ArgumentException>(() => PeriodicQueueCycleParameters.Parse(
@@ -133,15 +200,39 @@ static void TestDirectionalAssessments()
     var down = new DirectionWindow(5m, parameters);
     for (int i = 0; i < 15; i++)
     {
-        decimal mid = i == 14 ? 90m : 100m;
-        Assert(down.TryAdd(Book(mid, 90, 130, i + 1, start.AddSeconds(i)), start.AddSeconds(i)), "向下測試樣本應健康");
+        decimal mid = i switch
+        {
+            0 => 120m,
+            1 => 115m,
+            2 => 120m,
+            13 => 110m,
+            14 => 105m,
+            _ => 120m
+        };
+        (int bidQuantity, int askQuantity) = i switch
+        {
+            12 => (90, 130),
+            13 => (100, 140),
+            14 => (110, 150),
+            _ => (150, 90)
+        };
+        Assert(down.TryAdd(Book(mid, bidQuantity, askQuantity, i + 1, start.AddSeconds(i)), start.AddSeconds(i)), "向下測試樣本應健康");
     }
 
     DirectionAssessment downAssessment = down.Evaluate(start.AddSeconds(14), 5m, parameters);
-    Assert(downAssessment.Direction == CycleDirection.Down && downAssessment.NetMoveTicks == -2m &&
-           downAssessment.PathTicks == 2m && downAssessment.TrendEfficiency == 1m,
-        $"向下方向應與向上對稱，實際 {downAssessment.Direction}/{downAssessment.NetMoveTicks}");
-    AssertNear(downAssessment.AverageObi, -0.181818m, 0.000001m, "向下 OBI 應與向上對稱");
+    Assert(downAssessment.Direction == CycleDirection.Down && downAssessment.NetMoveTicks == -3m &&
+           downAssessment.PathTicks == 5m && downAssessment.TrendEfficiency == 0.6m,
+        $"非鏡像向下價格特徵不符手算值，實際 {downAssessment.Direction}/{downAssessment.NetMoveTicks}/{downAssessment.PathTicks}/{downAssessment.TrendEfficiency}");
+    AssertNear(downAssessment.AverageObi, -0.167444m, 0.000001m, "向下 OBI 必須只平均最近三秒的不同深度");
+    ThresholdResult downMove = downAssessment.Thresholds.Single(x => x.Name == "DownNetMoveTicks");
+    ThresholdResult downEfficiency = downAssessment.Thresholds.Single(x => x.Name == "MinTrendEfficiency");
+    ThresholdResult downObi = downAssessment.Thresholds.Single(x => x.Name == "DownMinDepthObi");
+    Assert(downMove.Observed == 3m && downMove.Required == 2m && downMove.Passed,
+        "向下淨移動門檻結果不符手算值");
+    Assert(downEfficiency.Observed == 0.6m && downEfficiency.Required == 0.40m && downEfficiency.Passed,
+        "向下效率門檻結果不符手算值");
+    AssertNear(downObi.Observed, 0.167444m, 0.000001m, "向下 OBI 門檻觀測值不符手算值");
+    Assert(downObi.Required == 0.10m && downObi.Passed, "向下 OBI 門檻需求與結果不符");
 }
 
 static void TestNeutralDirectionConditions()
@@ -189,11 +280,15 @@ static void TestHealthRejectionCodes()
     }, t, parameters);
     AssertRejected("InvalidBook", Book(100m, 130, 90, 1, t) with
     {
-        BidPrices = Enumerable.Repeat(105m, 10).ToArray()
+        BidPrices = Enumerable.Range(0, 10).Select(i => 105m - i * 5m).ToArray()
     }, t, parameters);
     AssertRejected("InvalidBook", Book(100m, 130, 90, 1, t) with
     {
         BidPrices = new[] { 97.5m, 92.5m, 95m, 87.5m, 82.5m, 77.5m, 72.5m, 67.5m, 62.5m, 57.5m }
+    }, t, parameters);
+    AssertRejected("InvalidBook", Book(100m, 130, 90, 1, t) with
+    {
+        AskPrices = new[] { 102.5m, 107.5m, 105m, 117.5m, 122.5m, 127.5m, 132.5m, 137.5m, 142.5m, 147.5m }
     }, t, parameters);
     AssertRejected("InsufficientSideDepth", Book(100m, 80, 90, 1, t), t, parameters);
 
@@ -228,6 +323,15 @@ static void TestUtcSecondSamplingAndWarmup()
     Assert(!window.TryAdd(Book(110m, 130, 90, 2, t.AddMilliseconds(900)), t.AddMilliseconds(900)), "時間較晚但序號倒退的同秒事件不得覆寫");
     Assert(window.SampleCount == 1 && window.LatestSequence == 3,
         "同秒或亂序事件不得以舊序號覆寫較新的健康樣本");
+    MarketEvent malformedOlderSequence = Book(110m, 130, 90, 2, t.AddMilliseconds(900)) with
+    {
+        BidPrices = new[] { 107.5m }, BidQuantities = new[] { 130 },
+        AskPrices = new[] { 112.5m }, AskQuantities = new[] { 90 }
+    };
+    Assert(!window.TryAdd(malformedOlderSequence, t.AddMilliseconds(900)), "亂序 malformed 事件不得加入方向窗");
+    DirectionAssessment retained = window.Evaluate(t.AddMilliseconds(900), 5m, parameters);
+    Assert(window.LatestSequence == 3 && retained.PrimaryReasonCode != "InvalidBook",
+        "亂序 malformed 事件不得覆寫健康樣本或污染拒絕狀態");
     Assert(!window.TryAdd(Book(100m, 130, 90, 4, t.AddSeconds(-1)), t.AddMilliseconds(800)), "跨秒倒序事件不得污染方向窗");
 
     var gap = new DirectionWindow(5m, parameters);
@@ -285,6 +389,9 @@ static void AssertNear(decimal actual, decimal expected, decimal tolerance, stri
         throw new InvalidOperationException($"{message}：expected={expected}, actual={actual}");
     }
 }
+
+static IReadOnlyDictionary<string, string> Values(params (string Name, string Value)[] pairs) =>
+    pairs.ToDictionary(pair => pair.Name, pair => pair.Value, StringComparer.OrdinalIgnoreCase);
 
 static void Assert(bool condition, string message)
 {

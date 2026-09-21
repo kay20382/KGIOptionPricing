@@ -26,6 +26,7 @@ public sealed class DirectionWindow
     private readonly decimal _tickSize;
     private readonly PeriodicQueueCycleParameters _parameters;
     private readonly SortedDictionary<long, Sample> _samples = new();
+    private readonly SortedDictionary<long, ObservedIdentity> _observedIdentities = new();
     private Rejection? _lastRejection;
 
     public DirectionWindow(decimal tickSize, PeriodicQueueCycleParameters parameters)
@@ -41,6 +42,8 @@ public sealed class DirectionWindow
     public bool TryAdd(MarketEvent item, DateTimeOffset now)
     {
         ArgumentNullException.ThrowIfNull(item);
+        if (!TryObserveIdentity(item)) return false;
+
         if (!TryCreateSample(item, out Sample? candidate))
         {
             _lastRejection = new Rejection(
@@ -55,25 +58,6 @@ public sealed class DirectionWindow
         }
 
         Sample next = candidate!;
-        if (_samples.TryGetValue(next.UtcSecond, out Sample? sameSecond))
-        {
-            bool timeRegressed = next.Timestamp < sameSecond.Timestamp;
-            bool sequenceRegressed = next.Sequence < sameSecond.Sequence;
-            bool exactDuplicate = next.Timestamp == sameSecond.Timestamp && next.Sequence == sameSecond.Sequence;
-            if (timeRegressed || sequenceRegressed || exactDuplicate)
-            {
-                return false;
-            }
-        }
-        else if (_samples.Count > 0)
-        {
-            Sample latest = _samples.Values.Last();
-            if (next.Timestamp <= latest.Timestamp || next.Sequence <= latest.Sequence)
-            {
-                return false;
-            }
-        }
-
         List<ThresholdResult> healthThresholds = HealthThresholds(next, now, _tickSize, _parameters, includeProspective: true);
         List<string> failures = HealthFailures(healthThresholds);
         if (failures.Count > 0)
@@ -96,8 +80,37 @@ public sealed class DirectionWindow
         {
             _samples.Remove(key);
         }
+        foreach (long key in _observedIdentities.Keys.Where(key => key < oldestSecond).ToArray())
+        {
+            _observedIdentities.Remove(key);
+        }
 
         _lastRejection = null;
+        return true;
+    }
+
+    private bool TryObserveIdentity(MarketEvent item)
+    {
+        long utcSecond = item.Timestamp.ToUniversalTime().Ticks / TimeSpan.TicksPerSecond;
+        if (_observedIdentities.TryGetValue(utcSecond, out ObservedIdentity? sameSecond))
+        {
+            bool timeRegressed = item.Timestamp < sameSecond.Timestamp;
+            bool sequenceRegressed = item.Sequence < sameSecond.Sequence;
+            bool exactDuplicate = item.Timestamp == sameSecond.Timestamp && item.Sequence == sameSecond.Sequence;
+            if (timeRegressed || sequenceRegressed || exactDuplicate) return false;
+        }
+        else if (_observedIdentities.Count > 0)
+        {
+            ObservedIdentity latest = _observedIdentities.Values.Last();
+            if (item.Timestamp <= latest.Timestamp || item.Sequence <= latest.Sequence) return false;
+        }
+
+        _observedIdentities[utcSecond] = new ObservedIdentity(item.Timestamp, item.Sequence);
+        long oldestSecond = utcSecond - _parameters.DirectionWindowSeconds + 1L;
+        foreach (long key in _observedIdentities.Keys.Where(key => key < oldestSecond).ToArray())
+        {
+            _observedIdentities.Remove(key);
+        }
         return true;
     }
 
@@ -401,4 +414,6 @@ public sealed class DirectionWindow
         IReadOnlyList<ThresholdResult> Thresholds,
         decimal SpreadTicks,
         decimal VolatilityTicks);
+
+    private sealed record ObservedIdentity(DateTimeOffset Timestamp, long Sequence);
 }
