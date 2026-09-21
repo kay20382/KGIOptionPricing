@@ -34,7 +34,10 @@ public sealed class QueueCyclePricingPolicy
         decimal chaseDistance = maxChaseTicks * tickSize;
         decimal buyLimit = AlignDown(anchor + chaseDistance, tickSize);
         decimal sellLimit = AlignUp(anchor - chaseDistance, tickSize);
-        return new FrozenPriceBounds(anchor, tickSize, buyLimit, sellLimit);
+        var bounds = new FrozenPriceBounds(anchor, tickSize, buyLimit, sellLimit);
+        if (!IsValidBounds(bounds))
+            throw new ArgumentException("The derived frozen price bounds are inconsistent.", nameof(maxChaseTicks));
+        return bounds;
     }
 
     public QueuePriceDecision SelectInitial(
@@ -43,7 +46,9 @@ public sealed class QueueCyclePricingPolicy
         int targetAhead,
         FrozenPriceBounds bounds)
     {
-        if (!IsValidBook(book) || !IsValidBounds(bounds))
+        if (!IsValidBounds(bounds))
+            return Hold(0m, 0, 0, "InvalidBounds");
+        if (!IsValidBook(book, bounds.TickSize))
             return Hold(0m, 0, 0, "InvalidBook");
 
         decimal candidate = SelectForAheadTarget(side, book, Math.Max(0, targetAhead), bounds.TickSize);
@@ -69,7 +74,9 @@ public sealed class QueueCyclePricingPolicy
         FrozenPriceBounds bounds)
     {
         int normalizedSameAhead = Math.Max(0, samePriceAhead);
-        if (!IsValidBook(book) || !IsValidBounds(bounds) || currentPrice <= 0m)
+        if (!IsValidBounds(bounds))
+            return Hold(currentPrice, normalizedSameAhead, 0, "InvalidBounds");
+        if (!IsValidBook(book, bounds.TickSize) || currentPrice <= 0m)
             return Hold(currentPrice, normalizedSameAhead, 0, "InvalidBook");
 
         int betterQuantity = BetterPriceQuantity(side, book, currentPrice);
@@ -144,9 +151,14 @@ public sealed class QueueCyclePricingPolicy
         bounds.Anchor > 0m &&
         bounds.TickSize > 0m &&
         bounds.BuyLimit > 0m &&
-        bounds.SellLimit > 0m;
+        bounds.SellLimit > 0m &&
+        IsTickAligned(bounds.BuyLimit, bounds.TickSize) &&
+        IsTickAligned(bounds.SellLimit, bounds.TickSize) &&
+        bounds.BuyLimit >= bounds.Anchor &&
+        bounds.SellLimit <= bounds.Anchor &&
+        bounds.BuyLimit >= bounds.SellLimit;
 
-    private static bool IsValidBook(MarketEvent book)
+    private static bool IsValidBook(MarketEvent book, decimal tickSize)
     {
         if (book is null || book.Kind != MarketEventKind.Book ||
             book.BidPrices.Length == 0 || book.AskPrices.Length == 0 ||
@@ -157,14 +169,16 @@ public sealed class QueueCyclePricingPolicy
 
         for (int i = 0; i < book.BidPrices.Length; i++)
         {
-            if (book.BidPrices[i] <= 0m || book.BidQuantities[i] < 0 ||
+            if (book.BidPrices[i] <= 0m || !IsTickAligned(book.BidPrices[i], tickSize) ||
+                book.BidQuantities[i] < 0 ||
                 (i > 0 && book.BidPrices[i] >= book.BidPrices[i - 1]))
                 return false;
         }
 
         for (int i = 0; i < book.AskPrices.Length; i++)
         {
-            if (book.AskPrices[i] <= 0m || book.AskQuantities[i] < 0 ||
+            if (book.AskPrices[i] <= 0m || !IsTickAligned(book.AskPrices[i], tickSize) ||
+                book.AskQuantities[i] < 0 ||
                 (i > 0 && book.AskPrices[i] <= book.AskPrices[i - 1]))
                 return false;
         }
@@ -177,6 +191,9 @@ public sealed class QueueCyclePricingPolicy
 
     private static decimal AlignUp(decimal price, decimal tickSize) =>
         decimal.Ceiling(price / tickSize) * tickSize;
+
+    private static bool IsTickAligned(decimal price, decimal tickSize) =>
+        tickSize > 0m && price % tickSize == 0m;
 
     private static QueuePriceDecision Hold(
         decimal currentPrice,
