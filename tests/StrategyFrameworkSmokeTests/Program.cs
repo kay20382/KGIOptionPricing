@@ -48,6 +48,76 @@ Assert(lifecycle.ClientOrderId == "cycle-1-buy-g1" &&
        lifecycle.State == OrderLifecycleState.Working && lifecycle.Price == 100m &&
        lifecycle.Quantity == 1 && lifecycle.RemainingQuantity == 1,
     "單張委託生命週期必須保留前後狀態、價格、數量與策略用戶端識別");
+
+var managedBroker = new CrossPricePaperExecutionService();
+var managedProbe = new ManagedProbeStrategy("managed-route");
+using (var managedRunner = new StrategyInstanceRunner(
+    managedProbe,
+    new ResolvedStrategyUniverse { Tradable = Product("225MC", "MGR", 5m, 10m) },
+    new PaperPortfolioLedger(), new SystemStrategyClock(), 0m, managedBroker))
+{
+    managedProbe.Request("buy-g1", BuySell.Buy, 100m);
+    Assert(managedBroker.GetWorkingOrders("managed-route").Single().ClientOrderId == "buy-g1",
+        "紙上執行器保存工作委託時不得遺失 ClientOrderId");
+    managedProbe.Cancel("buy-g1");
+    Assert(managedProbe.Lifecycle.Select(x => x.State).SequenceEqual(new[]
+        {
+            OrderLifecycleState.Submitted, OrderLifecycleState.Working,
+            OrderLifecycleState.CancelPending, OrderLifecycleState.Cancelled
+        }),
+        "共用執行器必須依序回報單張送出、工作、刪單中與已刪除");
+    Assert(managedProbe.Lifecycle.All(x => x.StrategyInstanceId == "managed-route" &&
+        x.ClientOrderId == "buy-g1"), "生命週期不得遺失策略 instance 或 ClientOrderId");
+    int lifecycleCount = managedProbe.Lifecycle.Count;
+    Assert(!managedBroker.CancelByClientOrderId("managed-route", "buy-g1") &&
+           !managedBroker.CancelByClientOrderId("managed-route", "missing") &&
+           managedProbe.Lifecycle.Count == lifecycleCount,
+        "不存在或已終止的 ClientOrderId 不得偽造撤單確認");
+}
+
+var managedFillBroker = new CrossPricePaperExecutionService();
+var managedFillProbe = new ManagedProbeStrategy("managed-fill");
+using (var managedFillRunner = new StrategyInstanceRunner(
+    managedFillProbe,
+    new ResolvedStrategyUniverse { Tradable = Product("225MC", "MGF", 5m, 10m) },
+    new PaperPortfolioLedger(), new SystemStrategyClock(), 0m, managedFillBroker))
+{
+    managedFillProbe.Request("buy-fill-g1", BuySell.Buy, 100m);
+    managedFillRunner.OnMarketEvent(Trade("MGF", "225MC", 100m, 1, DateTimeOffset.UtcNow));
+    Assert(managedFillProbe.Executions.Count == 0, "BrokerLimit 只觸價時不應成交");
+    managedFillRunner.OnMarketEvent(Trade("MGF", "225MC", 95m, 2, DateTimeOffset.UtcNow.AddSeconds(1)));
+    Assert(managedFillProbe.Lifecycle.Select(x => x.State).SequenceEqual(new[]
+        { OrderLifecycleState.Submitted, OrderLifecycleState.Working, OrderLifecycleState.Filled }),
+        "BrokerLimit 穿價後必須回報完整成交生命週期");
+    Assert(managedFillProbe.Executions.Count == 1 &&
+           managedFillProbe.Executions[0].ClientOrderId == "buy-fill-g1",
+        "BrokerLimit 成交必須保留 ClientOrderId");
+}
+
+var sharedManagedBroker = new CrossPricePaperExecutionService();
+var firstManagedProbe = new ManagedProbeStrategy("managed-first", "MG1");
+var secondManagedProbe = new ManagedProbeStrategy("managed-second", "MG2");
+using (var firstManagedRunner = new StrategyInstanceRunner(
+    firstManagedProbe,
+    new ResolvedStrategyUniverse { Tradable = Product("225MC", "MG1", 5m, 10m) },
+    new PaperPortfolioLedger(), new SystemStrategyClock(), 0m, sharedManagedBroker))
+using (var secondManagedRunner = new StrategyInstanceRunner(
+    secondManagedProbe,
+    new ResolvedStrategyUniverse { Tradable = Product("225MC", "MG2", 5m, 10m) },
+    new PaperPortfolioLedger(), new SystemStrategyClock(), 0m, sharedManagedBroker))
+{
+    firstManagedProbe.Request("same-client-id", BuySell.Buy, 100m);
+    secondManagedProbe.Request("same-client-id", BuySell.Buy, 100m);
+    firstManagedProbe.Cancel("same-client-id");
+    Assert(firstManagedProbe.Lifecycle.Last().State == OrderLifecycleState.Cancelled &&
+           secondManagedProbe.Lifecycle.Select(x => x.State).SequenceEqual(new[]
+               { OrderLifecycleState.Submitted, OrderLifecycleState.Working }),
+        "單張撤單必須以 StrategyInstanceId 與 ClientOrderId 精確隔離");
+    firstManagedProbe.Request("first-fill", BuySell.Buy, 100m);
+    sharedManagedBroker.OnMarketEvent(Trade("MG1", "225MC", 95m, 3, DateTimeOffset.UtcNow));
+    Assert(firstManagedProbe.Executions.Count == 1 && secondManagedProbe.Executions.Count == 0,
+        "共用執行器的成交事件只能路由至擁有該委託的策略 instance");
+}
 Assert(correlatedOrder.ClientOrderId == "cycle-1-buy-g1" &&
        correlatedExecution.ClientOrderId == "cycle-1-buy-g1",
     "工作委託與成交事件必須保留策略用戶端識別");
@@ -436,4 +506,63 @@ sealed class FakeSource : IMarketEventSource
     public void Subscribe(IEnumerable<ResolvedProduct> products) { }
     public void Emit(MarketEvent marketEvent) => MarketEventReceived?.Invoke(marketEvent);
     public void Dispose() { }
+}
+
+sealed class ManagedProbeStrategy : ISimulationStrategy, IManagedOrderStrategy
+{
+    private readonly string _symbol;
+
+    public ManagedProbeStrategy(string instanceId, string? symbol = null)
+    {
+        InstanceId = instanceId;
+        _symbol = symbol ?? (instanceId == "managed-fill" ? "MGF" : "MGR");
+    }
+
+    public string StrategyType => "ManagedProbe";
+    public string InstanceId { get; }
+    public StrategyLifecycleState State { get; private set; } = StrategyLifecycleState.Created;
+    public List<OrderLifecycleEvent> Lifecycle { get; } = new();
+    public List<ExecutionEvent> Executions { get; } = new();
+
+    public event Action<PaperOrderRequest>? OrderRequested;
+    public event Action? CancelAllRequested;
+    public event Action<StrategySnapshot>? SnapshotChanged;
+    public event Action<string>? CancelOrderRequested;
+
+    public void Request(string clientOrderId, BuySell side, decimal price) => OrderRequested?.Invoke(new PaperOrderRequest
+    {
+        ClientOrderId = clientOrderId,
+        StrategyInstanceId = InstanceId,
+        Symbol = _symbol,
+        Side = side,
+        Type = PaperOrderType.BrokerLimit,
+        Role = side == BuySell.Buy ? PaperOrderRole.EntryLong : PaperOrderRole.EntryShort,
+        Price = price,
+        Quantity = 1
+    });
+
+    public void Cancel(string clientOrderId) => CancelOrderRequested?.Invoke(clientOrderId);
+    public void OnOrderLifecycle(OrderLifecycleEvent orderEvent) => Lifecycle.Add(orderEvent);
+    public void Start(StrategyRuntimeContext context)
+    {
+        State = StrategyLifecycleState.Ready;
+        SnapshotChanged?.Invoke(GetSnapshot());
+    }
+    public void OnMarketEvent(MarketEvent marketEvent) { }
+    public void OnExecution(ExecutionEvent execution) => Executions.Add(execution);
+    public void Pause(string reason) => State = StrategyLifecycleState.Suspended;
+    public void Resume() => State = StrategyLifecycleState.Ready;
+    public void Stop(string reason)
+    {
+        CancelAllRequested?.Invoke();
+        State = StrategyLifecycleState.Stopped;
+    }
+    public StrategySnapshot GetSnapshot() => new()
+    {
+        StrategyType = StrategyType,
+        InstanceId = InstanceId,
+        State = State,
+        Reason = "probe",
+        UpdatedAt = DateTimeOffset.UtcNow
+    };
 }
