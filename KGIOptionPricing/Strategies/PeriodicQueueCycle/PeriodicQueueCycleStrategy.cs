@@ -11,12 +11,23 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
     private QueueCycleOrderCoordinator? _coordinator;
     private DirectionAssessment? _lastAssessment;
     private MarketEvent? _lastBook;
+    private MarketEvent? _lastHealthyBook;
+    private DateTimeOffset? _lastObservedBookTimestamp;
+    private long _lastObservedBookSequence = long.MinValue;
     private string _reason = "尚未啟動";
     private int _oppositeDirectionSeconds;
     private long _lastOppositeUtcSecond = long.MinValue;
     private bool _paused;
     private bool _stopRequested;
     private string _stopReason = string.Empty;
+    private DateTimeOffset? _oneLegStartedAt;
+    private DateTimeOffset? _unhealthySince;
+    private DateTimeOffset? _cooldownUntil;
+    private PaperOrderRole? _pendingExitRole;
+    private string? _pendingExitReason;
+    private int _pendingCooldownSeconds;
+    private bool _exitRequested;
+    private decimal _fixedStopPrice;
 
     internal PeriodicQueueCycleStrategy(
         StrategyDefinition definition,
@@ -60,17 +71,77 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
             marketEvent.Kind != MarketEventKind.Book ||
             !string.Equals(marketEvent.Symbol, _context.Universe.Tradable.Symbol, StringComparison.OrdinalIgnoreCase))
             return;
+
+        if (_cooldownUntil.HasValue)
+        {
+            if (_context.Clock.Now < _cooldownUntil.Value)
+            {
+                State = _paused ? StrategyLifecycleState.Suspended : StrategyLifecycleState.Running;
+                _reason = "CoolingDown";
+                Publish();
+                return;
+            }
+
+            _cooldownUntil = null;
+            _coordinator.ResetAfterCooldown();
+            _directionWindow = new DirectionWindow(_context.Universe.Tradable.TickSize, _parameters);
+            State = _paused ? StrategyLifecycleState.Suspended : StrategyLifecycleState.WarmingUp;
+            _reason = "WarmupIncomplete";
+        }
         if (_paused && Position().NetQuantity == 0) return;
+
+        if (_lastObservedBookTimestamp.HasValue &&
+            (marketEvent.Timestamp < _lastObservedBookTimestamp.Value ||
+             marketEvent.Sequence <= _lastObservedBookSequence))
+            return;
+        _lastObservedBookTimestamp = marketEvent.Timestamp;
+        _lastObservedBookSequence = marketEvent.Sequence;
 
         _lastBook = marketEvent;
         bool added = _directionWindow.TryAdd(marketEvent, _context.Clock.Now);
         _lastAssessment = _directionWindow.Evaluate(
             _context.Clock.Now, _context.Universe.Tradable.TickSize, _parameters);
+        bool currentBookHealthy = added && !IsHealthFailure(_lastAssessment.PrimaryReasonCode);
+        if (currentBookHealthy) _lastHealthyBook = marketEvent;
+
+        PositionSnapshot position = Position();
+        if (position.NetQuantity != 0)
+        {
+            EnsureExposureTimingAndStop(position, _context.Clock.Now);
+            if (!currentBookHealthy)
+            {
+                _unhealthySince ??= _context.Clock.Now;
+                _coordinator.BeginRiskCancellation(_lastAssessment.PrimaryReasonCode);
+                decimal unhealthySeconds = (decimal)(_context.Clock.Now - _unhealthySince.Value).TotalSeconds;
+                if (unhealthySeconds >= _parameters.MarketDataRecoverySeconds)
+                    BeginRiskExit(PaperOrderRole.Flatten, "MarketDataRecoveryTimeout", _parameters.ShockCooldownSeconds);
+                else
+                    _reason = _lastAssessment.PrimaryReasonCode;
+                TryAdvanceRiskExit();
+                SetProtectedState();
+                Publish();
+                return;
+            }
+
+            _unhealthySince = null;
+            if (_pendingExitRole is null && IsFixedStopHit(position, marketEvent))
+                BeginRiskExit(PaperOrderRole.StopLoss, "FixedStopLoss", _parameters.StopLossCooldownSeconds);
+            else if (_pendingExitRole is null && _oneLegStartedAt.HasValue &&
+                     (_context.Clock.Now - _oneLegStartedAt.Value).TotalSeconds >= _parameters.MaxOneLegSeconds)
+                BeginRiskExit(PaperOrderRole.Flatten, "OneLegTimeout", _parameters.CycleCooldownSeconds);
+
+            if (_pendingExitRole is not null)
+            {
+                TryAdvanceRiskExit();
+                SetProtectedState();
+                Publish();
+                return;
+            }
+        }
 
         if (_coordinator.Phase is QueueCyclePhase.WorkingBoth or QueueCyclePhase.WorkingOneLeg or
             QueueCyclePhase.CancellingForReprice or QueueCyclePhase.CancellingForExit)
         {
-            bool currentBookHealthy = added && !IsHealthFailure(_lastAssessment.PrimaryReasonCode);
             if (currentBookHealthy && ManagePreFillReversal(marketEvent.Timestamp))
             {
                 State = _coordinator.IsFaulted
@@ -132,6 +203,14 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
         _oppositeDirectionSeconds = 0;
         _reason = _coordinator?.ReasonCode ?? _reason;
         if (_coordinator?.IsFaulted == true) State = StrategyLifecycleState.Faulted;
+        if (execution.Role is PaperOrderRole.EntryLong or PaperOrderRole.EntryShort)
+        {
+            PositionSnapshot position = Position();
+            if (position.NetQuantity != 0)
+                EnsureExposureTimingAndStop(position, execution.Timestamp);
+        }
+        TryAdvanceRiskExit();
+        TryCompleteCycle();
         TryCompleteStop();
         Publish();
     }
@@ -142,6 +221,8 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
         _coordinator?.OnOrderLifecycle(orderEvent);
         _reason = _coordinator?.ReasonCode ?? _reason;
         if (_coordinator?.IsFaulted == true) State = StrategyLifecycleState.Faulted;
+        TryAdvanceRiskExit();
+        TryCompleteCycle();
         TryCompleteStop();
         Publish();
     }
@@ -185,7 +266,10 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
         _stopRequested = true;
         _paused = true;
         _stopReason = string.IsNullOrWhiteSpace(reason) ? "策略已停止" : reason;
-        _coordinator?.CancelAllWorking("StopRequested");
+        if (Position().NetQuantity != 0)
+            BeginRiskExit(PaperOrderRole.Flatten, "StopRequested", 0);
+        else
+            _coordinator?.CancelAllWorking("StopRequested");
         if (_coordinator?.IsFaulted == true)
         {
             State = StrategyLifecycleState.Faulted;
@@ -195,6 +279,7 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
         {
             State = StrategyLifecycleState.Suspended;
             _reason = "StopPending";
+            TryAdvanceRiskExit();
             TryCompleteStop();
         }
         Publish();
@@ -221,6 +306,7 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
             Range = _lastAssessment?.PathTicks ?? 0m,
             BuyEntry = bounds?.BuyLimit ?? 0m,
             SellEntry = bounds?.SellLimit ?? 0m,
+            StopPrice = _fixedStopPrice,
             Position = position.NetQuantity,
             RealizedPnl = position.RealizedPnl,
             UnrealizedPnl = position.UnrealizedPnl,
@@ -271,6 +357,105 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
         if (_coordinator?.HasOutstandingOrders == true || Position().NetQuantity != 0) return;
         State = StrategyLifecycleState.Stopped;
         _reason = _stopReason;
+    }
+
+    private void EnsureExposureTimingAndStop(PositionSnapshot position, DateTimeOffset timestamp)
+    {
+        _oneLegStartedAt ??= timestamp;
+        if (_context is null || _fixedStopPrice > 0m || position.AveragePrice <= 0m) return;
+        decimal distance = _parameters.StopLossTicks * _context.Universe.Tradable.TickSize;
+        _fixedStopPrice = position.NetQuantity > 0
+            ? position.AveragePrice - distance
+            : position.AveragePrice + distance;
+    }
+
+    private bool IsFixedStopHit(PositionSnapshot position, MarketEvent book)
+    {
+        if (_fixedStopPrice <= 0m) return false;
+        return position.NetQuantity > 0
+            ? book.BestBid <= _fixedStopPrice
+            : book.BestAsk >= _fixedStopPrice;
+    }
+
+    private void BeginRiskExit(PaperOrderRole role, string reasonCode, int cooldownSeconds)
+    {
+        if (_coordinator is null || _pendingExitRole is not null) return;
+        _pendingExitRole = role;
+        _pendingExitReason = reasonCode;
+        _pendingCooldownSeconds = cooldownSeconds;
+        _reason = reasonCode;
+        _coordinator.BeginRiskCancellation(reasonCode);
+    }
+
+    private void TryAdvanceRiskExit()
+    {
+        if (_coordinator is null || _context is null || _pendingExitRole is null || State == StrategyLifecycleState.Faulted)
+            return;
+
+        PositionSnapshot position = Position();
+        if (position.NetQuantity == 0)
+        {
+            if (_stopRequested)
+            {
+                TryCompleteStop();
+                return;
+            }
+            if (_exitRequested)
+                EnterCooldown(_pendingCooldownSeconds);
+            else if (_coordinator.HasBothEntryFills)
+                EnterCooldown(_parameters.CycleCooldownSeconds);
+            return;
+        }
+        if (!_coordinator.EntryOrdersTerminal || _exitRequested) return;
+
+        MarketEvent? priceBook = _lastHealthyBook;
+        decimal price = position.NetQuantity > 0 ? priceBook?.BestBid ?? 0m : priceBook?.BestAsk ?? 0m;
+        if (price <= 0m) price = position.AveragePrice;
+        _exitRequested = _coordinator.TrySubmitExit(
+            position, _pendingExitRole.Value, price, _pendingExitReason ?? "RiskExit");
+        if (_exitRequested) _reason = _pendingExitReason ?? "RiskExit";
+    }
+
+    private void TryCompleteCycle()
+    {
+        if (_coordinator is null || _cooldownUntil.HasValue || Position().NetQuantity != 0) return;
+        if (_exitRequested && _pendingExitRole is not null)
+        {
+            if (!_coordinator.HasOutstandingOrders) EnterCooldown(_pendingCooldownSeconds);
+            return;
+        }
+        if (_coordinator.HasBothEntryFills && !_coordinator.HasOutstandingOrders)
+            EnterCooldown(_parameters.CycleCooldownSeconds);
+    }
+
+    private void EnterCooldown(int seconds)
+    {
+        if (_coordinator is null || _context is null || _cooldownUntil.HasValue) return;
+        _coordinator.EnterCooldown();
+        _cooldownUntil = _context.Clock.Now.AddSeconds(seconds);
+        _oneLegStartedAt = null;
+        _unhealthySince = null;
+        _pendingExitRole = null;
+        _pendingExitReason = null;
+        _pendingCooldownSeconds = 0;
+        _exitRequested = false;
+        _fixedStopPrice = 0m;
+        State = _paused ? StrategyLifecycleState.Suspended : StrategyLifecycleState.Running;
+        _reason = "CoolingDown";
+    }
+
+    private void SetProtectedState()
+    {
+        if (_coordinator?.IsFaulted == true)
+        {
+            State = StrategyLifecycleState.Faulted;
+            _reason = _coordinator.ReasonCode;
+        }
+        else
+        {
+            State = _paused ? StrategyLifecycleState.Suspended : StrategyLifecycleState.Running;
+            if (_pendingExitReason is not null) _reason = _pendingExitReason;
+        }
     }
 
     private static bool IsHealthFailure(string reasonCode) => reasonCode is

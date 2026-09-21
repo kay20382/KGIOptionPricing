@@ -50,6 +50,10 @@ internal sealed class QueueCycleOrderCoordinator
     private readonly HashSet<string> _retiredFilledClientOrderIds = new(StringComparer.Ordinal);
     private OrderLeg? _buy;
     private OrderLeg? _sell;
+    private string? _exitClientOrderId;
+    private LegState _exitState = LegState.Cancelled;
+    private PaperOrderRole? _exitRole;
+    private long _exitSequence;
 
     internal QueueCycleOrderCoordinator(
         string instanceId,
@@ -70,10 +74,14 @@ internal sealed class QueueCycleOrderCoordinator
     internal bool IsFaulted => Phase == QueueCyclePhase.Faulted;
     internal bool BothUnfilled => _buy is not null && _sell is not null &&
         !_buy.HasFill && !_sell.HasFill;
-    internal bool HasOutstandingOrders => IsOutstanding(_buy) || IsOutstanding(_sell);
+    internal bool HasOutstandingOrders => IsOutstanding(_buy) || IsOutstanding(_sell) ||
+        (_exitClientOrderId is not null && _exitState is LegState.Working or LegState.CancelPending);
+    internal bool EntryOrdersTerminal => !IsOutstanding(_buy) && !IsOutstanding(_sell);
+    internal bool HasBothEntryFills => _buy?.HasFill == true && _sell?.HasFill == true;
     internal string CycleSummary =>
         $"Cycle={_buy?.CycleId ?? "none"};Direction={FrozenDirection};" +
-        $"Buy={LegSummary(_buy)};Sell={LegSummary(_sell)}";
+        $"Buy={LegSummary(_buy)};Sell={LegSummary(_sell)};" +
+        $"Exit={_exitClientOrderId ?? "none"},{_exitRole?.ToString() ?? "none"},{_exitState}";
 
     internal event Action<PaperOrderRequest>? OrderRequested;
     internal event Action<string>? CancelOrderRequested;
@@ -151,9 +159,78 @@ internal sealed class QueueCycleOrderCoordinator
         return true;
     }
 
+    internal void BeginRiskCancellation(string reasonCode)
+    {
+        if (IsFaulted) return;
+        Phase = QueueCyclePhase.CancellingForExit;
+        ReasonCode = reasonCode;
+        CancelWithoutReplacement(_buy, CancelIntent.Exit);
+        CancelWithoutReplacement(_sell, CancelIntent.Exit);
+    }
+
+    internal bool TrySubmitExit(PositionSnapshot position, PaperOrderRole role, decimal price, string reasonCode)
+    {
+        if (IsFaulted || !EntryOrdersTerminal || _exitClientOrderId is not null ||
+            position.NetQuantity == 0 || price <= 0m)
+            return false;
+
+        _exitClientOrderId = $"{_instanceId}-cycle-{CycleNumber}-exit-{++_exitSequence}";
+        _exitState = LegState.Working;
+        _exitRole = role;
+        Phase = QueueCyclePhase.Flattening;
+        ReasonCode = reasonCode;
+        OrderRequested?.Invoke(new PaperOrderRequest
+        {
+            ClientOrderId = _exitClientOrderId,
+            StrategyInstanceId = _instanceId,
+            Symbol = _symbol,
+            Side = position.NetQuantity > 0 ? BuySell.Sell : BuySell.Buy,
+            Type = PaperOrderType.Market,
+            Role = role,
+            Price = price,
+            Quantity = Math.Abs(position.NetQuantity)
+        });
+        return true;
+    }
+
+    internal void EnterCooldown()
+    {
+        Retire(_buy);
+        Retire(_sell);
+        if (_exitClientOrderId is not null)
+        {
+            _retiredClientOrderIds.Add(_exitClientOrderId);
+            if (_exitState == LegState.Filled) _retiredFilledClientOrderIds.Add(_exitClientOrderId);
+        }
+        _buy = null;
+        _sell = null;
+        _exitClientOrderId = null;
+        _exitState = LegState.Cancelled;
+        _exitRole = null;
+        FrozenDirection = CycleDirection.Neutral;
+        FrozenAssessment = null;
+        FrozenBounds = null;
+        Phase = QueueCyclePhase.CoolingDown;
+        ReasonCode = "CoolingDown";
+    }
+
+    internal void ResetAfterCooldown()
+    {
+        if (Phase != QueueCyclePhase.CoolingDown) return;
+        Phase = QueueCyclePhase.Ready;
+        ReasonCode = "WarmupIncomplete";
+    }
+
     internal void OnExecution(ExecutionEvent execution)
     {
         if (execution.Quantity <= 0) return;
+        if (string.Equals(_exitClientOrderId, execution.ClientOrderId, StringComparison.Ordinal))
+        {
+            if (_exitState == LegState.Filled) return;
+            _exitState = LegState.Filled;
+            Phase = QueueCyclePhase.Flattening;
+            return;
+        }
         if (_retiredClientOrderIds.Contains(execution.ClientOrderId))
         {
             FaultForRetiredFill(execution.ClientOrderId);
@@ -192,6 +269,31 @@ internal sealed class QueueCycleOrderCoordinator
 
     internal void OnOrderLifecycle(OrderLifecycleEvent orderEvent)
     {
+        if (string.Equals(_exitClientOrderId, orderEvent.ClientOrderId, StringComparison.Ordinal))
+        {
+            switch (orderEvent.State)
+            {
+                case OrderLifecycleState.Filled:
+                    _exitState = LegState.Filled;
+                    return;
+                case OrderLifecycleState.CancelPending:
+                    _exitState = LegState.CancelPending;
+                    return;
+                case OrderLifecycleState.Cancelled:
+                case OrderLifecycleState.Rejected:
+                    _exitState = LegState.Cancelled;
+                    Phase = QueueCyclePhase.Faulted;
+                    ReasonCode = orderEvent.State == OrderLifecycleState.Rejected
+                        ? "ExitOrderRejected"
+                        : "ExitOrderCancelled";
+                    return;
+                case OrderLifecycleState.Working:
+                case OrderLifecycleState.Submitted:
+                case OrderLifecycleState.PartiallyFilled:
+                    _exitState = LegState.Working;
+                    return;
+            }
+        }
         if (orderEvent.State == OrderLifecycleState.Filled &&
             _retiredClientOrderIds.Contains(orderEvent.ClientOrderId))
         {
@@ -344,6 +446,8 @@ internal sealed class QueueCycleOrderCoordinator
         if (leg is null) return;
         foreach (string clientOrderId in leg.ClientOrderIds)
             _retiredClientOrderIds.Add(clientOrderId);
+        foreach (string clientOrderId in leg.FilledClientOrderIds)
+            _retiredFilledClientOrderIds.Add(clientOrderId);
     }
 
     private void UpdateWorkingPhase()
