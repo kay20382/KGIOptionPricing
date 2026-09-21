@@ -178,6 +178,9 @@ public sealed class StrategyInstanceRunner : IDisposable
     public void Dispose()
     {
         if (_disposed) return;
+        // The live broker is fail-closed. Dispose it before mutating runner
+        // state or detaching routes so a failure leaves late fills observable.
+        if (_broker is IDisposable disposable) disposable.Dispose();
         Stop("執行個體已釋放");
         _disposed = true;
         _strategy.OrderRequested -= OnOrderRequested;
@@ -186,7 +189,6 @@ public sealed class StrategyInstanceRunner : IDisposable
         _broker.Filled -= OnFilled;
         if (_managedStrategy != null) _managedStrategy.CancelOrderRequested -= OnCancelOrderRequested;
         if (_managedBroker != null) _managedBroker.OrderLifecycleChanged -= OnOrderLifecycleChanged;
-        if (_broker is IDisposable disposable) disposable.Dispose();
     }
 }
 
@@ -256,13 +258,12 @@ public sealed class StrategyHost : IDisposable
     {
         StrategyInstanceRunner? runner;
         lock (_sync)
-        {
             runner = _runners.FirstOrDefault(x => string.Equals(x.InstanceId, instanceId, StringComparison.OrdinalIgnoreCase));
-            if (runner != null) _runners.Remove(runner);
-        }
         if (runner == null) return false;
+        // Dispose may fail while a live order is still active. Remove only
+        // after success so the runner continues routing late fills.
         runner.Dispose();
-        return true;
+        lock (_sync) return _runners.Remove(runner);
     }
 
     public void StopAll(string reason = "全部停止")

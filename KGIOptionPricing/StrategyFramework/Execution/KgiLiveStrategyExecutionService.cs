@@ -10,6 +10,11 @@ namespace KGIOptionPricing.StrategyFramework.Execution;
 /// </summary>
 public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionService, IDisposable
 {
+    // Bounds memory while preserving a practical cancel/fill race window.
+    // Callbacks arriving more than ten minutes after terminal state are ignored;
+    // those extreme delays must be reconciled from broker order/deal reports.
+    private static readonly TimeSpan TerminalRetention = TimeSpan.FromMinutes(10);
+
     private sealed class TrackedRealOrder
     {
         public required PaperOrder Order { get; init; }
@@ -20,6 +25,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         public int DeliveredFilledQuantity { get; set; }
         public string BrokerOrderId { get; set; } = string.Empty;
         public bool Terminal { get; set; }
+        public DateTimeOffset? TerminalAt { get; set; }
         public bool FailurePublished { get; set; }
         public bool IsManaged => !string.IsNullOrWhiteSpace(Order.ClientOrderId);
     }
@@ -30,6 +36,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
     private readonly string _quoteSymbol;
     private readonly InstrumentKey _instrument;
     private readonly decimal _commission;
+    private readonly Func<DateTimeOffset> _now;
     private readonly Dictionary<string, PaperOrder> _conditions = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, TrackedRealOrder> _realOrders = new(StringComparer.OrdinalIgnoreCase);
     private long _localSequence;
@@ -42,7 +49,14 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
     public event Action? StateChanged;
     public int ActiveBrokerOrderCount
     {
-        get { lock (_sync) return _realOrders.Values.Count(x => !x.Terminal); }
+        get
+        {
+            lock (_sync)
+            {
+                PurgeExpiredTerminalsLocked(_now());
+                return _realOrders.Values.Count(x => !x.Terminal);
+            }
+        }
     }
     public int LocalConditionCount { get { lock (_sync) return _conditions.Count; } }
 
@@ -53,7 +67,8 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         ResolvedProduct product,
         ContractInfo contract,
         decimal commissionPerContract)
-        : this(new OrderManagerLiveStrategyOrderGateway(orders, trade), instanceId, product, contract, commissionPerContract)
+        : this(new OrderManagerLiveStrategyOrderGateway(orders, trade), instanceId, product, contract,
+            commissionPerContract, null)
     {
     }
 
@@ -62,12 +77,14 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         string instanceId,
         ResolvedProduct product,
         ContractInfo contract,
-        decimal commissionPerContract)
+        decimal commissionPerContract,
+        Func<DateTimeOffset>? now = null)
     {
         _gateway = gateway ?? throw new ArgumentNullException(nameof(gateway));
         _instanceId = instanceId;
         _quoteSymbol = product.Symbol;
         _commission = Math.Max(0m, commissionPerContract);
+        _now = now ?? (() => DateTimeOffset.Now);
         _instrument = LiveStrategyOrderMapper.ToInstrument(contract);
         _gateway.OrderFilled += OnOrderFilled;
         _gateway.OrderFailed += OnOrderFailed;
@@ -78,6 +95,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
     public PaperOrder Submit(PaperOrderRequest request, DateTimeOffset now)
     {
         if (_disposed) throw new ObjectDisposedException(nameof(KgiLiveStrategyExecutionService));
+        lock (_sync) PurgeExpiredTerminalsLocked(_now());
         if (!_gateway.IsLoggedIn) throw new InvalidOperationException("交易服務尚未登入，禁止實盤送單。");
         if (!string.Equals(request.StrategyInstanceId, _instanceId, StringComparison.OrdinalIgnoreCase))
             throw new InvalidOperationException("策略實例與實盤執行器不一致。");
@@ -122,6 +140,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         string? realId;
         lock (_sync)
         {
+            PurgeExpiredTerminalsLocked(_now());
             removedCondition = _conditions.Remove(orderId);
             realId = removedCondition
                 ? null
@@ -144,6 +163,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         string? realId;
         lock (_sync)
         {
+            PurgeExpiredTerminalsLocked(_now());
             string[] matches = _realOrders
                 .Where(x => !x.Value.Terminal &&
                             string.Equals(x.Value.Order.StrategyInstanceId, strategyInstanceId, StringComparison.OrdinalIgnoreCase) &&
@@ -163,6 +183,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         int conditionCount;
         lock (_sync)
         {
+            PurgeExpiredTerminalsLocked(_now());
             conditionCount = _conditions.Count;
             _conditions.Clear();
             realIds = _realOrders.Where(x => !x.Value.Terminal).Select(x => x.Key).ToArray();
@@ -176,9 +197,12 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
     {
         if (!string.Equals(strategyInstanceId, _instanceId, StringComparison.OrdinalIgnoreCase)) return Array.Empty<PaperOrder>();
         lock (_sync)
+        {
+            PurgeExpiredTerminalsLocked(_now());
             return _conditions.Values
                 .Concat(_realOrders.Values.Where(x => !x.Terminal).Select(x => x.Order))
                 .ToArray();
+        }
     }
 
     public void OnMarketEvent(MarketEvent marketEvent)
@@ -216,7 +240,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
             Price = 1m,
             Quantity = 1,
             State = PaperOrderState.Working,
-            CreatedAt = DateTimeOffset.Now
+            CreatedAt = _now()
         };
         SendMarket(order, 0m);
     }
@@ -227,6 +251,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
             request, _instrument, _gateway.BrokerId, _gateway.Account, order.OrderId);
         lock (_sync)
         {
+            PurgeExpiredTerminalsLocked(_now());
             if (_realOrders.Values.Any(x => string.Equals(
                     x.Order.ClientOrderId, request.ClientOrderId, StringComparison.OrdinalIgnoreCase)))
                 throw new InvalidOperationException($"ClientOrderId 已存在：{request.ClientOrderId}");
@@ -245,7 +270,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         }
         catch (Exception ex)
         {
-            PublishTransition(order.OrderId, OrderLifecycleState.Rejected, null, "SubmitException", DateTimeOffset.Now);
+            PublishTransition(order.OrderId, OrderLifecycleState.Rejected, null, "SubmitException", _now());
             PublishFailureOnce(order.OrderId, "實盤限價單送單例外：" + ex.GetBaseException().Message);
         }
     }
@@ -297,12 +322,13 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         bool managed;
         lock (_sync)
         {
+            PurgeExpiredTerminalsLocked(_now());
             if (!_realOrders.TryGetValue(realId, out TrackedRealOrder? tracked) || tracked.Terminal ||
                 tracked.LifecycleState == OrderLifecycleState.CancelPending) return false;
             managed = tracked.IsManaged;
             if (managed)
                 lifecycle = CreateTransitionLocked(tracked, OrderLifecycleState.CancelPending, null,
-                    "CancelRequested", DateTimeOffset.Now);
+                    "CancelRequested", _now());
         }
         PublishLifecycle(lifecycle);
 
@@ -327,6 +353,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         bool legacyTerminal = false;
         lock (_sync)
         {
+            PurgeExpiredTerminalsLocked(_now());
             if (!_realOrders.TryGetValue(brokerOrder.OrderId, out TrackedRealOrder? tracked)) return;
             UpdateBrokerOrderId(tracked, brokerOrder);
 
@@ -344,7 +371,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
             execution = new ExecutionEvent
             {
                 Sequence = Interlocked.Increment(ref _executionSequence),
-                Timestamp = DateTimeOffset.Now,
+                Timestamp = _now(),
                 StrategyInstanceId = _instanceId,
                 ClientOrderId = tracked.Order.ClientOrderId,
                 OrderId = brokerOrder.OrderId,
@@ -365,7 +392,8 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
                     partial ? OrderLifecycleState.PartiallyFilled : OrderLifecycleState.Filled,
                     brokerOrder,
                     partial ? "PartiallyFilled" : "Filled",
-                    DateTimeOffset.Now);
+                    _now(),
+                    allowLateFill: true);
             else if (!partial)
             {
                 _realOrders.Remove(brokerOrder.OrderId);
@@ -387,11 +415,13 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         bool legacyRemoved = false;
         lock (_sync)
         {
+            PurgeExpiredTerminalsLocked(_now());
             if (!_realOrders.TryGetValue(brokerOrder.OrderId, out TrackedRealOrder? tracked)) return;
+            if (tracked.Terminal) return;
             UpdateBrokerOrderId(tracked, brokerOrder);
             if (tracked.IsManaged)
                 lifecycle = CreateTransitionLocked(tracked, OrderLifecycleState.Rejected, brokerOrder,
-                    "Rejected", DateTimeOffset.Now);
+                    "Rejected", _now());
             else
                 legacyRemoved = _realOrders.Remove(brokerOrder.OrderId);
             if (!tracked.FailurePublished)
@@ -409,8 +439,18 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
     {
         if (_disposed) return;
         bool owned;
-        lock (_sync) owned = _realOrders.TryGetValue(brokerOrder.OrderId, out TrackedRealOrder? tracked) && !tracked.Terminal;
+        OrderLifecycleEvent? lifecycle = null;
+        lock (_sync)
+        {
+            PurgeExpiredTerminalsLocked(_now());
+            owned = _realOrders.TryGetValue(brokerOrder.OrderId, out TrackedRealOrder? tracked) && !tracked.Terminal;
+            if (owned && tracked!.IsManaged && tracked.LifecycleState == OrderLifecycleState.CancelPending)
+                lifecycle = CreateTransitionLocked(tracked, OrderLifecycleState.Working, brokerOrder,
+                    "CancelFailed", _now(), allowCancelFailureRecovery: true);
+        }
+        if (lifecycle != null) OrderLifecycleChanged?.Invoke(lifecycle);
         if (owned) Failed?.Invoke($"實盤刪單失敗：{reason}");
+        if (lifecycle != null) StateChanged?.Invoke();
     }
 
     private void OnOrderChanged(OrderInfo brokerOrder)
@@ -421,6 +461,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         bool legacyChanged = false;
         lock (_sync)
         {
+            PurgeExpiredTerminalsLocked(_now());
             if (!_realOrders.TryGetValue(brokerOrder.OrderId, out TrackedRealOrder? tracked)) return;
             UpdateBrokerOrderId(tracked, brokerOrder);
             if (!tracked.IsManaged)
@@ -430,33 +471,34 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
             }
             else
             {
-                // A terminal tombstone may only advance because of a real late fill.
-                if (tracked.Terminal && brokerOrder.Status != OrderStatus.Filled) return;
+                // A terminal tombstone advances only in OnOrderFilled, which
+                // guarantees the execution reaches the ledger first.
+                if (tracked.Terminal) return;
                 switch (brokerOrder.Status)
                 {
                     case OrderStatus.Accepted:
                         lifecycle = CreateTransitionLocked(tracked, OrderLifecycleState.Working, brokerOrder,
-                            "Working", DateTimeOffset.Now);
+                            "Working", _now());
                         break;
                     case OrderStatus.CancelPending:
                         lifecycle = CreateTransitionLocked(tracked, OrderLifecycleState.CancelPending, brokerOrder,
-                            "CancelPending", DateTimeOffset.Now);
+                            "CancelPending", _now());
                         break;
                     case OrderStatus.PartiallyFilled:
                         lifecycle = CreateTransitionLocked(tracked, OrderLifecycleState.PartiallyFilled, brokerOrder,
-                            "PartiallyFilled", DateTimeOffset.Now);
+                            "PartiallyFilled", _now());
                         break;
                     case OrderStatus.Filled:
                         lifecycle = CreateTransitionLocked(tracked, OrderLifecycleState.Filled, brokerOrder,
-                            "Filled", DateTimeOffset.Now);
+                            "Filled", _now());
                         break;
                     case OrderStatus.Cancelled:
                         lifecycle = CreateTransitionLocked(tracked, OrderLifecycleState.Cancelled, brokerOrder,
-                            "Cancelled", DateTimeOffset.Now);
+                            "Cancelled", _now());
                         break;
                     case OrderStatus.Rejected:
                         lifecycle = CreateTransitionLocked(tracked, OrderLifecycleState.Rejected, brokerOrder,
-                            "Rejected", DateTimeOffset.Now);
+                            "Rejected", _now());
                         if (!tracked.FailurePublished)
                         {
                             tracked.FailurePublished = true;
@@ -483,6 +525,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         OrderLifecycleEvent? lifecycle;
         lock (_sync)
         {
+            PurgeExpiredTerminalsLocked(_now());
             if (!_realOrders.TryGetValue(realId, out TrackedRealOrder? tracked)) return;
             lifecycle = CreateTransitionLocked(tracked, state, brokerOrder, reasonCode, timestamp);
         }
@@ -494,7 +537,9 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         OrderLifecycleState state,
         OrderInfo? brokerOrder,
         string reasonCode,
-        DateTimeOffset timestamp)
+        DateTimeOffset timestamp,
+        bool allowLateFill = false,
+        bool allowCancelFailureRecovery = false)
     {
         UpdateBrokerOrderId(tracked, brokerOrder);
         int filled = brokerOrder == null ? tracked.FilledQuantity : Math.Max(tracked.FilledQuantity, brokerOrder.FilledQty);
@@ -502,10 +547,15 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
             ? brokerOrder.LeavesQty
             : tracked.RemainingQuantity;
         bool terminal = state is OrderLifecycleState.Filled or OrderLifecycleState.Cancelled or OrderLifecycleState.Rejected;
+        if (!CanTransition(tracked, state, allowLateFill, allowCancelFailureRecovery)) return null;
         if (tracked.LifecycleState == state &&
             tracked.FilledQuantity == filled && tracked.RemainingQuantity == remaining)
         {
-            if (terminal) tracked.Terminal = true;
+            if (terminal)
+            {
+                tracked.Terminal = true;
+                tracked.TerminalAt = timestamp;
+            }
             return null;
         }
 
@@ -513,7 +563,8 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         tracked.LifecycleState = state;
         tracked.FilledQuantity = filled;
         tracked.RemainingQuantity = remaining;
-        tracked.Terminal = terminal;
+        tracked.Terminal = tracked.Terminal || terminal;
+        if (terminal) tracked.TerminalAt = timestamp;
         return new OrderLifecycleEvent
         {
             Timestamp = timestamp,
@@ -543,6 +594,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         bool publish;
         lock (_sync)
         {
+            PurgeExpiredTerminalsLocked(_now());
             publish = _realOrders.TryGetValue(realId, out TrackedRealOrder? tracked) && !tracked.FailurePublished;
             if (publish) tracked!.FailurePublished = true;
         }
@@ -563,11 +615,55 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         return order.Identity.Cnt;
     }
 
+    private static bool CanTransition(
+        TrackedRealOrder tracked,
+        OrderLifecycleState next,
+        bool allowLateFill,
+        bool allowCancelFailureRecovery)
+    {
+        if (tracked.Terminal)
+            return allowLateFill && next is OrderLifecycleState.PartiallyFilled or OrderLifecycleState.Filled;
+        if (!tracked.LifecycleState.HasValue) return next == OrderLifecycleState.Submitted;
+        return tracked.LifecycleState.Value switch
+        {
+            OrderLifecycleState.Submitted => next is OrderLifecycleState.Working or
+                OrderLifecycleState.CancelPending or OrderLifecycleState.PartiallyFilled or
+                OrderLifecycleState.Filled or OrderLifecycleState.Cancelled or OrderLifecycleState.Rejected,
+            OrderLifecycleState.Working => next is OrderLifecycleState.CancelPending or
+                OrderLifecycleState.PartiallyFilled or OrderLifecycleState.Filled or
+                OrderLifecycleState.Cancelled or OrderLifecycleState.Rejected,
+            OrderLifecycleState.CancelPending =>
+                (allowCancelFailureRecovery && next == OrderLifecycleState.Working) ||
+                next is OrderLifecycleState.PartiallyFilled or OrderLifecycleState.Filled or
+                    OrderLifecycleState.Cancelled or OrderLifecycleState.Rejected,
+            OrderLifecycleState.PartiallyFilled => next is OrderLifecycleState.CancelPending or
+                OrderLifecycleState.PartiallyFilled or OrderLifecycleState.Filled or
+                OrderLifecycleState.Cancelled or OrderLifecycleState.Rejected,
+            _ => false
+        };
+    }
+
+    private void PurgeExpiredTerminalsLocked(DateTimeOffset now)
+    {
+        string[] expired = _realOrders
+            .Where(x => x.Value.Terminal && x.Value.TerminalAt.HasValue &&
+                        now - x.Value.TerminalAt.Value > TerminalRetention)
+            .Select(x => x.Key)
+            .ToArray();
+        foreach (string realId in expired) _realOrders.Remove(realId);
+    }
+
     public void Dispose()
     {
         if (_disposed) return;
-        CancelAll(_instanceId);
-        _disposed = true;
+        lock (_sync)
+        {
+            PurgeExpiredTerminalsLocked(_now());
+            int active = _realOrders.Values.Count(x => !x.Terminal);
+            if (active > 0)
+                throw new InvalidOperationException($"仍有 {active} 張實盤委託未終結，禁止釋放執行器。");
+            _disposed = true;
+        }
         _gateway.OrderFilled -= OnOrderFilled;
         _gateway.OrderFailed -= OnOrderFailed;
         _gateway.CancelFailed -= OnCancelFailed;

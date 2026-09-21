@@ -572,15 +572,159 @@ Assert(partialLifecycle.Last().State == OrderLifecycleState.PartiallyFilled &&
        partialLifecycle.Last().FilledQuantity == 1 && partialLifecycle.Last().RemainingQuantity == 1 &&
        partialExecutions.Count == 1 && partialService.ActiveBrokerOrderCount == 1,
     "部分成交必須回報準確累計／剩餘量且繼續列為工作單");
+partialGateway.EmitState(partialOrder.OrderId, OrderStatus.Cancelled, 1, 0);
 partialService.Dispose();
 Assert(partialService.ActiveBrokerOrderCount == 0 && partialService.LocalConditionCount == 0,
-    "Dispose 必須清除 live tombstone 與本地條件");
+    "委託終結後 Dispose 必須清除 tombstone 與本地條件");
 int partialLifecycleCountAfterDispose = partialLifecycle.Count;
-partialGateway.EmitState(partialOrder.OrderId, OrderStatus.Cancelled, 1, 0);
+partialGateway.EmitState(partialOrder.OrderId, OrderStatus.Rejected, 1, 0);
 Assert(partialLifecycle.Count == partialLifecycleCountAfterDispose,
     "Dispose 後必須解除 gateway callback 訂閱");
 
+// Dispose 必須 fail closed：有 active broker order 時不可清除追蹤或解除 callback。
+var disposeGateway = new FakeLiveStrategyOrderGateway();
+var disposeLifecycle = new List<OrderLifecycleEvent>();
+var disposeExecutions = new List<ExecutionEvent>();
+var disposeService = CreateLiveService(disposeGateway, "dispose-live");
+disposeService.OrderLifecycleChanged += disposeLifecycle.Add;
+disposeService.Filled += disposeExecutions.Add;
+PaperOrder disposeOrder = disposeService.Submit(
+    liveBuy with { StrategyInstanceId = "dispose-live", ClientOrderId = "dispose-g1" },
+    DateTimeOffset.UtcNow);
+AssertThrows<InvalidOperationException>(() => disposeService.Dispose(),
+    "尚有 active BrokerLimit 時 Dispose 必須 fail closed");
+Assert(disposeService.ActiveBrokerOrderCount == 1 &&
+       disposeService.GetWorkingOrders("dispose-live").Count == 1,
+    "Dispose 失敗後不得清除 active count 或工作單");
+disposeGateway.EmitFill(disposeOrder.OrderId, 1, 0, OrderStatus.Filled, 1, 65000d);
+Assert(disposeExecutions.Count == 1 && disposeLifecycle.Last().State == OrderLifecycleState.Filled &&
+       disposeService.ActiveBrokerOrderCount == 0,
+    "Dispose 失敗後仍須接收 late fill，並在成交後歸零 active count");
+disposeService.Dispose();
+
+// StrategyHost.Remove 必須在 broker Dispose 成功後才移除 runner 或解除路由。
+var hostGateway = new FakeLiveStrategyOrderGateway();
+var hostService = CreateLiveService(hostGateway, "host-live");
+using (var hostSource = new FakeHostMarketSource())
+using (var host = new StrategyHost(hostSource))
+{
+    var hostStrategy = new HostManagedProbeStrategy("host-live", "225MC");
+    host.Add(
+        hostStrategy,
+        new ResolvedStrategyUniverse
+        {
+            Tradable = new ResolvedProduct
+            {
+                ProductId = "225MC", Symbol = "225MC", TickSize = 5m, ContractMultiplier = 10m
+            }
+        },
+        36m,
+        hostService);
+    PaperOrderRequest hostRequest = liveBuy with
+    {
+        StrategyInstanceId = "host-live", ClientOrderId = "host-g1"
+    };
+    hostStrategy.Request(hostRequest);
+    PaperOrder hostOrder = hostService.GetWorkingOrders("host-live").Single();
+    AssertThrows<InvalidOperationException>(() => host.Remove("host-live"),
+        "Host Remove 必須傳遞 active broker 的 fail-closed Dispose");
+    Assert(host.GetSnapshots().Any(x => x.InstanceId == "host-live"),
+        "Remove 失敗後 runner 必須仍留在 host");
+    hostGateway.EmitFill(hostOrder.OrderId, 1, 0, OrderStatus.Filled, 1, 65000d);
+    Assert(hostStrategy.Executions.Count == 1 && hostStrategy.Lifecycle.Last().State == OrderLifecycleState.Filled,
+        "Remove 失敗後 runner 必須仍接收 late fill 與 lifecycle");
+    Assert(host.Remove("host-live") && host.GetSnapshots().All(x => x.InstanceId != "host-live"),
+        "broker 歸零後第二次 Remove 才可成功移除 runner");
+}
+
+// 非法倒退 callback 不得讓終結單或 CancelPending 回到錯誤狀態。
+var raceGateway = new FakeLiveStrategyOrderGateway();
+var raceLifecycle = new List<OrderLifecycleEvent>();
+var raceFailures = new List<string>();
+var raceService = CreateLiveService(raceGateway, "race-live");
+raceService.OrderLifecycleChanged += raceLifecycle.Add;
+raceService.Failed += raceFailures.Add;
+PaperOrder cancelledRace = raceService.Submit(
+    liveBuy with { StrategyInstanceId = "race-live", ClientOrderId = "race-cancelled" },
+    DateTimeOffset.UtcNow);
+raceGateway.EmitState(cancelledRace.OrderId, OrderStatus.Cancelled, 0, 0);
+int afterCancelled = raceLifecycle.Count;
+int failuresAfterCancelled = raceFailures.Count;
+raceGateway.EmitState(cancelledRace.OrderId, OrderStatus.Rejected, 0, 0, "late reject");
+Assert(raceLifecycle.Count == afterCancelled && raceFailures.Count == failuresAfterCancelled,
+    "Cancelled 後 late reject 不得發布 lifecycle 或 Failed");
+
+PaperOrder filledRace = raceService.Submit(
+    liveBuy with { StrategyInstanceId = "race-live", ClientOrderId = "race-filled" },
+    DateTimeOffset.UtcNow);
+raceGateway.EmitFill(filledRace.OrderId, 1, 0, OrderStatus.Filled, 1, 65000d);
+int afterFilled = raceLifecycle.Count;
+int failuresAfterFilled = raceFailures.Count;
+raceGateway.EmitState(filledRace.OrderId, OrderStatus.Rejected, 1, 0, "late reject");
+Assert(raceLifecycle.Count == afterFilled && raceFailures.Count == failuresAfterFilled,
+    "Filled 後 late reject 不得發布 lifecycle 或 Failed");
+
+PaperOrder pendingRace = raceService.Submit(
+    liveBuy with { StrategyInstanceId = "race-live", ClientOrderId = "race-pending" },
+    DateTimeOffset.UtcNow);
+Assert(raceService.CancelByClientOrderId("race-live", "race-pending"),
+    "測試委託應進入 CancelPending");
+int workingBeforeLateAccepted = raceLifecycle.Count(x =>
+    x.ClientOrderId == "race-pending" && x.State == OrderLifecycleState.Working);
+raceGateway.EmitState(pendingRace.OrderId, OrderStatus.Accepted, 0, 1);
+Assert(raceLifecycle.Count(x =>
+           x.ClientOrderId == "race-pending" && x.State == OrderLifecycleState.Working) == workingBeforeLateAccepted &&
+       raceLifecycle.Last(x => x.ClientOrderId == "race-pending").State == OrderLifecycleState.CancelPending,
+    "CancelPending 後 late Accepted 不得倒退回 Working");
+raceGateway.EmitState(pendingRace.OrderId, OrderStatus.Cancelled, 0, 0);
+raceService.Dispose();
+
+// Tombstone 只保留有限時間；過期後由下一次安全操作清理。
+DateTimeOffset retentionNow = new(2026, 9, 22, 1, 0, 0, TimeSpan.Zero);
+var retentionGateway = new FakeLiveStrategyOrderGateway();
+var retentionExecutions = new List<ExecutionEvent>();
+var retentionService = CreateLiveService(retentionGateway, "retention-live", () => retentionNow);
+retentionService.Filled += retentionExecutions.Add;
+var expiredOrders = new List<PaperOrder>();
+for (int i = 0; i < 25; i++)
+{
+    PaperOrder item = retentionService.Submit(
+        liveBuy with
+        {
+            StrategyInstanceId = "retention-live", ClientOrderId = $"expired-{i}", Price = 65000m + i * 5m
+        },
+        retentionNow);
+    expiredOrders.Add(item);
+    retentionGateway.EmitState(item.OrderId, OrderStatus.Cancelled, 0, 0);
+}
+Assert(retentionService.ActiveBrokerOrderCount == 0,
+    "終結 tombstone 不得計入 active count");
+retentionNow = retentionNow.AddMinutes(11);
+PaperOrder retainedNew = retentionService.Submit(
+    liveBuy with { StrategyInstanceId = "retention-live", ClientOrderId = "retained-new" },
+    retentionNow);
+retentionGateway.EmitFill(expiredOrders[0].OrderId, 1, 0, OrderStatus.Filled, 1, 65000d);
+Assert(retentionExecutions.Count == 0 && retentionService.ActiveBrokerOrderCount == 1,
+    "超過十分鐘的 terminal tombstone 應在新操作清除，late fill 不再路由且不影響 active count");
+retentionGateway.EmitState(retainedNew.OrderId, OrderStatus.Cancelled, 0, 0);
+retentionService.Dispose();
+
 Console.WriteLine("OrderManagement smoke tests passed.");
+
+static KgiLiveStrategyExecutionService CreateLiveService(
+    ILiveStrategyOrderGateway gateway,
+    string instanceId,
+    Func<DateTimeOffset>? now = null) => new(
+        gateway,
+        instanceId,
+        new ResolvedProduct { ProductId = "225MC", Symbol = "225MC", TickSize = 5m, ContractMultiplier = 10m },
+        new ContractInfo
+        {
+            ExchangeNm = "JPX", ProductId = "225MC", Symbol = "JPX.225MC-202609",
+            ComYM2 = "202609", CPF = CPFEnum.Futures, ComType = '0'
+        },
+        36m,
+        now);
 
 static InstrumentKey ForeignInstrument() => new()
 {
@@ -751,4 +895,55 @@ sealed class FakeLiveStrategyOrderGateway : ILiveStrategyOrderGateway
 
     public void EmitOrderFailed(string orderId, string reason) => OrderFailed?.Invoke(_orders[orderId], reason);
     public void EmitCancelFailed(string orderId, string reason) => CancelFailed?.Invoke(_orders[orderId], reason);
+}
+
+sealed class FakeHostMarketSource : IMarketEventSource
+{
+    public event Action<MarketEvent>? MarketEventReceived;
+    public void Subscribe(IEnumerable<ResolvedProduct> products) { }
+    public void Emit(MarketEvent marketEvent) => MarketEventReceived?.Invoke(marketEvent);
+    public void Dispose() { }
+}
+
+sealed class HostManagedProbeStrategy : ISimulationStrategy, IManagedOrderStrategy
+{
+    private readonly string _symbol;
+
+    public HostManagedProbeStrategy(string instanceId, string symbol)
+    {
+        InstanceId = instanceId;
+        _symbol = symbol;
+    }
+
+    public string StrategyType => "HostManagedProbe";
+    public string InstanceId { get; }
+    public StrategyLifecycleState State { get; private set; } = StrategyLifecycleState.Created;
+    public List<OrderLifecycleEvent> Lifecycle { get; } = new();
+    public List<ExecutionEvent> Executions { get; } = new();
+    public event Action<PaperOrderRequest>? OrderRequested;
+    public event Action? CancelAllRequested;
+    public event Action<StrategySnapshot>? SnapshotChanged;
+    public event Action<string>? CancelOrderRequested;
+
+    public void Request(PaperOrderRequest request) => OrderRequested?.Invoke(request);
+    public void Start(StrategyRuntimeContext context) => State = StrategyLifecycleState.Ready;
+    public void OnMarketEvent(MarketEvent marketEvent) { }
+    public void OnExecution(ExecutionEvent execution) => Executions.Add(execution);
+    public void OnOrderLifecycle(OrderLifecycleEvent orderEvent) => Lifecycle.Add(orderEvent);
+    public void Pause(string reason) => State = StrategyLifecycleState.Suspended;
+    public void Resume() => State = StrategyLifecycleState.Ready;
+    public void Stop(string reason)
+    {
+        CancelAllRequested?.Invoke();
+        State = StrategyLifecycleState.Stopped;
+    }
+    public StrategySnapshot GetSnapshot() => new()
+    {
+        StrategyType = StrategyType,
+        InstanceId = InstanceId,
+        TradableSymbol = _symbol,
+        State = State,
+        Reason = "probe",
+        UpdatedAt = DateTimeOffset.UtcNow
+    };
 }
