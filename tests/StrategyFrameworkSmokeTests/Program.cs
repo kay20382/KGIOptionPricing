@@ -8,6 +8,8 @@ using KGIOptionPricing.StrategyFramework.Execution;
 using KGIOptionPricing.StrategyFramework.Performance;
 using KGIOptionPricing.StrategyFramework.Storage;
 using System.Reflection;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 
 // Strict crossing: a touch must not fill, a pass through must fill.
@@ -258,6 +260,74 @@ using (var heartbeatHost = new StrategyHost(heartbeatSource, heartbeatClock))
            heartbeatClock.Now == heartbeatTime.AddSeconds(1),
         "StrategyHost.Pulse 必須以事件時鐘驅動 optional heartbeat strategy，測試不依賴 sleep");
 }
+
+var serializedClock = new MutableStrategyClock(heartbeatTime);
+var serializedLedger = new PaperPortfolioLedger();
+var serializedBroker = new ConcurrentCallbackExecutionService();
+var serializedProbe = new BlockingHeartbeatManagedStrategy("serialized-heartbeat", serializedLedger, "HBS");
+using (var serializedRunner = new StrategyInstanceRunner(
+    serializedProbe,
+    new ResolvedStrategyUniverse { Tradable = Product("225MC", "HBS", 5m, 10m) },
+    serializedLedger,
+    serializedClock,
+    0m,
+    serializedBroker))
+{
+    Task pulse = Task.Factory.StartNew(
+        () => serializedRunner.Pulse(heartbeatTime.AddSeconds(1)),
+        CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+    Assert(serializedProbe.HeartbeatEntered.Wait(TimeSpan.FromSeconds(5)),
+        "測試前置：heartbeat 必須進入阻塞區段");
+    Task lifecycleCallback = Task.Factory.StartNew(() => serializedBroker.RaiseLifecycle(new OrderLifecycleEvent
+    {
+        StrategyInstanceId = serializedProbe.InstanceId, ClientOrderId = "entry-1",
+        Timestamp = heartbeatTime.AddSeconds(1), State = OrderLifecycleState.Filled,
+        Quantity = 1, FilledQuantity = 1
+    }), CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+    Task fillCallback = Task.Factory.StartNew(() => serializedBroker.RaiseFill(new ExecutionEvent
+    {
+        StrategyInstanceId = serializedProbe.InstanceId, ClientOrderId = "entry-1",
+        Symbol = "HBS", Side = BuySell.Buy, Role = PaperOrderRole.EntryLong,
+        Price = 100m, Quantity = 1, Timestamp = heartbeatTime.AddSeconds(1)
+    }), CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+    bool callbackEnteredWhileHeartbeatBlocked =
+        serializedProbe.BrokerCallbackEntered.Wait(TimeSpan.FromMilliseconds(100));
+    int positionWhileHeartbeatBlocked =
+        serializedLedger.GetPosition(serializedProbe.InstanceId, "HBS").NetQuantity;
+    serializedProbe.ReleaseHeartbeat.Set();
+    Assert(Task.WaitAll(new[] { pulse, lifecycleCallback, fillCallback }, TimeSpan.FromSeconds(5)),
+        "heartbeat 釋放後 broker callbacks 必須完成");
+    Assert(!callbackEnteredWhileHeartbeatBlocked && positionWhileHeartbeatBlocked == 0,
+        "heartbeat 尚未釋放時 broker Filled/lifecycle 不得並行進入策略或先更新帳本");
+    Assert(serializedProbe.MaxConcurrentCallbacks == 1 &&
+           serializedProbe.LifecycleCount == 1 && serializedProbe.ExecutionCount == 1 &&
+           serializedProbe.PositionObservedInsideExecution == 1,
+        "Runner 必須序列化 heartbeat/lifecycle/execution，且 ledger apply 必須先於 strategy execution callback");
+}
+
+Type heartbeatTimerType = typeof(StrategyHost).Assembly.GetType(
+    "KGIOptionPricing.StrategyFramework.StrategyHeartbeatTimer", throwOnError: true)!;
+using var timerCallbackEntered = new ManualResetEventSlim(false);
+using var releaseTimerCallback = new ManualResetEventSlim(false);
+Action<DateTimeOffset> blockingPulse = _ =>
+{
+    timerCallbackEntered.Set();
+    releaseTimerCallback.Wait();
+};
+var heartbeatTimer = (IDisposable)Activator.CreateInstance(
+    heartbeatTimerType,
+    BindingFlags.Instance | BindingFlags.NonPublic,
+    binder: null,
+    args: new object?[] { blockingPulse, TimeSpan.FromMilliseconds(1) },
+    culture: null)!;
+Assert(timerCallbackEntered.Wait(TimeSpan.FromSeconds(5)), "測試前置：timer callback 必須開始執行");
+Task disposeHeartbeatTimer = Task.Run(heartbeatTimer.Dispose);
+bool timerDisposeReturnedBeforeCallback = disposeHeartbeatTimer.Wait(TimeSpan.FromMilliseconds(100));
+releaseTimerCallback.Set();
+Assert(disposeHeartbeatTimer.Wait(TimeSpan.FromSeconds(5)),
+    "timer callback 排空後 Dispose 必須完成，供 SimulationService 依 timer→host 順序安全釋放");
+Assert(!timerDisposeReturnedBeforeCallback,
+    "timer callback 尚未結束時 Dispose 不得先返回並讓 host 被釋放");
 
 // Shared ledger: strategies read, runner writes.
 var ledger = new PaperPortfolioLedger();
@@ -711,6 +781,88 @@ sealed class HeartbeatProbeStrategy : ISimulationStrategy, IStrategyHeartbeat
     {
         StrategyType = StrategyType, InstanceId = InstanceId, State = State, UpdatedAt = DateTimeOffset.UtcNow
     };
+}
+
+sealed class BlockingHeartbeatManagedStrategy : ISimulationStrategy, IManagedOrderStrategy, IStrategyHeartbeat
+{
+    private readonly PaperPortfolioLedger _ledger;
+    private readonly string _symbol;
+    private int _activeCallbacks;
+
+    public BlockingHeartbeatManagedStrategy(string instanceId, PaperPortfolioLedger ledger, string symbol)
+    {
+        InstanceId = instanceId;
+        _ledger = ledger;
+        _symbol = symbol;
+    }
+
+    public string StrategyType => "BlockingHeartbeatManaged";
+    public string InstanceId { get; }
+    public StrategyLifecycleState State { get; private set; } = StrategyLifecycleState.Created;
+    public ManualResetEventSlim HeartbeatEntered { get; } = new(false);
+    public ManualResetEventSlim ReleaseHeartbeat { get; } = new(false);
+    public ManualResetEventSlim BrokerCallbackEntered { get; } = new(false);
+    public int MaxConcurrentCallbacks { get; private set; }
+    public int LifecycleCount { get; private set; }
+    public int ExecutionCount { get; private set; }
+    public int PositionObservedInsideExecution { get; private set; }
+    public event Action<PaperOrderRequest>? OrderRequested { add { } remove { } }
+    public event Action? CancelAllRequested { add { } remove { } }
+    public event Action<StrategySnapshot>? SnapshotChanged { add { } remove { } }
+    public event Action<string>? CancelOrderRequested { add { } remove { } }
+    public void Start(StrategyRuntimeContext context) => State = StrategyLifecycleState.Ready;
+    public void OnHeartbeat(DateTimeOffset now)
+    {
+        EnterCallback();
+        HeartbeatEntered.Set();
+        ReleaseHeartbeat.Wait();
+        ExitCallback();
+    }
+    public void OnOrderLifecycle(OrderLifecycleEvent orderEvent)
+    {
+        EnterCallback();
+        BrokerCallbackEntered.Set();
+        LifecycleCount++;
+        ExitCallback();
+    }
+    public void OnExecution(ExecutionEvent execution)
+    {
+        EnterCallback();
+        BrokerCallbackEntered.Set();
+        PositionObservedInsideExecution = _ledger.GetPosition(InstanceId, _symbol).NetQuantity;
+        ExecutionCount++;
+        ExitCallback();
+    }
+    public void OnMarketEvent(MarketEvent marketEvent) { }
+    public void Pause(string reason) => State = StrategyLifecycleState.Suspended;
+    public void Resume() => State = StrategyLifecycleState.Ready;
+    public void Stop(string reason) => State = StrategyLifecycleState.Stopped;
+    public StrategySnapshot GetSnapshot() => new()
+    {
+        StrategyType = StrategyType, InstanceId = InstanceId, State = State, UpdatedAt = DateTimeOffset.UtcNow
+    };
+
+    private void EnterCallback()
+    {
+        int active = Interlocked.Increment(ref _activeCallbacks);
+        MaxConcurrentCallbacks = Math.Max(MaxConcurrentCallbacks, active);
+    }
+    private void ExitCallback() => Interlocked.Decrement(ref _activeCallbacks);
+}
+
+sealed class ConcurrentCallbackExecutionService : IManagedStrategyExecutionService
+{
+    public event Action<ExecutionEvent>? Filled;
+    public event Action<string>? Failed { add { } remove { } }
+    public event Action<OrderLifecycleEvent>? OrderLifecycleChanged;
+    public void RaiseFill(ExecutionEvent execution) => Filled?.Invoke(execution);
+    public void RaiseLifecycle(OrderLifecycleEvent orderEvent) => OrderLifecycleChanged?.Invoke(orderEvent);
+    public PaperOrder Submit(PaperOrderRequest request, DateTimeOffset now) => throw new NotSupportedException();
+    public bool Cancel(string orderId) => false;
+    public int CancelAll(string strategyInstanceId) => 0;
+    public bool CancelByClientOrderId(string strategyInstanceId, string clientOrderId) => false;
+    public IReadOnlyList<PaperOrder> GetWorkingOrders(string strategyInstanceId) => Array.Empty<PaperOrder>();
+    public void OnMarketEvent(MarketEvent marketEvent) { }
 }
 
 sealed class TrackingManagedExecutionService : IManagedStrategyExecutionService

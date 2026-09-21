@@ -75,6 +75,7 @@ internal sealed class QueueCycleOrderCoordinator
     internal bool BothUnfilled => _buy is not null && _sell is not null &&
         !_buy.HasFill && !_sell.HasFill;
     internal bool HasOutstandingOrders => IsOutstanding(_buy) || IsOutstanding(_sell) ||
+        HasUnreconciledFill(_buy) || HasUnreconciledFill(_sell) ||
         (_exitClientOrderId is not null && _exitState is LegState.Working or LegState.CancelPending);
     internal bool EntryOrdersTerminal => !IsOutstanding(_buy) && !IsOutstanding(_sell) &&
         !HasUnreconciledFill(_buy) && !HasUnreconciledFill(_sell);

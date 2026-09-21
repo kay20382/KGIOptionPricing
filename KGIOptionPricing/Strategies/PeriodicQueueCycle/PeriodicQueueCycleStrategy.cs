@@ -207,7 +207,11 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
         {
             PositionSnapshot position = Position();
             if (position.NetQuantity != 0)
+            {
                 EnsureExposureTimingAndStop(position, execution.Timestamp);
+                if (_stopRequested && _pendingExitRole is null)
+                    BeginRiskExit(PaperOrderRole.Flatten, "StopRequested", 0);
+            }
         }
         TryAdvanceRiskExit();
         TryCompleteCycle();

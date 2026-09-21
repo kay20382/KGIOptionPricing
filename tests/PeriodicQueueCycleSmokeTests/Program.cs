@@ -57,6 +57,7 @@ TestPeriodicStrategyAcceptsFilledLifecycleAfterExecutionStartsCooldown();
 TestPeriodicStrategyIgnoresDuplicateBookForRiskTriggers();
 TestPeriodicHeartbeatAdvancesTimeoutAndHealthRecoveryWithoutMarketEvents();
 TestPeriodicLifecycleFirstWaitsForAuthoritativeExecutions();
+TestPeriodicLifecycleFirstStopWaitsForExecutionAndProtection();
 TestPeriodicFixedStopDoesNotTriggerBelowSixTicks();
 TestPeriodicExitCallbacksAreIdempotentOutOfOrder();
 TestPeriodicHealthFlattenUsesNextTradePriceThroughRealPaperBroker();
@@ -1687,6 +1688,45 @@ static void TestPeriodicLifecycleFirstWaitsForAuthoritativeExecutions()
     Assert(strategy.GetSnapshot().Reason == "CoolingDown" &&
            ledger.GetPosition(strategy.InstanceId, "225MC").NetQuantity == 0,
         "只有兩筆權威 execution 使帳本歸零後才能完成週期");
+}
+
+static void TestPeriodicLifecycleFirstStopWaitsForExecutionAndProtection()
+{
+    DateTimeOffset start = new(2026, 9, 23, 17, 30, 0, TimeSpan.Zero);
+    var ledger = new KGIOptionPricing.StrategyFramework.Performance.PaperPortfolioLedger();
+    (PeriodicQueueCycleStrategy strategy, MutableClock clock, List<PaperOrderRequest> orders) =
+        StartWorkingUpStrategy("lifecycle-first-stop", RiskParameters(), start, ledger);
+    PaperOrderRequest buy = orders.Single(x => x.Side == BuySell.Buy);
+    PaperOrderRequest sell = orders.Single(x => x.Side == BuySell.Sell);
+    foreach (PaperOrderRequest order in new[] { buy, sell })
+    {
+        strategy.OnOrderLifecycle(new OrderLifecycleEvent
+        {
+            StrategyInstanceId = strategy.InstanceId,
+            ClientOrderId = order.ClientOrderId,
+            Timestamp = clock.Now,
+            State = OrderLifecycleState.Filled,
+            Quantity = 1,
+            FilledQuantity = 1
+        });
+    }
+
+    strategy.Stop("等待權威成交");
+    Assert(strategy.State != StrategyLifecycleState.Stopped,
+        "兩腿只有 Filled lifecycle、ledger=0 時 Stop 不得越過 unreconciled fill 宣告 Stopped");
+    ApplyFill(strategy, ledger, buy, 200m, clock.Now);
+    Assert(ledger.GetPosition(strategy.InstanceId, "225MC").NetQuantity == 1 &&
+           strategy.State != StrategyLifecycleState.Stopped,
+        "StopPending 後到 execution 形成部位時仍必須保留策略保護生命週期");
+    clock.Advance(clock.Now.AddSeconds(30));
+    ((IStrategyHeartbeat)strategy).OnHeartbeat(clock.Now);
+    Assert(strategy.State != StrategyLifecycleState.Stopped && strategy.GetSnapshot().StopPrice == 170m &&
+           strategy.GetSnapshot().Reason.Contains("StopRequested", StringComparison.Ordinal),
+        "後到 execution 形成部位後 heartbeat 必須繼續維持固定停損與 StopRequested 保護，不得因誤 Stopped 忽略");
+    ApplyFill(strategy, ledger, sell, 205m, clock.Now);
+    Assert(strategy.State == StrategyLifecycleState.Stopped &&
+           ledger.GetPosition(strategy.InstanceId, "225MC").NetQuantity == 0,
+        "所有權威 executions 到齊且帳本歸零後才可完成 Stop");
 }
 
 static void TestPeriodicFixedStopDoesNotTriggerBelowSixTicks()

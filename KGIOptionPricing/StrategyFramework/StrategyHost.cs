@@ -28,7 +28,9 @@ public sealed class StrategyInstanceRunner : IDisposable
     private readonly IStrategyClock _clock;
     private readonly IManagedOrderStrategy? _managedStrategy;
     private readonly IManagedStrategyExecutionService? _managedBroker;
+    private readonly ManualResetEventSlim _disposeCompleted = new(false);
     private bool _disposed;
+    private bool _disposing;
     private bool _paused;
 
     public string InstanceId => _strategy.InstanceId;
@@ -72,7 +74,7 @@ public sealed class StrategyInstanceRunner : IDisposable
     {
         lock (_sync)
         {
-            if (_disposed || !UsesSymbol(marketEvent.Symbol)) return;
+            if (_disposed || _disposing || !UsesSymbol(marketEvent.Symbol)) return;
             // Mark open positions from an actual last-traded price, never a half-tick midpoint.
             if (marketEvent.LastPrice > 0m)
                 _ledger.ApplyMark(marketEvent.Symbol, marketEvent.LastPrice);
@@ -96,7 +98,7 @@ public sealed class StrategyInstanceRunner : IDisposable
     {
         lock (_sync)
         {
-            if (_disposed || _strategy is not IStrategyHeartbeat heartbeat) return;
+            if (_disposed || _disposing || _strategy is not IStrategyHeartbeat heartbeat) return;
             if (_clock is IEventDrivenStrategyClock eventClock) eventClock.Advance(now);
             if (_paused)
             {
@@ -135,15 +137,21 @@ public sealed class StrategyInstanceRunner : IDisposable
     {
         lock (_sync)
         {
-            _paused = false;
-            bool managed = _managedStrategy is not null && _managedBroker is not null;
-            if (!managed)
-                _broker.CancelAll(_strategy.InstanceId);
-            _strategy.Stop(reason);
-            if (managed && _strategy.State == StrategyLifecycleState.Stopped &&
-                _broker.GetWorkingOrders(_strategy.InstanceId).Count > 0)
-                _broker.CancelAll(_strategy.InstanceId);
+            if (_disposed) return;
+            StopCore(reason);
         }
+    }
+
+    private void StopCore(string reason)
+    {
+        _paused = false;
+        bool managed = _managedStrategy is not null && _managedBroker is not null;
+        if (!managed)
+            _broker.CancelAll(_strategy.InstanceId);
+        _strategy.Stop(reason);
+        if (managed && _strategy.State == StrategyLifecycleState.Stopped &&
+            _broker.GetWorkingOrders(_strategy.InstanceId).Count > 0)
+            _broker.CancelAll(_strategy.InstanceId);
     }
 
     private void OnOrderRequested(PaperOrderRequest request) =>
@@ -170,18 +178,30 @@ public sealed class StrategyInstanceRunner : IDisposable
 
     private void OnOrderLifecycleChanged(OrderLifecycleEvent orderEvent)
     {
-        if (string.Equals(orderEvent.StrategyInstanceId, _strategy.InstanceId, StringComparison.OrdinalIgnoreCase))
+        if (!string.Equals(orderEvent.StrategyInstanceId, _strategy.InstanceId, StringComparison.OrdinalIgnoreCase))
+            return;
+        lock (_sync)
+        {
+            if (_disposed) return;
             _managedStrategy?.OnOrderLifecycle(orderEvent);
+        }
     }
 
     private void OnFilled(ExecutionEvent execution)
     {
-        if (!string.Equals(execution.StrategyInstanceId, _strategy.InstanceId, StringComparison.OrdinalIgnoreCase))
-            return;
-        _ledger.ApplyExecution(execution);
-        _strategy.OnExecution(execution);
+        StrategySnapshot snapshot;
+        lock (_sync)
+        {
+            if (_disposed || !string.Equals(execution.StrategyInstanceId, _strategy.InstanceId, StringComparison.OrdinalIgnoreCase))
+                return;
+            // Applying the execution and notifying the strategy are one serialized
+            // state transition. Broker callbacks may be concurrent with heartbeats.
+            _ledger.ApplyExecution(execution);
+            _strategy.OnExecution(execution);
+            snapshot = GetSnapshotCore();
+        }
         ExecutionOccurred?.Invoke(execution);
-        SnapshotChanged?.Invoke(GetSnapshot());
+        SnapshotChanged?.Invoke(snapshot);
     }
 
     private StrategySnapshot WithPnl(StrategySnapshot snapshot)
@@ -211,18 +231,40 @@ public sealed class StrategyInstanceRunner : IDisposable
 
     public void Dispose()
     {
-        if (_disposed) return;
+        bool disposeOwner;
+        lock (_sync)
+        {
+            if (_disposed) return;
+            disposeOwner = !_disposing;
+            if (disposeOwner) _disposing = true;
+        }
+        if (!disposeOwner)
+        {
+            _disposeCompleted.Wait();
+            return;
+        }
+
         // The live broker is fail-closed. Dispose it before mutating runner
         // state or detaching routes so a failure leaves late fills observable.
-        if (_broker is IDisposable disposable) disposable.Dispose();
-        Stop("執行個體已釋放");
-        _disposed = true;
-        _strategy.OrderRequested -= OnOrderRequested;
-        _strategy.CancelAllRequested -= OnCancelAllRequested;
-        _strategy.SnapshotChanged -= OnStrategySnapshotChanged;
-        _broker.Filled -= OnFilled;
-        if (_managedStrategy != null) _managedStrategy.CancelOrderRequested -= OnCancelOrderRequested;
-        if (_managedBroker != null) _managedBroker.OrderLifecycleChanged -= OnOrderLifecycleChanged;
+        try
+        {
+            if (_broker is IDisposable disposable) disposable.Dispose();
+            lock (_sync)
+            {
+                StopCore("執行個體已釋放");
+                _disposed = true;
+                _strategy.OrderRequested -= OnOrderRequested;
+                _strategy.CancelAllRequested -= OnCancelAllRequested;
+                _strategy.SnapshotChanged -= OnStrategySnapshotChanged;
+                _broker.Filled -= OnFilled;
+                if (_managedStrategy != null) _managedStrategy.CancelOrderRequested -= OnCancelOrderRequested;
+                if (_managedBroker != null) _managedBroker.OrderLifecycleChanged -= OnOrderLifecycleChanged;
+            }
+        }
+        finally
+        {
+            _disposeCompleted.Set();
+        }
     }
 }
 
@@ -339,6 +381,7 @@ internal sealed class StrategyHeartbeatTimer : IDisposable
     private readonly System.Threading.Timer _timer;
     private int _running;
     private int _disposed;
+    private int _callbackThreadId;
 
     internal StrategyHeartbeatTimer(Action<DateTimeOffset> pulse, TimeSpan? interval = null)
     {
@@ -353,6 +396,7 @@ internal sealed class StrategyHeartbeatTimer : IDisposable
             return;
         try
         {
+            Volatile.Write(ref _callbackThreadId, Environment.CurrentManagedThreadId);
             _pulse(DateTimeOffset.Now);
         }
         catch (Exception exception)
@@ -361,6 +405,7 @@ internal sealed class StrategyHeartbeatTimer : IDisposable
         }
         finally
         {
+            Volatile.Write(ref _callbackThreadId, 0);
             Volatile.Write(ref _running, 0);
         }
     }
@@ -369,6 +414,13 @@ internal sealed class StrategyHeartbeatTimer : IDisposable
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
         _timer.Change(Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
-        _timer.Dispose();
+        if (Volatile.Read(ref _callbackThreadId) == Environment.CurrentManagedThreadId)
+        {
+            // Waiting for the current callback from inside that callback would deadlock.
+            _timer.Dispose();
+            return;
+        }
+        using var drained = new ManualResetEvent(false);
+        if (_timer.Dispose(drained)) drained.WaitOne();
     }
 }
