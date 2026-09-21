@@ -53,5 +53,17 @@ class TxoOtmIvTests(unittest.TestCase):
         self.assertEqual(result.reason, "holiday_calendar_year_missing")
 
 
+
+    def test_retains_option_source_file_for_audit(self):
+        rows = make_rows()
+        rows[0] = OptionRow(
+            contract_type=rows[0].contract_type, expiry_month=rows[0].expiry_month,
+            expiry_date=rows[0].expiry_date, strike=rows[0].strike, kind=rows[0].kind,
+            settlement=rows[0].settlement, oi=rows[0].oi, source_file="official-source.csv",
+        )
+        result = calculate_contract_iv(rows, date(2026, 9, 22), set(), {2026})
+        self.assertEqual(result.source_file, "official-source.csv")
+
+
 if __name__ == "__main__":
     unittest.main()

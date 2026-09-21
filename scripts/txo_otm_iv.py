@@ -50,6 +50,7 @@ class IvResult:
     call_iv: float | None = None
     put_iv: float | None = None
     reason: str | None = None
+    source_file: str | None = None
 
 
 def black76_price(kind: str, forward: float, strike: float, years: float, sigma: float) -> float:
@@ -139,6 +140,7 @@ def calculate_contract_iv(rows: Iterable[OptionRow], trade_date: date, holidays:
     if not rows:
         return IvResult("未知", None, None, reason="contract_rows_missing")
     first = rows[0]
+    source_file = next((row.source_file for row in rows if row.source_file), None)
     if any(row.expiry_date != first.expiry_date or row.expiry_month != first.expiry_month for row in rows):
         return IvResult(first.contract_type, first.expiry_month, first.expiry_date, reason="mixed_contract_rows")
     if trade_date.year not in covered_years or first.expiry_date.year not in covered_years:
@@ -161,7 +163,7 @@ def calculate_contract_iv(rows: Iterable[OptionRow], trade_date: date, holidays:
     call_iv = implied_volatility("Call", call.settlement, forward, call.strike, years)
     put_iv = implied_volatility("Put", put.settlement, forward, put.strike, years)
     reason = None if call_iv is not None and put_iv is not None else "implied_volatility_not_converged"
-    return IvResult(first.contract_type, first.expiry_month, first.expiry_date, central_call.strike, central_call.settlement, central_put.settlement, forward, call.strike, call.settlement, put.strike, put.settlement, days, call_iv, put_iv, reason)
+    return IvResult(first.contract_type, first.expiry_month, first.expiry_date, central_call.strike, central_call.settlement, central_put.settlement, forward, call.strike, call.settlement, put.strike, put.settlement, days, call_iv, put_iv, reason, source_file)
 
 
 def load_holiday_calendar(path: Path) -> tuple[set[date], set[int]]:
@@ -182,3 +184,6 @@ def load_holiday_calendar(path: Path) -> tuple[set[date], set[int]]:
             if row["是否休市"] == "true":
                 holidays.add(value)
     return holidays, covered_years
+
+
+
