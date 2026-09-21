@@ -14,6 +14,7 @@ public sealed class CrossPricePaperExecutionService : IPaperExecutionService, IM
     private readonly object _sync = new();
     private readonly Dictionary<string, PaperOrder> _orders = new(StringComparer.OrdinalIgnoreCase);
     private readonly decimal _commissionPerContract;
+    private readonly IStrategyClock _clock;
     private long _orderSequence;
     private long _executionSequence;
 
@@ -21,8 +22,11 @@ public sealed class CrossPricePaperExecutionService : IPaperExecutionService, IM
     public event Action<string>? Failed;
     public event Action<OrderLifecycleEvent>? OrderLifecycleChanged;
 
-    public CrossPricePaperExecutionService(decimal commissionPerContract = 0m) =>
+    public CrossPricePaperExecutionService(decimal commissionPerContract = 0m, IStrategyClock? clock = null)
+    {
         _commissionPerContract = Math.Max(0m, commissionPerContract);
+        _clock = clock ?? new SystemStrategyClock();
+    }
 
     public PaperOrder Submit(PaperOrderRequest request, DateTimeOffset now)
     {
@@ -58,7 +62,7 @@ public sealed class CrossPricePaperExecutionService : IPaperExecutionService, IM
             cancelled = order with { State = PaperOrderState.Cancelled };
             _orders[orderId] = cancelled;
         }
-        DateTimeOffset now = DateTimeOffset.Now;
+        DateTimeOffset now = _clock.Now;
         PublishLifecycle(cancelled, OrderLifecycleState.Working, OrderLifecycleState.CancelPending, now, "CancelRequested");
         PublishLifecycle(cancelled, OrderLifecycleState.CancelPending, OrderLifecycleState.Cancelled, now, "Cancelled");
         return true;
@@ -78,7 +82,7 @@ public sealed class CrossPricePaperExecutionService : IPaperExecutionService, IM
             cancelled = matches[0] with { State = PaperOrderState.Cancelled };
             _orders[cancelled.OrderId] = cancelled;
         }
-        DateTimeOffset now = DateTimeOffset.Now;
+        DateTimeOffset now = _clock.Now;
         PublishLifecycle(cancelled, OrderLifecycleState.Working, OrderLifecycleState.CancelPending, now, "CancelRequested");
         PublishLifecycle(cancelled, OrderLifecycleState.CancelPending, OrderLifecycleState.Cancelled, now, "Cancelled");
         return true;
@@ -95,7 +99,7 @@ public sealed class CrossPricePaperExecutionService : IPaperExecutionService, IM
                 .Select(x => x with { State = PaperOrderState.Cancelled }).ToArray();
             foreach (PaperOrder order in cancelled) _orders[order.OrderId] = order;
         }
-        DateTimeOffset now = DateTimeOffset.Now;
+        DateTimeOffset now = _clock.Now;
         foreach (PaperOrder order in cancelled)
         {
             PublishLifecycle(order, OrderLifecycleState.Working, OrderLifecycleState.CancelPending, now, "CancelRequested");

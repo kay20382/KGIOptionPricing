@@ -23,6 +23,7 @@ public sealed class StrategyInstanceRunner : IDisposable
     private readonly PaperPortfolioLedger _ledger;
     private readonly ResolvedStrategyUniverse _universe;
     private readonly decimal _commissionPerContract;
+    private readonly IStrategyClock _clock;
     private readonly IManagedOrderStrategy? _managedStrategy;
     private readonly IManagedStrategyExecutionService? _managedBroker;
     private bool _disposed;
@@ -43,8 +44,9 @@ public sealed class StrategyInstanceRunner : IDisposable
         _strategy = strategy;
         _universe = universe;
         _ledger = ledger;
+        _clock = clock;
         _commissionPerContract = Math.Max(0m, commissionPerContract);
-        _broker = executionService ?? new CrossPricePaperExecutionService(commissionPerContract);
+        _broker = executionService ?? new CrossPricePaperExecutionService(commissionPerContract, clock);
         foreach (ResolvedProduct product in universe.AllProducts) ledger.RegisterProduct(strategy.InstanceId, product);
         _strategy.OrderRequested += OnOrderRequested;
         _strategy.CancelAllRequested += OnCancelAllRequested;
@@ -123,7 +125,7 @@ public sealed class StrategyInstanceRunner : IDisposable
     }
 
     private void OnOrderRequested(PaperOrderRequest request) =>
-        _broker.Submit(request, DateTimeOffset.Now);
+        _broker.Submit(request, _clock.Now);
 
     private void OnCancelAllRequested() => _broker.CancelAll(_strategy.InstanceId);
 

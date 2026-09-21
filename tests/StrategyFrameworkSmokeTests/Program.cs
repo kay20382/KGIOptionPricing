@@ -119,6 +119,30 @@ using (var secondManagedRunner = new StrategyInstanceRunner(
         "共用執行器的成交事件只能路由至擁有該委託的策略 instance");
 }
 
+DateTimeOffset lifecycleT0 = new(2026, 9, 22, 0, 0, 0, TimeSpan.Zero);
+DateTimeOffset lifecycleT1 = lifecycleT0.AddSeconds(7);
+var deterministicLifecycleRuns = new List<OrderLifecycleEvent[]>();
+for (int run = 0; run < 2; run++)
+{
+    var lifecycleClock = new MutableStrategyClock(lifecycleT0);
+    var lifecycleBroker = new CrossPricePaperExecutionService(clock: lifecycleClock);
+    var lifecycleProbe = new ManagedProbeStrategy("managed-clock", "MGC");
+    using var lifecycleRunner = new StrategyInstanceRunner(
+        lifecycleProbe,
+        new ResolvedStrategyUniverse { Tradable = Product("225MC", "MGC", 5m, 10m) },
+        new PaperPortfolioLedger(), lifecycleClock, 0m, lifecycleBroker);
+    lifecycleProbe.Request("clock-g1", BuySell.Buy, 100m);
+    Assert(lifecycleProbe.Lifecycle.Take(2).All(x => x.Timestamp == lifecycleT0),
+        "Submitted 與 Working 必須使用策略 clock 的送單時間");
+    lifecycleClock.Advance(lifecycleT1);
+    lifecycleProbe.Cancel("clock-g1");
+    Assert(lifecycleProbe.Lifecycle.Skip(2).All(x => x.Timestamp == lifecycleT1),
+        "CancelPending 與 Cancelled 必須使用策略 clock 的撤單時間");
+    deterministicLifecycleRuns.Add(lifecycleProbe.Lifecycle.ToArray());
+}
+Assert(deterministicLifecycleRuns[0].SequenceEqual(deterministicLifecycleRuns[1]),
+    "相同 clock 與委託序列必須產生完全一致的生命週期事件");
+
 var detachedBroker = new TrackingManagedExecutionService();
 var detachedProbe = new ManagedProbeStrategy("managed-detached", "MGD");
 var detachedRunner = new StrategyInstanceRunner(
@@ -616,4 +640,11 @@ sealed class TrackingManagedExecutionService : IManagedStrategyExecutionService
     public bool CancelByClientOrderId(string strategyInstanceId, string clientOrderId) => false;
     public IReadOnlyList<PaperOrder> GetWorkingOrders(string strategyInstanceId) => Array.Empty<PaperOrder>();
     public void OnMarketEvent(MarketEvent marketEvent) { }
+}
+
+sealed class MutableStrategyClock : IStrategyClock
+{
+    public MutableStrategyClock(DateTimeOffset now) => Now = now;
+    public DateTimeOffset Now { get; private set; }
+    public void Advance(DateTimeOffset now) => Now = now;
 }
