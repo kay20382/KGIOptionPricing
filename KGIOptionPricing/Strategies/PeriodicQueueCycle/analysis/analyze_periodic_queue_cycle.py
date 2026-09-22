@@ -206,7 +206,7 @@ def _write_outputs(report: dict, output: Path) -> None:
             "", "## 分析推論", "",
             "- 僅以已驗證的執行產物比較；資料品質與風控失敗的候選不列入排序。",
             "", "## 邏輯修改建議", "",
-            "- 先針對拒絕原因與資料品質計數最高者改善行情濾網，再擴大樣本。",
+            f"- run={','.join(report['runIds']) or '無'}：先針對拒絕原因與資料品質計數最高者改善行情濾網，再擴大樣本。",
             "", "## 參數建議", ""]
     for row in report.get("parameterRanking", []):
         rows.append(f"- {row['experimentId']}（run={row['candidateRunId']}）：淨損益 {row['netPnl']}，回撤 {row['maximumDrawdown']}。")
