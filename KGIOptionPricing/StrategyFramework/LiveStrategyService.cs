@@ -4,6 +4,7 @@ using KGIOptionPricing.Strategies.MeanReversionScalper;
 using KGIOptionPricing.Strategies.MiniLeadMicro;
 using KGIOptionPricing.Strategies.NikkeiMicrostructureAlpha;
 using KGIOptionPricing.Strategies.OrderBookTrend;
+using KGIOptionPricing.Strategies.PeriodicQueueCycle;
 using KGIOptionPricing.Strategies.WaveletScalper;
 using KGIOptionPricing.StrategyFramework.Execution;
 using KGIOptionPricing.StrategyFramework.MarketData;
@@ -56,6 +57,37 @@ public sealed class LiveStrategyService : IDisposable
     public event Action<ExecutionEvent>? ExecutionOccurred;
     public string Account => _account();
     public bool IsLoggedIn => _isLoggedIn();
+    public static IReadOnlyList<IStrategyFactory> DefaultFactories => CreateDefaultFactories();
+
+    internal static IReadOnlyList<IStrategyFactory> CreateDefaultFactories() => new IStrategyFactory[]
+    {
+        new MeanReversionScalperFactory(),
+        new WaveletScalperFactory(),
+        new NikkeiMicrostructureAlphaFactory(),
+        new MiniLeadMicroFactory(),
+        new OrderBookTrendFactory(),
+        new PeriodicQueueCycleFactory()
+    };
+
+    public static bool TryValidateResearchStrategy(StrategyDefinition definition, out string? reasonCode)
+    {
+        ArgumentNullException.ThrowIfNull(definition);
+        bool isResearchStrategy = string.Equals(definition.StrategyType, MiniLeadMicroFactory.TypeName, StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(definition.StrategyType, PeriodicQueueCycleFactory.TypeName, StringComparison.OrdinalIgnoreCase);
+        if (!isResearchStrategy)
+        {
+            reasonCode = null;
+            return true;
+        }
+        if (definition.Parameters.TryGetValue("ResearchValidated", out string? raw) &&
+            bool.TryParse(raw, out bool validated) && validated)
+        {
+            reasonCode = null;
+            return true;
+        }
+        reasonCode = "ResearchValidationRequired";
+        return false;
+    }
 
     public LiveStrategyService(KGIQuoteService quote, OrderManager orders, KGITradeService trade)
     {
@@ -72,11 +104,7 @@ public sealed class LiveStrategyService : IDisposable
                 _orders, trade, definition.InstanceId, universe.Tradable, contract, commission);
         };
         _afterHostAddFailure = null;
-        _registry.Register(new MeanReversionScalperFactory());
-        _registry.Register(new WaveletScalperFactory());
-        _registry.Register(new NikkeiMicrostructureAlphaFactory());
-        _registry.Register(new MiniLeadMicroFactory());
-        _registry.Register(new OrderBookTrendFactory());
+        foreach (IStrategyFactory factory in CreateDefaultFactories()) _registry.Register(factory);
         _host = new StrategyHost(new KgiStrategyMarketDataSource(quote));
         _host.SnapshotChanged += OnSnapshot;
         _host.ExecutionOccurred += execution => ExecutionOccurred?.Invoke(execution);
@@ -109,10 +137,8 @@ public sealed class LiveStrategyService : IDisposable
     public void Add(StrategyDefinition definition, decimal commissionPerContract, decimal dailyLossLimit)
     {
         if (!_isLoggedIn()) throw new InvalidOperationException("交易服務尚未登入，禁止啟動實盤策略。");
-        if (string.Equals(definition.StrategyType, MiniLeadMicroFactory.TypeName, StringComparison.OrdinalIgnoreCase) &&
-            (!definition.Parameters.TryGetValue("ResearchValidated", out string? validated) ||
-             !bool.TryParse(validated, out bool isValidated) || !isValidated))
-            throw new InvalidOperationException("Mini 領先 Micro 尚屬研究策略；未明確標記已通過樣本外、滑價、延遲與模擬盤門檻，禁止實盤啟動。");
+        if (!TryValidateResearchStrategy(definition, out string? researchReason))
+            throw new InvalidOperationException($"{definition.StrategyType} 尚屬研究策略；未明確標記已通過樣本外、滑價、延遲與模擬盤門檻，禁止實盤啟動。[{researchReason}]");
         if (!string.Equals(definition.Universe.Tradable.ProductId, "225MC", StringComparison.OrdinalIgnoreCase))
             throw new InvalidOperationException("實盤策略第一版僅允許交易商品 225MC。");
         var reservation = new AddReservation(Environment.CurrentManagedThreadId, Interlocked.Increment(ref _generationSequence));

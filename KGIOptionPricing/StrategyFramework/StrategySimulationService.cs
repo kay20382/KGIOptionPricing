@@ -575,6 +575,17 @@ public sealed class StrategySimulationService : IDisposable
     public event Action<ExecutionEvent>? ExecutionOccurred;
     public string LiveArchivePath { get; }
     public IReadOnlyList<IStrategyFactory> Factories => _registry.Factories;
+    public static IReadOnlyList<IStrategyFactory> DefaultFactories => CreateDefaultFactories();
+
+    internal static IReadOnlyList<IStrategyFactory> CreateDefaultFactories() => new IStrategyFactory[]
+    {
+        new MeanReversionScalperFactory(),
+        new WaveletScalperFactory(),
+        new NikkeiMicrostructureAlphaFactory(),
+        new MiniLeadMicroFactory(),
+        new OrderBookTrendFactory(),
+        new PeriodicQueueCycleFactory()
+    };
 
     public StrategySimulationService(KGIQuoteService quote, string rootDirectory)
     {
@@ -584,12 +595,7 @@ public sealed class StrategySimulationService : IDisposable
         var source = new RecordingMarketEventSource(new KgiStrategyMarketDataSource(quote), _liveArchive);
         LiveArchivePath = _liveArchive.DirectoryPath;
         _liveHost = new StrategyHost(source);
-        _registry.Register(new MeanReversionScalperFactory());
-        _registry.Register(new WaveletScalperFactory());
-        _registry.Register(new NikkeiMicrostructureAlphaFactory());
-        _registry.Register(new MiniLeadMicroFactory());
-        _registry.Register(new OrderBookTrendFactory());
-        _registry.Register(new PeriodicQueueCycleFactory());
+        foreach (IStrategyFactory factory in CreateDefaultFactories()) _registry.Register(factory);
         _liveHost.SnapshotChanged += OnSnapshot;
         _liveHost.ExecutionOccurred += OnExecution;
         _liveHost.OrderLifecycleOccurred += _liveRecorders.Record;

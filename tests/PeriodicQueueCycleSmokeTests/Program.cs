@@ -62,6 +62,7 @@ TestPeriodicFixedStopDoesNotTriggerBelowSixTicks();
 TestPeriodicExitCallbacksAreIdempotentOutOfOrder();
 TestPeriodicHealthFlattenUsesNextTradePriceThroughRealPaperBroker();
 TestPeriodicStrategyPublishesTypedDecisionEvidence();
+TestPeriodicRegistrationAndResearchValidationGate();
 
 Console.WriteLine("PeriodicQueueCycle smoke tests passed.");
 
@@ -116,6 +117,38 @@ static void TestPeriodicStrategyPublishesTypedDecisionEvidence()
     Assert(working.Decision == StrategyDecision.Hold && working.PrimaryReasonCode == "WorkingBoth" &&
            working.CandidateId == accepted.CandidateId && working.CycleId == accepted.CycleId,
         $"進入工作狀態後必須保留 coordinator reason，不得被舊 assessment 改回 Accept；actual={working.Decision}/{working.PrimaryReasonCode}");
+}
+
+static void TestPeriodicRegistrationAndResearchValidationGate()
+{
+    Assert(StrategySimulationService.DefaultFactories.Any(factory =>
+               factory.StrategyType == PeriodicQueueCycleFactory.TypeName &&
+               factory.DisplayName == "週期雙邊完成單") &&
+           LiveStrategyService.DefaultFactories.Any(factory =>
+               factory.StrategyType == PeriodicQueueCycleFactory.TypeName &&
+               factory.DisplayName == "週期雙邊完成單"),
+        "模擬與實盤服務都必須註冊週期雙邊完成單工廠");
+
+    StrategyDefinition periodicMissing = PeriodicDefinition("live-periodic-missing", Values());
+    Assert(!LiveStrategyService.TryValidateResearchStrategy(periodicMissing, out string? periodicMissingReason) &&
+           periodicMissingReason == "ResearchValidationRequired",
+        "未設定 ResearchValidated 的週期策略必須被實盤研究閘門拒絕");
+    StrategyDefinition periodicFalse = PeriodicDefinition("live-periodic-false", Values(("ResearchValidated", "false")));
+    Assert(!LiveStrategyService.TryValidateResearchStrategy(periodicFalse, out string? periodicFalseReason) &&
+           periodicFalseReason == "ResearchValidationRequired",
+        "ResearchValidated=false 的週期策略必須被實盤研究閘門拒絕");
+    StrategyDefinition periodicTrue = PeriodicDefinition("live-periodic-true", Values(("ResearchValidated", "true")));
+    Assert(LiveStrategyService.TryValidateResearchStrategy(periodicTrue, out _),
+        "ResearchValidated=true 的週期策略必須通過研究閘門");
+    var nonResearch = new StrategyDefinition
+    {
+        StrategyType = "MeanReversionScalper",
+        InstanceId = "live-nonresearch",
+        Universe = new StrategyUniverse { Tradable = new ProductSelection("225MC", "225MC") },
+        Parameters = Values()
+    };
+    Assert(LiveStrategyService.TryValidateResearchStrategy(nonResearch, out _),
+        "非研究策略不得被週期策略研究閘門誤拒絕");
 }
 
 static void TestParameterDefaultsAndSummary()
