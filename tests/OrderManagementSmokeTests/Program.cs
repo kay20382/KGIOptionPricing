@@ -1268,6 +1268,7 @@ var periodicProtocolDefinition = new StrategyDefinition
         ["DirectionWindowSeconds"] = "2", ["ObiConfirmSeconds"] = "1",
         ["MinSideDepth"] = "1", ["MinNearDepth"] = "1", ["MinDepthRatio"] = "0",
         ["MaxSpreadTicks"] = "2", ["MaxVolatilityTicks"] = "100", ["MaxChaseTicks"] = "20",
+        ["ResearchValidated"] = "true",
         ["TrendInitialAheadA"] = "5", ["TrendRepriceThresholdB"] = "100000", ["TrendRepriceTargetC"] = "1",
         ["OppositeInitialAheadA"] = "20", ["OppositeRepriceThresholdB"] = "100000", ["OppositeRepriceTargetC"] = "1"
     }
