@@ -72,8 +72,7 @@ public sealed class LiveStrategyService : IDisposable
     public static bool TryValidateResearchStrategy(StrategyDefinition definition, out string? reasonCode)
     {
         ArgumentNullException.ThrowIfNull(definition);
-        bool isResearchStrategy = string.Equals(definition.StrategyType, MiniLeadMicroFactory.TypeName, StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(definition.StrategyType, PeriodicQueueCycleFactory.TypeName, StringComparison.OrdinalIgnoreCase);
+        bool isResearchStrategy = string.Equals(definition.StrategyType, MiniLeadMicroFactory.TypeName, StringComparison.OrdinalIgnoreCase);
         if (!isResearchStrategy)
         {
             reasonCode = null;

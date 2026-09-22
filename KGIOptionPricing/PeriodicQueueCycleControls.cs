@@ -53,7 +53,11 @@ public sealed class PeriodicQueueCycleControls : FlowLayoutPanel
         AddNumber("OppositeRepriceThresholdB", "反向 B", 312, 0, 1_000_000);
         AddNumber("OppositeRepriceTargetC", "反向 C", 22, 0, 1_000_000);
         Add("每口每次費", Commission);
-        if (live) Add("研究驗證", ResearchValidated);
+        if (live)
+        {
+            ResearchValidated.Text = "研究驗證（紀錄用）";
+            Add("研究驗證", ResearchValidated);
+        }
     }
 
     public StrategyDefinition CreateDefinition() => new()

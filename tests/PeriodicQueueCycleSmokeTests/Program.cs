@@ -1,6 +1,7 @@
 using System.Globalization;
 using KGIOptionPricing;
 using KGIOptionPricing.OrderManagement.Core;
+using KGIOptionPricing.Strategies.MiniLeadMicro;
 using KGIOptionPricing.Strategies.PeriodicQueueCycle;
 using KGIOptionPricing.StrategyFramework;
 
@@ -65,6 +66,7 @@ TestPeriodicHealthFlattenUsesNextTradePriceThroughRealPaperBroker();
 TestPeriodicStrategyPublishesTypedDecisionEvidence();
 TestPeriodicRegistrationAndResearchValidationGate();
 TestPeriodicControlSurfaceDefaultsAndResearchGate();
+TestPeriodicLiveTestingDoesNotRequireResearchValidation();
 
 Console.WriteLine("PeriodicQueueCycle smoke tests passed.");
 
@@ -132,13 +134,13 @@ static void TestPeriodicRegistrationAndResearchValidationGate()
         "模擬與實盤服務都必須註冊週期雙邊完成單工廠");
 
     StrategyDefinition periodicMissing = PeriodicDefinition("live-periodic-missing", Values());
-    Assert(!LiveStrategyService.TryValidateResearchStrategy(periodicMissing, out string? periodicMissingReason) &&
-           periodicMissingReason == "ResearchValidationRequired",
-        "未設定 ResearchValidated 的週期策略必須被實盤研究閘門拒絕");
+    Assert(LiveStrategyService.TryValidateResearchStrategy(periodicMissing, out string? periodicMissingReason) &&
+           periodicMissingReason == null,
+        "週期策略解除實盤測試鎖定後，不得要求 ResearchValidated");
     StrategyDefinition periodicFalse = PeriodicDefinition("live-periodic-false", Values(("ResearchValidated", "false")));
-    Assert(!LiveStrategyService.TryValidateResearchStrategy(periodicFalse, out string? periodicFalseReason) &&
-           periodicFalseReason == "ResearchValidationRequired",
-        "ResearchValidated=false 的週期策略必須被實盤研究閘門拒絕");
+    Assert(LiveStrategyService.TryValidateResearchStrategy(periodicFalse, out string? periodicFalseReason) &&
+           periodicFalseReason == null,
+        "ResearchValidated=false 的週期策略不得被實盤研究閘門拒絕");
     StrategyDefinition periodicTrue = PeriodicDefinition("live-periodic-true", Values(("ResearchValidated", "true")));
     Assert(LiveStrategyService.TryValidateResearchStrategy(periodicTrue, out _),
         "ResearchValidated=true 的週期策略必須通過研究閘門");
@@ -151,6 +153,23 @@ static void TestPeriodicRegistrationAndResearchValidationGate()
     };
     Assert(LiveStrategyService.TryValidateResearchStrategy(nonResearch, out _),
         "非研究策略不得被週期策略研究閘門誤拒絕");
+    var miniLead = new StrategyDefinition
+    {
+        StrategyType = MiniLeadMicroFactory.TypeName,
+        InstanceId = "live-mini-lead-missing",
+        Universe = new StrategyUniverse { Tradable = new ProductSelection("225MC", "225MC") },
+        Parameters = Values()
+    };
+    Assert(!LiveStrategyService.TryValidateResearchStrategy(miniLead, out string? miniLeadReason) &&
+           miniLeadReason == "ResearchValidationRequired",
+        "解除週期策略鎖定不得意外解除 Mini Lead 的研究驗證閘門");
+}
+
+static void TestPeriodicLiveTestingDoesNotRequireResearchValidation()
+{
+    StrategyDefinition periodic = PeriodicDefinition("live-periodic-testing", Values(("ResearchValidated", "false")));
+    Assert(LiveStrategyService.TryValidateResearchStrategy(periodic, out string? reasonCode) && reasonCode == null,
+        "解除週期策略實盤測試鎖定後，ResearchValidated=false 不得阻擋既有的人工確認實盤流程");
 }
 
 static void TestPeriodicControlSurfaceDefaultsAndResearchGate()
@@ -171,12 +190,12 @@ static void TestPeriodicControlSurfaceDefaultsAndResearchGate()
                 "週期策略控制頁必須暴露單邊逾時與各種冷卻時間的預設值");
             Assert(!simulation.Controls.OfType<CheckBox>().Any(control => control.Name == "ResearchValidated") &&
                    live.Controls.OfType<CheckBox>().Single(control => control.Name == "ResearchValidated").Checked == false &&
-                   !LiveStrategyService.TryValidateResearchStrategy(liveDefinition, out string? reason) &&
-                   reason == "ResearchValidationRequired",
-                "實盤週期控制頁必須預設未通過研究核可，且服務端仍須拒絕啟動");
+                   LiveStrategyService.TryValidateResearchStrategy(liveDefinition, out string? reason) &&
+                   reason == null,
+                "實盤週期控制頁的研究欄位只供紀錄，不得再鎖定測試啟動");
             live.ResearchValidated.Checked = true;
             Assert(LiveStrategyService.TryValidateResearchStrategy(live.CreateDefinition(), out _),
-                "明確勾選研究核可後才可通過實盤服務端研究閘門");
+                "研究紀錄欄位不應改變週期策略的實盤測試可用性");
         }
         catch (Exception exception)
         {
