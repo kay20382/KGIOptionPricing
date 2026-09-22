@@ -1,4 +1,5 @@
 using System.Globalization;
+using KGIOptionPricing;
 using KGIOptionPricing.OrderManagement.Core;
 using KGIOptionPricing.Strategies.PeriodicQueueCycle;
 using KGIOptionPricing.StrategyFramework;
@@ -63,6 +64,7 @@ TestPeriodicExitCallbacksAreIdempotentOutOfOrder();
 TestPeriodicHealthFlattenUsesNextTradePriceThroughRealPaperBroker();
 TestPeriodicStrategyPublishesTypedDecisionEvidence();
 TestPeriodicRegistrationAndResearchValidationGate();
+TestPeriodicControlSurfaceDefaultsAndResearchGate();
 
 Console.WriteLine("PeriodicQueueCycle smoke tests passed.");
 
@@ -149,6 +151,42 @@ static void TestPeriodicRegistrationAndResearchValidationGate()
     };
     Assert(LiveStrategyService.TryValidateResearchStrategy(nonResearch, out _),
         "非研究策略不得被週期策略研究閘門誤拒絕");
+}
+
+static void TestPeriodicControlSurfaceDefaultsAndResearchGate()
+{
+    Exception? failure = null;
+    var thread = new Thread(() =>
+    {
+        try
+        {
+            using var simulation = new PeriodicQueueCycleControls(live: false);
+            using var live = new PeriodicQueueCycleControls(live: true);
+            StrategyDefinition simulationDefinition = simulation.CreateDefinition();
+            StrategyDefinition liveDefinition = live.CreateDefinition();
+            Assert(simulationDefinition.StrategyType == PeriodicQueueCycleFactory.TypeName &&
+                   simulationDefinition.Parameters["MaxOneLegSeconds"] == "30" &&
+                   simulationDefinition.Parameters["CycleCooldownSeconds"] == "45" &&
+                   simulationDefinition.Parameters["StopLossCooldownSeconds"] == "60",
+                "週期策略控制頁必須暴露單邊逾時與各種冷卻時間的預設值");
+            Assert(!simulation.Controls.OfType<CheckBox>().Any(control => control.Name == "ResearchValidated") &&
+                   live.Controls.OfType<CheckBox>().Single(control => control.Name == "ResearchValidated").Checked == false &&
+                   !LiveStrategyService.TryValidateResearchStrategy(liveDefinition, out string? reason) &&
+                   reason == "ResearchValidationRequired",
+                "實盤週期控制頁必須預設未通過研究核可，且服務端仍須拒絕啟動");
+            live.ResearchValidated.Checked = true;
+            Assert(LiveStrategyService.TryValidateResearchStrategy(live.CreateDefinition(), out _),
+                "明確勾選研究核可後才可通過實盤服務端研究閘門");
+        }
+        catch (Exception exception)
+        {
+            failure = exception;
+        }
+    });
+    thread.SetApartmentState(ApartmentState.STA);
+    thread.Start();
+    thread.Join();
+    if (failure != null) throw new InvalidOperationException("週期策略控制頁建構或安全閘門失敗", failure);
 }
 
 static void TestParameterDefaultsAndSummary()
