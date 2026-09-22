@@ -8,6 +8,7 @@ using KGIOptionPricing.StrategyFramework.Execution;
 using KGIOptionPricing.StrategyFramework.Performance;
 using KGIOptionPricing.StrategyFramework.Storage;
 using System.Reflection;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
@@ -75,6 +76,29 @@ using (var managedRunner = new StrategyInstanceRunner(
            !managedBroker.CancelByClientOrderId("managed-route", "missing") &&
            managedProbe.Lifecycle.Count == lifecycleCount,
         "不存在或已終止的 ClientOrderId 不得偽造撤單確認");
+}
+
+var observationSource = new FakeSource();
+using (var observationHost = new StrategyHost(observationSource))
+{
+    var observationProbe = new ManagedProbeStrategy("managed-observation", "MGO");
+    var observationBroker = new CrossPricePaperExecutionService();
+    var routedLifecycle = new List<OrderLifecycleEvent>();
+    var routedDecisions = new List<StrategyDecisionObservation>();
+    observationHost.OrderLifecycleOccurred += routedLifecycle.Add;
+    observationHost.DecisionObserved += routedDecisions.Add;
+    observationHost.Add(observationProbe,
+        new ResolvedStrategyUniverse { Tradable = Product("225MC", "MGO", 5m, 10m) },
+        0m, observationBroker);
+    observationProbe.Observe(new StrategyDecisionObservation
+    {
+        Timestamp = DateTimeOffset.UtcNow, StrategyInstanceId = observationProbe.InstanceId,
+        Decision = StrategyDecision.Accept, PrimaryReasonCode = "SignalAccepted"
+    });
+    observationProbe.Request("observation-buy-g1", BuySell.Buy, 100m);
+    Assert(routedDecisions.Count == 1 && routedLifecycle.Select(x => x.State).SequenceEqual(new[]
+        { OrderLifecycleState.Submitted, OrderLifecycleState.Working }),
+        "StrategyHost 必須公開決策與 managed 委託生命週期供共用 recorder 路由");
 }
 
 var managedFillBroker = new CrossPricePaperExecutionService();
@@ -770,6 +794,134 @@ Assert(MarketDataArchiveCodec.TryDeserialize(legacyLine, out MarketEvent legacy)
        legacy.ProductId == "225MC" && legacy.Kind == MarketEventKind.Trade && legacy.BestBid == 49995m,
     "既有 NikkeiResearch 格式無法讀取");
 
+// Shared observability must retain enough correlated evidence to reproduce a run.
+string observationDirectory = Path.Combine(Path.GetTempPath(), "kgi-observation-" + Guid.NewGuid().ToString("N"));
+Directory.CreateDirectory(observationDirectory);
+try
+{
+    DateTimeOffset observedAt = new(2026, 9, 22, 1, 2, 3, TimeSpan.Zero);
+    using (var recorder = new SimulationRunRecorder(observationDirectory, TimeSpan.FromSeconds(30)))
+    {
+        recorder.RecordManifest(new RunManifest
+        {
+            RunId = "run-observation-1", StrategyType = "PeriodicQueueCycle", InstanceId = "observe-1",
+            Mode = StrategyRunMode.HistoricalReplay, StartedAt = observedAt,
+            EffectiveParameters = new Dictionary<string, string> { ["MinMoveTicks"] = "2" },
+            NormalizedParameters = "MinMoveTicks=2", ParameterSha256 = "PARAM-HASH",
+            InputArchive = new InputArchiveIdentity
+            {
+                AbsolutePath = @"E:\data\events.jsonl", SizeBytes = 123, LastWriteTimeUtc = observedAt,
+                Sha256 = "ARCHIVE-HASH"
+            },
+            Universe = new[] { new RunProductIdentity("225MC", "MCM6", "202606", 5m, 10m) },
+            ExecutionAssumptions = new Dictionary<string, string> { ["fillModel"] = "strict-cross" }
+        });
+
+        var accepted = new StrategyDecisionObservation
+        {
+            Sequence = 101, Timestamp = observedAt, StrategyType = "PeriodicQueueCycle",
+            StrategyInstanceId = "observe-1", CandidateId = "candidate-1", CycleId = "cycle-1",
+            Symbol = "MCM6", Direction = "Up", State = StrategyLifecycleState.Ready,
+            Decision = StrategyDecision.Accept, PrimaryReasonCode = "SignalAccepted",
+            SecondaryReasonCodes = new[] { "AllHealthGatesPassed" }, QuoteAgeSeconds = 0.25m,
+            SpreadTicks = 1m,
+            Thresholds = new[]
+            {
+                new ThresholdObservation("MinMoveTicks", 3m, 2m, "ticks", true),
+                new ThresholdObservation("MinDepthObi", 0.14m, 0.10m, "ratio", true)
+            }
+        };
+        recorder.Record(accepted);
+        recorder.Record(accepted with { Sequence = 102, Timestamp = observedAt.AddSeconds(1) });
+        recorder.Record(accepted with
+        {
+            Sequence = 103, Timestamp = observedAt.AddSeconds(2), State = StrategyLifecycleState.Running,
+            Decision = StrategyDecision.Hold, PrimaryReasonCode = "WorkingBoth"
+        });
+
+        recorder.Record(Lifecycle("cycle-1-buy-g1", "SIM-1", OrderLifecycleState.Submitted,
+            OrderLifecycleState.Submitted, 100m, observedAt.AddMilliseconds(10)));
+        recorder.Record(Lifecycle("cycle-1-buy-g1", "SIM-1", OrderLifecycleState.Submitted,
+            OrderLifecycleState.Submitted, 100m, observedAt.AddMilliseconds(15)));
+        recorder.Record(Lifecycle("cycle-1-sell-g1", "SIM-2", OrderLifecycleState.Submitted,
+            OrderLifecycleState.Submitted, 110m, observedAt.AddMilliseconds(20)));
+        recorder.Record(Lifecycle("cycle-1-sell-g1", "SIM-2", OrderLifecycleState.Working,
+            OrderLifecycleState.Cancelled, 110m, observedAt.AddSeconds(1)));
+        recorder.Record(ObservedExecution(1, "cycle-1-buy-g1", "SIM-1", BuySell.Buy,
+            PaperOrderRole.EntryLong, 100m, 95m, 201, observedAt.AddSeconds(2)));
+        recorder.Record(ObservedExecution(2, "cycle-1-sell-g2", "SIM-3", BuySell.Sell,
+            PaperOrderRole.EntryShort, 110m, 115m, 202, observedAt.AddSeconds(3)));
+        recorder.Record(new StrategySnapshot
+        {
+            StrategyType = "PeriodicQueueCycle", InstanceId = "observe-1", State = StrategyLifecycleState.Ready,
+            Reason = "CycleCompleted", RealizedPnl = 100m, NetPnl = 28m, CompletedTrades = 1,
+            UpdatedAt = observedAt.AddSeconds(3)
+        });
+        recorder.Record(new ParameterExperimentRecord
+        {
+            ExperimentId = "experiment-1", BaselineRunId = "baseline-1", CandidateRunId = "run-observation-1",
+            StrategyType = "PeriodicQueueCycle", SearchMethod = "manual", Status = ParameterExperimentStatus.Valid,
+            CandidateParameters = new Dictionary<string, string> { ["MinMoveTicks"] = "2" },
+            Results = new Dictionary<string, decimal?> { ["completedTrades"] = 1m }
+        });
+        recorder.FinalizeSummary(observedAt.AddSeconds(4));
+    }
+
+    string[] expectedArtifacts =
+    {
+        "run-manifest.json", "strategy-decisions.jsonl", "order-lifecycle.jsonl", "executions.csv",
+        "run-summary.json", "parameter-experiments.jsonl"
+    };
+    Assert(expectedArtifacts.All(name => File.Exists(Path.Combine(observationDirectory, name))),
+        "共用 recorder 必須產生六項可重現策略產物");
+    string executionsCsv = File.ReadAllText(Path.Combine(observationDirectory, "executions.csv"));
+    Assert(executionsCsv.Split('\n', StringSplitOptions.RemoveEmptyEntries).Length == 3 &&
+           executionsCsv.StartsWith("timestamp,sequence,marketSequence,instanceId,clientOrderId,orderId", StringComparison.Ordinal) &&
+           executionsCsv.Contains("\"cycle-1-buy-g1\"", StringComparison.Ordinal),
+        "executions.csv 必須以 InvariantCulture 保留兩筆成交及 clientOrderId");
+    string[] decisionLines = File.ReadAllLines(Path.Combine(observationDirectory, "strategy-decisions.jsonl"));
+    Assert(decisionLines.Length == 2, "相同決策心跳應壓縮，但狀態或原因變更必須保留");
+    using (JsonDocument decisionDocument = JsonDocument.Parse(decisionLines[0]))
+    {
+        JsonElement decision = decisionDocument.RootElement;
+        JsonElement threshold = decision.GetProperty("thresholds")[0];
+        Assert(decision.GetProperty("decision").GetString() == "Accept" &&
+               decision.GetProperty("cycleId").GetString() == "cycle-1" &&
+               decision.GetProperty("primaryReasonCode").GetString() == "SignalAccepted" &&
+               decision.GetProperty("secondaryReasonCodes").GetArrayLength() == 1 &&
+               decision.GetProperty("quoteAgeSeconds").GetDecimal() == 0.25m &&
+               decision.GetProperty("spreadTicks").GetDecimal() == 1m &&
+               threshold.GetProperty("observedValue").GetDecimal() == 3m &&
+               threshold.GetProperty("thresholdValue").GetDecimal() == 2m &&
+               threshold.GetProperty("passed").GetBoolean(),
+            "決策證據必須包含觀察值、門檻、通過結果、原因、報價年齡、價差及週期識別");
+    }
+    using (JsonDocument lifecycleDocument = JsonDocument.Parse(
+        File.ReadLines(Path.Combine(observationDirectory, "order-lifecycle.jsonl")).First()))
+        Assert(lifecycleDocument.RootElement.GetProperty("cycleId").GetString() == "cycle-1",
+            "訂單生命週期必須可關聯至週期識別");
+    Assert(File.ReadLines(Path.Combine(observationDirectory, "order-lifecycle.jsonl")).Count() == 3,
+        "同一委託重送相同生命週期轉換不得重複落盤");
+    using (JsonDocument summaryDocument = JsonDocument.Parse(
+        File.ReadAllText(Path.Combine(observationDirectory, "run-summary.json"))))
+    {
+        JsonElement summary = summaryDocument.RootElement;
+        Assert(summary.GetProperty("candidateSignals").GetInt64() == 1 &&
+               summary.GetProperty("acceptedSignals").GetInt64() == 1 &&
+               summary.GetProperty("submittedOrders").GetInt64() == 2 &&
+               summary.GetProperty("cancelledOrders").GetInt64() == 1 &&
+               summary.GetProperty("fills").GetInt64() == 2 &&
+               summary.GetProperty("completedTrades").GetInt64() == 1 &&
+               summary.GetProperty("marketEvents").ValueKind == JsonValueKind.Null &&
+               summary.GetProperty("unavailableReasons").GetProperty("marketEvents").GetString() == "MarketEventsNotObserved",
+            "run summary 必須彙總漏斗與交易，無法取得的指標使用 null 及穩定原因碼");
+    }
+}
+finally
+{
+    Directory.Delete(observationDirectory, recursive: true);
+}
+
 // UI regression: NumericUpDown defaults to Maximum=100, so Value=900 must be assigned only after its range.
 Exception? uiConstructionError = null;
 var uiThread = new Thread(() =>
@@ -815,6 +967,24 @@ static MarketEvent Book(string symbol, string product, decimal bid, decimal ask,
 {
     Symbol = symbol, ProductId = product, Sequence = sequence, Timestamp = time, Kind = MarketEventKind.Book,
     BidPrices = new[] { bid }, BidQuantities = new[] { 10 }, AskPrices = new[] { ask }, AskQuantities = new[] { 10 }
+};
+
+static OrderLifecycleEvent Lifecycle(string clientOrderId, string orderId, OrderLifecycleState previous,
+    OrderLifecycleState state, decimal price, DateTimeOffset timestamp) => new()
+{
+    Timestamp = timestamp, StrategyInstanceId = "observe-1", ClientOrderId = clientOrderId, OrderId = orderId,
+    PreviousState = previous, State = state, Price = price, Quantity = 1,
+    FilledQuantity = state == OrderLifecycleState.Filled ? 1 : 0,
+    RemainingQuantity = state == OrderLifecycleState.Filled ? 0 : 1,
+    ReasonCode = state.ToString()
+};
+
+static ExecutionEvent ObservedExecution(long sequence, string clientOrderId, string orderId, BuySell side,
+    PaperOrderRole role, decimal price, decimal triggerPrice, long marketSequence, DateTimeOffset timestamp) => new()
+{
+    Sequence = sequence, Timestamp = timestamp, MarketSequence = marketSequence, StrategyInstanceId = "observe-1",
+    ClientOrderId = clientOrderId, OrderId = orderId, Symbol = "MCM6", Side = side, Role = role,
+    Price = price, Quantity = 1, Commission = 36m, TriggerMarketPrice = triggerPrice
 };
 
 static MarketEvent FiveLevelTrade(string symbol, decimal bid, decimal ask, int bidQuantity, int askQuantity,
@@ -962,7 +1132,7 @@ sealed class DisposeProbeExecutionService : IStrategyExecutionService, IDisposab
     public void OnMarketEvent(MarketEvent marketEvent) { }
 }
 
-sealed class ManagedProbeStrategy : ISimulationStrategy, IManagedOrderStrategy
+sealed class ManagedProbeStrategy : ISimulationStrategy, IManagedOrderStrategy, IStrategyDecisionSource
 {
     private readonly string _symbol;
     private readonly bool _cancelAllOnStop;
@@ -985,6 +1155,9 @@ sealed class ManagedProbeStrategy : ISimulationStrategy, IManagedOrderStrategy
     public event Action? CancelAllRequested;
     public event Action<StrategySnapshot>? SnapshotChanged;
     public event Action<string>? CancelOrderRequested;
+    public event Action<StrategyDecisionObservation>? DecisionObserved;
+
+    public void Observe(StrategyDecisionObservation observation) => DecisionObserved?.Invoke(observation);
 
     public void Request(string clientOrderId, BuySell side, decimal price) => OrderRequested?.Invoke(new PaperOrderRequest
     {

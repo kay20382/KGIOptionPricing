@@ -29,6 +29,7 @@ public sealed class StrategyInstanceRunner : IDisposable
     private readonly IStrategyClock _clock;
     private readonly IManagedOrderStrategy? _managedStrategy;
     private readonly IManagedStrategyExecutionService? _managedBroker;
+    private readonly IStrategyDecisionSource? _decisionSource;
     private bool _disposed;
     private bool _disposing;
     private int _disposeOwnerThreadId;
@@ -41,6 +42,8 @@ public sealed class StrategyInstanceRunner : IDisposable
     internal bool IsDisposed { get { lock (_sync) return _disposed; } }
     public event Action<StrategySnapshot>? SnapshotChanged;
     public event Action<ExecutionEvent>? ExecutionOccurred;
+    public event Action<OrderLifecycleEvent>? OrderLifecycleOccurred;
+    public event Action<StrategyDecisionObservation>? DecisionObserved;
 
     public StrategyInstanceRunner(
         ISimulationStrategy strategy,
@@ -70,6 +73,11 @@ public sealed class StrategyInstanceRunner : IDisposable
             _managedStrategy.CancelOrderRequested += OnCancelOrderRequested;
             _managedBroker.OrderLifecycleChanged += OnOrderLifecycleChanged;
         }
+        if (_strategy is IStrategyDecisionSource decisionSource)
+        {
+            _decisionSource = decisionSource;
+            _decisionSource.DecisionObserved += OnDecisionObserved;
+        }
         if (!deferStart) try
         {
             Initialize();
@@ -82,6 +90,7 @@ public sealed class StrategyInstanceRunner : IDisposable
             _broker.Filled -= OnFilled;
             if (_managedStrategy != null) _managedStrategy.CancelOrderRequested -= OnCancelOrderRequested;
             if (_managedBroker != null) _managedBroker.OrderLifecycleChanged -= OnOrderLifecycleChanged;
+            if (_decisionSource != null) _decisionSource.DecisionObserved -= OnDecisionObserved;
             try { if (_broker is IDisposable disposable) disposable.Dispose(); } catch { }
             throw;
         }
@@ -210,7 +219,7 @@ public sealed class StrategyInstanceRunner : IDisposable
         {
             return;
         }
-        _managedStrategy?.OnOrderLifecycle(new OrderLifecycleEvent
+        var failure = new OrderLifecycleEvent
         {
             Timestamp = _clock.Now,
             StrategyInstanceId = _strategy.InstanceId,
@@ -218,7 +227,9 @@ public sealed class StrategyInstanceRunner : IDisposable
             PreviousState = OrderLifecycleState.CancelPending,
             State = OrderLifecycleState.CancelPending,
             ReasonCode = "CancelRequestNotRouted"
-        });
+        };
+        _managedStrategy?.OnOrderLifecycle(failure);
+        OrderLifecycleOccurred?.Invoke(failure);
     }
 
     private void OnOrderLifecycleChanged(OrderLifecycleEvent orderEvent)
@@ -230,7 +241,11 @@ public sealed class StrategyInstanceRunner : IDisposable
             if (_disposed) return;
             _managedStrategy?.OnOrderLifecycle(orderEvent);
         }
+        OrderLifecycleOccurred?.Invoke(orderEvent);
     }
+
+    private void OnDecisionObserved(StrategyDecisionObservation observation) =>
+        DecisionObserved?.Invoke(observation);
 
     private void OnFilled(ExecutionEvent execution)
     {
@@ -310,6 +325,7 @@ public sealed class StrategyInstanceRunner : IDisposable
                 _strategy.CancelAllRequested -= OnCancelAllRequested;
                 _strategy.SnapshotChanged -= OnStrategySnapshotChanged;
                 if (_managedStrategy != null) _managedStrategy.CancelOrderRequested -= OnCancelOrderRequested;
+                if (_decisionSource != null) _decisionSource.DecisionObserved -= OnDecisionObserved;
                 _paused = false;
                 try { _strategy.Stop("執行個體已釋放"); }
                 catch (Exception exception) { cleanupError = exception; }
@@ -355,6 +371,8 @@ public sealed class StrategyHost : IDisposable
 
     public event Action<StrategySnapshot>? SnapshotChanged;
     public event Action<ExecutionEvent>? ExecutionOccurred;
+    public event Action<OrderLifecycleEvent>? OrderLifecycleOccurred;
+    public event Action<StrategyDecisionObservation>? DecisionObserved;
     public PaperPortfolioLedger Ledger => _ledger;
 
     public StrategyHost(IMarketEventSource source, IStrategyClock? clock = null)
@@ -388,6 +406,8 @@ public sealed class StrategyHost : IDisposable
             runner = new StrategyInstanceRunner(strategy, universe, _ledger, _clock, commissionPerContract, executionService, deferStart: true);
             runner.SnapshotChanged += PublishSnapshotSafely;
             runner.ExecutionOccurred += execution => ExecutionOccurred?.Invoke(execution);
+            runner.OrderLifecycleOccurred += PublishOrderLifecycleSafely;
+            runner.DecisionObserved += PublishDecisionSafely;
             try { runner.Initialize(); }
             catch (Exception startError)
             {
@@ -540,6 +560,26 @@ public sealed class StrategyHost : IDisposable
         {
             try { handler(snapshot); }
             catch (Exception exception) { Debug.WriteLine($"Initial strategy snapshot subscriber failed: {exception}"); }
+        }
+    }
+
+    private void PublishOrderLifecycleSafely(OrderLifecycleEvent orderEvent)
+    {
+        Delegate[] handlers = OrderLifecycleOccurred?.GetInvocationList() ?? Array.Empty<Delegate>();
+        foreach (Action<OrderLifecycleEvent> handler in handlers.Cast<Action<OrderLifecycleEvent>>())
+        {
+            try { handler(orderEvent); }
+            catch (Exception exception) { Debug.WriteLine($"Order lifecycle subscriber failed: {exception}"); }
+        }
+    }
+
+    private void PublishDecisionSafely(StrategyDecisionObservation observation)
+    {
+        Delegate[] handlers = DecisionObserved?.GetInvocationList() ?? Array.Empty<Delegate>();
+        foreach (Action<StrategyDecisionObservation> handler in handlers.Cast<Action<StrategyDecisionObservation>>())
+        {
+            try { handler(observation); }
+            catch (Exception exception) { Debug.WriteLine($"Strategy decision subscriber failed: {exception}"); }
         }
     }
 
