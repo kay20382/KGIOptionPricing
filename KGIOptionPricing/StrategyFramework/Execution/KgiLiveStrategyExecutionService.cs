@@ -2,6 +2,11 @@ using KGIOptionPricing.OrderManagement.Core;
 
 namespace KGIOptionPricing.StrategyFramework.Execution;
 
+public sealed class BrokerReconciliationRequiredException : InvalidOperationException
+{
+    public BrokerReconciliationRequiredException(string message) : base(message) { }
+}
+
 /// <summary>
 /// Routes strategy orders through the shared OrderManager. Legacy Limit and
 /// Stop requests remain local OCO conditions. BrokerLimit requests are sent
@@ -35,6 +40,12 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         public bool IsManaged => !string.IsNullOrWhiteSpace(Order.ClientOrderId);
     }
 
+    private sealed class BrokerMutationLease
+    {
+        public required long Id { get; init; }
+        public bool Calling { get; set; }
+    }
+
     private readonly object _sync = new();
     private readonly ILiveStrategyOrderGateway _gateway;
     private readonly string _instanceId;
@@ -44,6 +55,12 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
     private readonly Func<DateTimeOffset> _now;
     private readonly Action? _beforeFilledPublished;
     private readonly Action? _beforeFlattenRegistration;
+    private readonly Action? _beforeSubmitValidation;
+    private readonly Action? _beforeBrokerMutationCommit;
+    private readonly Action? _afterBrokerMutationCommit;
+    private readonly Action? _afterBrokerMutationTransition;
+    private readonly object _brokerMutationSync = new();
+    private readonly Dictionary<long, BrokerMutationLease> _brokerMutationLeases = new();
     private readonly Dictionary<string, PaperOrder> _conditions = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, TrackedRealOrder> _realOrders = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _ownedClientOrderIds = new(StringComparer.OrdinalIgnoreCase);
@@ -57,6 +74,8 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
     private int _inflightOperations;
     private readonly Dictionary<int, int> _operationThreadDepth = new();
     private bool _protocolViolation;
+    private bool _protocolGateRequested;
+    private long _brokerMutationSequence;
 
     public event Action<ExecutionEvent>? Filled;
     public event Action<string>? Failed;
@@ -88,7 +107,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
     }
     internal bool ManualReconciliationRequired
     {
-        get { lock (_sync) return _protocolViolation; }
+        get { lock (_brokerMutationSync) return _protocolGateRequested; }
     }
 
     public KgiLiveStrategyExecutionService(
@@ -111,7 +130,11 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         decimal commissionPerContract,
         Func<DateTimeOffset>? now = null,
         Action? beforeFilledPublished = null,
-        Action? beforeFlattenRegistration = null)
+        Action? beforeFlattenRegistration = null,
+        Action? beforeSubmitValidation = null,
+        Action? beforeBrokerMutationCommit = null,
+        Action? afterBrokerMutationCommit = null,
+        Action? afterBrokerMutationTransition = null)
     {
         _gateway = gateway ?? throw new ArgumentNullException(nameof(gateway));
         _instanceId = instanceId;
@@ -120,6 +143,10 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         _now = now ?? (() => DateTimeOffset.Now);
         _beforeFilledPublished = beforeFilledPublished;
         _beforeFlattenRegistration = beforeFlattenRegistration;
+        _beforeSubmitValidation = beforeSubmitValidation;
+        _beforeBrokerMutationCommit = beforeBrokerMutationCommit;
+        _afterBrokerMutationCommit = afterBrokerMutationCommit;
+        _afterBrokerMutationTransition = afterBrokerMutationTransition;
         _instrument = LiveStrategyOrderMapper.ToInstrument(contract);
         _gateway.OrderFilled += OnOrderFilled;
         _gateway.OrderFailed += OnOrderFailed;
@@ -137,6 +164,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
             PurgeExpiredTerminalsLocked(_now());
             ThrowIfProtocolViolationLocked();
         }
+        _beforeSubmitValidation?.Invoke();
         if (!_gateway.IsLoggedIn) throw new InvalidOperationException("交易服務尚未登入，禁止實盤送單。");
         if (!string.Equals(request.StrategyInstanceId, _instanceId, StringComparison.OrdinalIgnoreCase))
             throw new InvalidOperationException("策略實例與實盤執行器不一致。");
@@ -449,15 +477,28 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         }
         PublishTransition(order.OrderId, OrderLifecycleState.Submitted, null, "Submitted", now);
 
+        BrokerMutationLease? mutation = null;
+        bool gatewayCallStarted = false;
         try
         {
-            lock (_sync) ThrowIfProtocolViolationLocked();
+            mutation = CommitBrokerMutationLease();
+            TransitionBrokerMutationToCall(mutation);
+            gatewayCallStarted = true;
             _gateway.PlaceOrder(brokerRequest);
+        }
+        catch (BrokerReconciliationRequiredException)
+        {
+            if (!gatewayCallStarted) RemoveNeverSubmittedOrder(order.OrderId);
+            throw;
         }
         catch (Exception ex)
         {
             PublishTransition(order.OrderId, OrderLifecycleState.Rejected, null, "SubmitException", _now());
             PublishFailureOnce(order.OrderId, "實盤限價單送單例外：" + ex.GetBaseException().Message);
+        }
+        finally
+        {
+            if (mutation != null) ReleaseBrokerMutationLease(mutation);
         }
     }
 
@@ -481,9 +522,13 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
             CommitClientOrderReservationLocked(condition.ClientOrderId);
         }
         PublishTransition(realId, OrderLifecycleState.Submitted, null, "Submitted", _now());
+        BrokerMutationLease? mutation = null;
+        bool gatewayCallStarted = false;
         try
         {
-            lock (_sync) ThrowIfProtocolViolationLocked();
+            mutation = CommitBrokerMutationLease();
+            TransitionBrokerMutationToCall(mutation);
+            gatewayCallStarted = true;
             _gateway.PlaceOrder(new OrderRequest
             {
                 OrderId = realId,
@@ -497,10 +542,19 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
                 Account = _gateway.Account
             });
         }
+        catch (BrokerReconciliationRequiredException)
+        {
+            if (!gatewayCallStarted) RemoveNeverSubmittedOrder(realId);
+            throw;
+        }
         catch (Exception ex)
         {
             PublishTransition(realId, OrderLifecycleState.Rejected, null, "SubmitException", _now());
             PublishFailureOnce(realId, "實盤送單例外：" + ex.GetBaseException().Message);
+        }
+        finally
+        {
+            if (mutation != null) ReleaseBrokerMutationLease(mutation);
         }
     }
 
@@ -521,20 +575,27 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         }
         PublishLifecycle(lifecycle);
 
+        BrokerMutationLease? mutation = null;
         try
         {
-            lock (_sync)
-            {
-                ThrowIfProtocolViolationLocked();
-            }
+            mutation = CommitBrokerMutationLease();
+            TransitionBrokerMutationToCall(mutation);
             _gateway.CancelOrder(realId);
             if (!managed) StateChanged?.Invoke();
             return true;
+        }
+        catch (BrokerReconciliationRequiredException)
+        {
+            throw;
         }
         catch (Exception ex)
         {
             Failed?.Invoke("實盤刪單例外：" + ex.GetBaseException().Message);
             return false;
+        }
+        finally
+        {
+            if (mutation != null) ReleaseBrokerMutationLease(mutation);
         }
     }
 
@@ -559,7 +620,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
             {
                 tracked.ProtocolViolation = true;
                 tracked.AwaitingSettlement = true;
-                _protocolViolation = true;
+                RequestProtocolGateLocked();
                 if (!tracked.ProtocolViolationPublished)
                 {
                     tracked.ProtocolViolationPublished = true;
@@ -705,7 +766,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
             {
                 tracked.ProtocolViolation = true;
                 tracked.AwaitingSettlement = true;
-                _protocolViolation = true;
+                RequestProtocolGateLocked();
                 if (!tracked.ProtocolViolationPublished)
                 {
                     tracked.ProtocolViolationPublished = true;
@@ -803,7 +864,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         {
             tracked.ProtocolViolation = true;
             tracked.AwaitingSettlement = true;
-            _protocolViolation = true;
+            RequestProtocolGateLocked();
         }
         int filled = Math.Clamp(reportedFilled, 0, tracked.Order.Quantity);
         int remaining = brokerOrder == null
@@ -933,9 +994,70 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         _ownedClientOrderIds.Remove(clientOrderId);
     }
 
+    private void RemoveNeverSubmittedOrder(string realId)
+    {
+        bool changed;
+        lock (_sync)
+        {
+            changed = _realOrders.Remove(realId, out TrackedRealOrder? tracked);
+            if (tracked != null) RetireClientOrderIdLocked(tracked.Order.ClientOrderId);
+        }
+        if (changed) StateChanged?.Invoke();
+    }
+
+    private BrokerMutationLease CommitBrokerMutationLease()
+    {
+        _beforeBrokerMutationCommit?.Invoke();
+        BrokerMutationLease lease;
+        lock (_brokerMutationSync)
+        {
+            if (_protocolGateRequested)
+                throw new BrokerReconciliationRequiredException(ProtocolReconciliationMessage);
+            lease = new BrokerMutationLease { Id = ++_brokerMutationSequence };
+            _brokerMutationLeases.Add(lease.Id, lease);
+        }
+        try
+        {
+            _afterBrokerMutationCommit?.Invoke();
+            return lease;
+        }
+        catch
+        {
+            ReleaseBrokerMutationLease(lease);
+            throw;
+        }
+    }
+
+    private void TransitionBrokerMutationToCall(BrokerMutationLease lease)
+    {
+        lock (_brokerMutationSync)
+        {
+            if (!_brokerMutationLeases.ContainsKey(lease.Id))
+                throw new InvalidOperationException("實盤 broker mutation lease 已失效。");
+            if (_protocolGateRequested)
+                throw new BrokerReconciliationRequiredException(ProtocolReconciliationMessage);
+            lease.Calling = true;
+        }
+        _afterBrokerMutationTransition?.Invoke();
+    }
+
+    private void ReleaseBrokerMutationLease(BrokerMutationLease lease)
+    {
+        lock (_brokerMutationSync) _brokerMutationLeases.Remove(lease.Id);
+    }
+
+    // Called while _sync is held. It never waits for a mutation already in the
+    // Calling phase; that call linearized before the gate and may finish.
+    private void RequestProtocolGateLocked()
+    {
+        _protocolViolation = true;
+        lock (_brokerMutationSync) _protocolGateRequested = true;
+    }
+
     private void ThrowIfProtocolViolationLocked()
     {
-        if (_protocolViolation) throw new InvalidOperationException(ProtocolReconciliationMessage);
+        if (_protocolViolation)
+            throw new BrokerReconciliationRequiredException(ProtocolReconciliationMessage);
     }
 
     public void Dispose() => DisposeIfSafe(() => true);

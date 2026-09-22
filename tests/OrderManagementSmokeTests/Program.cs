@@ -718,6 +718,182 @@ Assert(lateProtocolGateway.PlaceOrderCount == lateProtocolPlaces &&
        lateProtocolGateway.CancelOrderCount == lateProtocolCancels,
     "protocol flag後條件單觸發不得觸及gateway");
 
+// Broker mutations use a two-phase lease. A protocol gate may still abort an
+// operation before commit-to-call, but never after that linearization point.
+using var preCommitEntered = new ManualResetEventSlim(false);
+using var releasePreCommit = new ManualResetEventSlim(false);
+bool blockPreCommit = false;
+var preCommitGateway = new FakeLiveStrategyOrderGateway();
+var preCommitService = CreateLiveService(preCommitGateway, "precommit-live",
+    beforeBrokerMutationCommit: () =>
+    {
+        if (!blockPreCommit) return;
+        preCommitEntered.Set();
+        releasePreCommit.Wait();
+    });
+PaperOrder preCommitSeed = preCommitService.Submit(
+    liveBuy with { StrategyInstanceId = "precommit-live", ClientOrderId = "precommit-seed" },
+    DateTimeOffset.UtcNow);
+preCommitGateway.EmitFill(preCommitSeed.OrderId, 1, 0, OrderStatus.Filled, 1, 65000d);
+blockPreCommit = true;
+Task<PaperOrder> preCommitSubmit = Task.Factory.StartNew(() => preCommitService.Submit(
+        liveBuy with { StrategyInstanceId = "precommit-live", ClientOrderId = "precommit-target" },
+        DateTimeOffset.UtcNow),
+    CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+Assert(preCommitEntered.Wait(TimeSpan.FromSeconds(5)), "Submit必須停在mutation lease commit前");
+preCommitGateway.EmitState(preCommitSeed.OrderId, OrderStatus.Filled, 2, 0, "latch before commit");
+Assert(ManualReconciliationRequired(preCommitService),
+    "protocol callback請求gate當下manual reconciliation status就必須生效");
+releasePreCommit.Set();
+Exception preCommitError = CaptureTaskException(preCommitSubmit, "pre-commit Submit未在期限內結束");
+Assert(preCommitError is BrokerReconciliationRequiredException && preCommitGateway.PlaceOrderCount == 1,
+    "lease尚未commit時protocol latch必須中止送單且不得呼叫gateway");
+
+using var committedEntered = new ManualResetEventSlim(false);
+using var releaseCommitted = new ManualResetEventSlim(false);
+bool blockCommitted = false;
+var committedGateway = new FakeLiveStrategyOrderGateway();
+var committedService = CreateLiveService(committedGateway, "committed-live",
+    afterBrokerMutationCommit: () =>
+    {
+        if (!blockCommitted) return;
+        committedEntered.Set();
+        releaseCommitted.Wait();
+    });
+PaperOrder committedSeed = committedService.Submit(
+    liveBuy with { StrategyInstanceId = "committed-live", ClientOrderId = "committed-seed" },
+    DateTimeOffset.UtcNow);
+committedGateway.EmitFill(committedSeed.OrderId, 1, 0, OrderStatus.Filled, 1, 65000d);
+blockCommitted = true;
+Task<PaperOrder> committedSubmit = Task.Factory.StartNew(() => committedService.Submit(
+        liveBuy with { StrategyInstanceId = "committed-live", ClientOrderId = "committed-target" },
+        DateTimeOffset.UtcNow),
+    CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+Assert(committedEntered.Wait(TimeSpan.FromSeconds(5)), "Submit必須停在lease commit後、commit-to-call前");
+committedGateway.EmitState(committedSeed.OrderId, OrderStatus.Filled, 2, 0, "latch after commit");
+releaseCommitted.Set();
+Exception committedError = CaptureTaskException(committedSubmit, "committed Submit未在期限內結束");
+Assert(committedError is BrokerReconciliationRequiredException && committedGateway.PlaceOrderCount == 1,
+    "lease已commit但尚未transition-to-call時，protocol latch仍必須中止gateway call");
+
+using var callingEntered = new ManualResetEventSlim(false);
+using var releaseCalling = new ManualResetEventSlim(false);
+bool blockCalling = false;
+var callingGateway = new FakeLiveStrategyOrderGateway();
+var callingService = CreateLiveService(callingGateway, "calling-live",
+    afterBrokerMutationTransition: () =>
+    {
+        if (!blockCalling) return;
+        callingEntered.Set();
+        releaseCalling.Wait();
+    });
+PaperOrder callingSeed = callingService.Submit(
+    liveBuy with { StrategyInstanceId = "calling-live", ClientOrderId = "calling-seed" },
+    DateTimeOffset.UtcNow);
+callingGateway.EmitFill(callingSeed.OrderId, 1, 0, OrderStatus.Filled, 1, 65000d);
+blockCalling = true;
+Task<PaperOrder> callingSubmit = Task.Factory.StartNew(() => callingService.Submit(
+        liveBuy with { StrategyInstanceId = "calling-live", ClientOrderId = "calling-target" },
+        DateTimeOffset.UtcNow),
+    CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+Assert(callingEntered.Wait(TimeSpan.FromSeconds(5)), "Submit必須停在commit-to-call後、gateway call前");
+callingGateway.EmitState(callingSeed.OrderId, OrderStatus.Filled, 2, 0, "latch after transition");
+releaseCalling.Set();
+Assert(callingSubmit.Wait(TimeSpan.FromSeconds(5)) && callingGateway.PlaceOrderCount == 2,
+    "commit-to-call已線性化於gate之前的唯一一筆可完成");
+AssertThrows<BrokerReconciliationRequiredException>(() => callingService.Submit(
+        liveBuy with { StrategyInstanceId = "calling-live", ClientOrderId = "calling-blocked" },
+        DateTimeOffset.UtcNow),
+    "gate後任何後續mutation皆不得開始新lease");
+Assert(callingGateway.PlaceOrderCount == 2, "gate後不得多送第三張單");
+
+using var cancelCommittedEntered = new ManualResetEventSlim(false);
+using var releaseCancelCommitted = new ManualResetEventSlim(false);
+bool blockCancelCommitted = false;
+var cancelLeaseGateway = new FakeLiveStrategyOrderGateway();
+var cancelLeaseService = CreateLiveService(cancelLeaseGateway, "cancel-lease-live",
+    afterBrokerMutationCommit: () =>
+    {
+        if (!blockCancelCommitted) return;
+        cancelCommittedEntered.Set();
+        releaseCancelCommitted.Wait();
+    });
+PaperOrder cancelLeaseSeed = cancelLeaseService.Submit(
+    liveBuy with { StrategyInstanceId = "cancel-lease-live", ClientOrderId = "cancel-lease-seed" },
+    DateTimeOffset.UtcNow);
+cancelLeaseGateway.EmitFill(cancelLeaseSeed.OrderId, 1, 0, OrderStatus.Filled, 1, 65000d);
+PaperOrder cancelLeaseTarget = cancelLeaseService.Submit(
+    liveBuy with { StrategyInstanceId = "cancel-lease-live", ClientOrderId = "cancel-lease-target" },
+    DateTimeOffset.UtcNow);
+blockCancelCommitted = true;
+Task<bool> committedCancel = Task.Factory.StartNew(() => cancelLeaseService.Cancel(cancelLeaseTarget.OrderId),
+    CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+Assert(cancelCommittedEntered.Wait(TimeSpan.FromSeconds(5)), "Cancel必須共用broker mutation lease");
+cancelLeaseGateway.EmitState(cancelLeaseSeed.OrderId, OrderStatus.Filled, 2, 0, "cancel gate");
+releaseCancelCommitted.Set();
+Exception cancelLeaseError = CaptureTaskException(committedCancel, "committed Cancel未在期限內結束");
+Assert(cancelLeaseError is BrokerReconciliationRequiredException && cancelLeaseGateway.CancelOrderCount == 0,
+    "Cancel在commit-to-call前遇protocol latch必須不呼叫gateway");
+
+var synchronousProtocolGateway = new FakeLiveStrategyOrderGateway
+{
+    EmitProtocolViolationDuringPlaceOrder = true
+};
+var synchronousProtocolService = CreateLiveService(synchronousProtocolGateway, "sync-protocol-live");
+Task<PaperOrder> synchronousProtocolSubmit = Task.Factory.StartNew(() => synchronousProtocolService.Submit(
+        liveBuy with { StrategyInstanceId = "sync-protocol-live", ClientOrderId = "sync-protocol-g1" },
+        DateTimeOffset.UtcNow),
+    CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+Assert(synchronousProtocolSubmit.Wait(TimeSpan.FromSeconds(5)) &&
+       ManualReconciliationRequired(synchronousProtocolService),
+    "gateway PlaceOrder內同步protocol callback不得與mutation lease死鎖");
+AssertThrows<BrokerReconciliationRequiredException>(() => synchronousProtocolService.Submit(
+        liveBuy with { StrategyInstanceId = "sync-protocol-live", ClientOrderId = "sync-protocol-g2" },
+        DateTimeOffset.UtcNow),
+    "同步callback latch後後續送單必須被專用例外拒絕");
+
+// Runner must discriminate by exception type, never by observing a global flag
+// after an unrelated InvalidOperationException has already been selected.
+using var invalidValidationEntered = new ManualResetEventSlim(false);
+using var releaseInvalidValidation = new ManualResetEventSlim(false);
+bool blockInvalidValidation = false;
+var typedGateway = new FakeLiveStrategyOrderGateway();
+var typedExecution = CreateLiveService(typedGateway, "typed-runner-live",
+    beforeSubmitValidation: () =>
+    {
+        if (!blockInvalidValidation) return;
+        invalidValidationEntered.Set();
+        releaseInvalidValidation.Wait();
+    });
+var typedStrategy = new HostManagedProbeStrategy("typed-runner-live", "225MC");
+var typedHost = new StrategyHost(new FakeHostMarketSource());
+typedHost.Add(typedStrategy, lateProtocolUniverse, 36m, typedExecution);
+typedStrategy.Request(liveBuy with
+{
+    StrategyInstanceId = "typed-runner-live", ClientOrderId = "typed-seed"
+});
+PaperOrder typedSeed = typedExecution.GetWorkingOrders("typed-runner-live").Single();
+typedGateway.EmitFill(typedSeed.OrderId, 1, 0, OrderStatus.Filled, 1, 65000d);
+Exception duplicateIdError = CaptureException(() => typedStrategy.Request(liveBuy with
+{
+    StrategyInstanceId = "typed-runner-live", ClientOrderId = "typed-seed"
+}));
+Assert(duplicateIdError is InvalidOperationException and not BrokerReconciliationRequiredException,
+    "duplicate ClientOrderId必須保持一般InvalidOperationException並向上傳遞");
+blockInvalidValidation = true;
+Task invalidQuantityRequest = Task.Factory.StartNew(() => typedStrategy.Request(liveBuy with
+    {
+        StrategyInstanceId = "typed-runner-live", ClientOrderId = "typed-invalid", Quantity = 2
+    }), CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+Assert(invalidValidationEntered.Wait(TimeSpan.FromSeconds(5)),
+    "invalid quantity必須卡在初始gate check後、request validation前");
+typedGateway.EmitState(typedSeed.OrderId, OrderStatus.Filled, 2, 0, "concurrent latch");
+releaseInvalidValidation.Set();
+Exception invalidQuantityError = CaptureTaskException(invalidQuantityRequest,
+    "invalid quantity request未在期限內結束");
+Assert(invalidQuantityError is InvalidOperationException and not BrokerReconciliationRequiredException,
+    "並行protocol latch不得讓Runner吞掉已選定的quantity InvalidOperationException");
+
 // Dispose 必須 fail closed：有 active broker order 時不可清除追蹤或解除 callback。
 var disposeGateway = new FakeLiveStrategyOrderGateway();
 var disposeLifecycle = new List<OrderLifecycleEvent>();
@@ -1503,7 +1679,11 @@ static KgiLiveStrategyExecutionService CreateLiveService(
     string instanceId,
     Func<DateTimeOffset>? now = null,
     Action? beforeFilledPublished = null,
-    Action? beforeFlattenRegistration = null) => new(
+    Action? beforeFlattenRegistration = null,
+    Action? beforeSubmitValidation = null,
+    Action? beforeBrokerMutationCommit = null,
+    Action? afterBrokerMutationCommit = null,
+    Action? afterBrokerMutationTransition = null) => new(
         gateway,
         instanceId,
         new ResolvedProduct { ProductId = "225MC", Symbol = "225MC", TickSize = 5m, ContractMultiplier = 10m },
@@ -1515,7 +1695,11 @@ static KgiLiveStrategyExecutionService CreateLiveService(
         36m,
         now,
         beforeFilledPublished,
-        beforeFlattenRegistration);
+        beforeFlattenRegistration,
+        beforeSubmitValidation,
+        beforeBrokerMutationCommit,
+        afterBrokerMutationCommit,
+        afterBrokerMutationTransition);
 
 static KgiLiveStrategyExecutionService GetLiveExecution(LiveStrategyService service, string instanceId)
 {
@@ -1529,6 +1713,11 @@ static int ClientOrderRegistryCount(KgiLiveStrategyExecutionService service) =>
     (int)(typeof(KgiLiveStrategyExecutionService)
         .GetProperty("ClientOrderRegistryCount", BindingFlags.Instance | BindingFlags.NonPublic)
         ?.GetValue(service) ?? throw new InvalidOperationException("ClientOrderId registry observable missing"));
+
+static bool ManualReconciliationRequired(KgiLiveStrategyExecutionService service) =>
+    (bool)(typeof(KgiLiveStrategyExecutionService)
+        .GetProperty("ManualReconciliationRequired", BindingFlags.Instance | BindingFlags.NonPublic)
+        ?.GetValue(service) ?? throw new InvalidOperationException("manual reconciliation observable missing"));
 
 static MarketEvent HealthyBook(string symbol, decimal bestBid, long sequence, DateTimeOffset timestamp) => new()
 {
@@ -1615,6 +1804,20 @@ static void AssertThrows<TException>(Action action, string message) where TExcep
     throw new Exception(message);
 }
 
+static Exception CaptureException(Action action)
+{
+    try { action(); }
+    catch (Exception ex) { return ex; }
+    throw new Exception("預期操作拋出例外。");
+}
+
+static Exception CaptureTaskException(Task task, string timeoutMessage)
+{
+    if (!((IAsyncResult)task).AsyncWaitHandle.WaitOne(TimeSpan.FromSeconds(5)))
+        throw new Exception(timeoutMessage);
+    return CaptureException(() => task.GetAwaiter().GetResult());
+}
+
 sealed class FakeGateway : IOrderGateway
 {
     public string NextRequestId { get; set; } = "request";
@@ -1649,6 +1852,7 @@ sealed class FakeLiveStrategyOrderGateway : ILiveStrategyOrderGateway
     public string Account { get; set; } = "ACC";
     public bool BlockPlaceOrder { get; set; }
     public bool EmitFillBeforePlaceOrderRelease { get; set; }
+    public bool EmitProtocolViolationDuringPlaceOrder { get; set; }
     public ManualResetEventSlim PlaceOrderEntered { get; } = new(false);
     public ManualResetEventSlim ReleasePlaceOrder { get; } = new(false);
     public string LastOrderId { get; private set; } = string.Empty;
@@ -1680,6 +1884,13 @@ sealed class FakeLiveStrategyOrderGateway : ILiveStrategyOrderGateway
         LastOrderId = request.OrderId;
         PlaceOrderCount++;
         OrderStateChanged?.Invoke(order);
+        if (EmitProtocolViolationDuringPlaceOrder)
+        {
+            order.Status = OrderStatus.Filled;
+            order.FilledQty = request.Quantity + 1;
+            order.LeavesQty = 0;
+            OrderStateChanged?.Invoke(order);
+        }
         FakePlaceOutcome outcome = PlaceOutcomes.Count == 0 ? FakePlaceOutcome.None : PlaceOutcomes.Dequeue();
         if (outcome == FakePlaceOutcome.Throw) throw new InvalidOperationException("synchronous place failure");
         if (outcome is FakePlaceOutcome.Rejected or FakePlaceOutcome.Cancelled)

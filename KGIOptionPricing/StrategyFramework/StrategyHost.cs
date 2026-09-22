@@ -101,7 +101,7 @@ public sealed class StrategyInstanceRunner : IDisposable
             if (marketEvent.LastPrice > 0m)
                 _ledger.ApplyMark(marketEvent.Symbol, marketEvent.LastPrice);
             try { _broker.OnMarketEvent(marketEvent); }
-            catch (InvalidOperationException) when (RequiresManualBrokerReconciliation())
+            catch (BrokerReconciliationRequiredException)
             {
                 // Keep routing prices to the paused strategy for visibility;
                 // the execution service will reject any resulting auto order.
@@ -184,7 +184,7 @@ public sealed class StrategyInstanceRunner : IDisposable
     private void OnOrderRequested(PaperOrderRequest request)
     {
         try { _broker.Submit(request, _clock.Now); }
-        catch (InvalidOperationException) when (RequiresManualBrokerReconciliation())
+        catch (BrokerReconciliationRequiredException)
         {
             // The execution service already published the protocol failure.
             // Preserve the strategy so Live can pause it for manual recovery.
@@ -194,7 +194,7 @@ public sealed class StrategyInstanceRunner : IDisposable
     private void OnCancelAllRequested()
     {
         try { _broker.CancelAll(_strategy.InstanceId); }
-        catch (InvalidOperationException) when (RequiresManualBrokerReconciliation()) { }
+        catch (BrokerReconciliationRequiredException) { }
     }
 
     private void OnStrategySnapshotChanged(StrategySnapshot snapshot) =>
@@ -206,7 +206,7 @@ public sealed class StrategyInstanceRunner : IDisposable
         {
             if (_managedBroker?.CancelByClientOrderId(_strategy.InstanceId, clientOrderId) != false) return;
         }
-        catch (InvalidOperationException) when (RequiresManualBrokerReconciliation())
+        catch (BrokerReconciliationRequiredException)
         {
             return;
         }
@@ -220,9 +220,6 @@ public sealed class StrategyInstanceRunner : IDisposable
             ReasonCode = "CancelRequestNotRouted"
         });
     }
-
-    private bool RequiresManualBrokerReconciliation() =>
-        _broker is KgiLiveStrategyExecutionService liveBroker && liveBroker.ManualReconciliationRequired;
 
     private void OnOrderLifecycleChanged(OrderLifecycleEvent orderEvent)
     {
