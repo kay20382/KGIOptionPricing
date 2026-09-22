@@ -2,7 +2,7 @@ using KGIOptionPricing.StrategyFramework;
 
 namespace KGIOptionPricing.Strategies.PeriodicQueueCycle;
 
-public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOrderStrategy, IStrategyHeartbeat
+public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOrderStrategy, IStrategyHeartbeat, IStrategyDecisionSource
 {
     private readonly StrategyDefinition _definition;
     private readonly PeriodicQueueCycleParameters _parameters;
@@ -28,6 +28,7 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
     private int _pendingCooldownSeconds;
     private bool _exitRequested;
     private decimal _fixedStopPrice;
+    private int _completedTrades;
 
     internal PeriodicQueueCycleStrategy(
         StrategyDefinition definition,
@@ -45,6 +46,7 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
     public event Action? CancelAllRequested { add { } remove { } }
     public event Action<StrategySnapshot>? SnapshotChanged;
     public event Action<string>? CancelOrderRequested;
+    public event Action<StrategyDecisionObservation>? DecisionObserved;
 
     public void Start(StrategyRuntimeContext context)
     {
@@ -375,6 +377,7 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
             UnrealizedPnl = position.UnrealizedPnl,
             NetPnl = position.NetPnl,
             CommissionPerContract = _parameters.CommissionPerContract,
+            CompletedTrades = _completedTrades,
             UpdatedAt = _context?.Clock.Now ?? DateTimeOffset.Now
         };
     }
@@ -385,7 +388,98 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
 
     private void ForwardOrder(PaperOrderRequest request) => OrderRequested?.Invoke(request);
     private void ForwardCancel(string clientOrderId) => CancelOrderRequested?.Invoke(clientOrderId);
-    private void Publish() => SnapshotChanged?.Invoke(GetSnapshot());
+    private void Publish()
+    {
+        SnapshotChanged?.Invoke(GetSnapshot());
+        PublishDecisionObservation();
+    }
+
+    private void PublishDecisionObservation()
+    {
+        if (_context is null) return;
+        DirectionAssessment? assessment = _lastAssessment;
+        string primaryReason = StableReason(_reason);
+        StrategyDecision decision = primaryReason switch
+        {
+            "WarmupIncomplete" => StrategyDecision.Warmup,
+            "SignalAccepted" when _coordinator?.Phase is QueueCyclePhase.WorkingBoth or QueueCyclePhase.WorkingOneLeg => StrategyDecision.Accept,
+            "NeutralDirection" or "StaleQuote" or "InvalidBook" or "InsufficientSideDepth" or
+                "InsufficientNearDepth" or "DepthImbalance" or "SpreadTooWide" or "VolatilityTooHigh" => StrategyDecision.Reject,
+            "FixedStopLoss" or "OneLegTimeout" or "MarketDataRecoveryTimeout" or
+                "SignalReversedBeforeFill" => StrategyDecision.Exit,
+            "DailyLossLocked" => StrategyDecision.Halt,
+            _ when State is StrategyLifecycleState.Stopped or StrategyLifecycleState.Faulted => StrategyDecision.Halt,
+            _ => StrategyDecision.Hold
+        };
+        if (assessment?.PrimaryReasonCode == "SignalAccepted" &&
+            State is StrategyLifecycleState.Ready or StrategyLifecycleState.Running)
+        {
+            decision = StrategyDecision.Accept;
+            primaryReason = "SignalAccepted";
+        }
+
+        decimal? quoteAge = _lastBook is null
+            ? null
+            : Math.Max(0m, (decimal)(_context.Clock.Now - _lastBook.Timestamp).Ticks / TimeSpan.TicksPerSecond);
+        string cycleId = _coordinator?.CurrentCycleId ?? string.Empty;
+        if (cycleId.Length == 0 && decision == StrategyDecision.Accept && _coordinator is not null)
+            cycleId = $"cycle-{_coordinator.CycleNumber + 1}";
+        string candidateId = _lastBook is null ? string.Empty : $"{InstanceId}-signal-{_lastBook.Sequence}";
+        var features = new Dictionary<string, decimal?>
+        {
+            ["netMoveTicks"] = assessment?.NetMoveTicks,
+            ["pathTicks"] = assessment?.PathTicks,
+            ["trendEfficiency"] = assessment?.TrendEfficiency,
+            ["averageObi"] = assessment?.AverageObi,
+            ["volatilityTicks"] = assessment?.VolatilityTicks
+        };
+        var thresholds = assessment?.Thresholds.Select(threshold => new ThresholdObservation(
+            threshold.Name,
+            threshold.Observed,
+            threshold.Required,
+            ThresholdUnit(threshold.Name),
+            threshold.Passed)).ToArray() ?? Array.Empty<ThresholdObservation>();
+        IReadOnlyList<string> secondary = assessment?.OtherFailedReasonCodes ?? Array.Empty<string>();
+        bool healthFailure = IsHealthFailure(primaryReason);
+        DecisionObserved?.Invoke(new StrategyDecisionObservation
+        {
+            Sequence = _lastBook?.Sequence ?? 0L,
+            Timestamp = _context.Clock.Now,
+            StrategyType = StrategyType,
+            StrategyInstanceId = InstanceId,
+            CandidateId = candidateId,
+            CycleId = cycleId,
+            Symbol = _context.Universe.Tradable.Symbol,
+            Direction = assessment?.Direction.ToString() ?? CycleDirection.Neutral.ToString(),
+            State = State,
+            Decision = decision,
+            Features = features,
+            Thresholds = thresholds,
+            PrimaryReasonCode = primaryReason,
+            SecondaryReasonCodes = secondary,
+            QuoteAgeSeconds = quoteAge,
+            SpreadTicks = assessment?.SpreadTicks,
+            RequiredProductsPresent = true,
+            DataQualityFlags = healthFailure ? new[] { primaryReason } : Array.Empty<string>(),
+            UnavailableReasonCode = _lastBook is null ? "MarketBookNotObserved" : null
+        });
+    }
+
+    private static string ThresholdUnit(string name) => name switch
+    {
+        "MinSideDepth" or "MinNearDepth" or "DirectionWindowSeconds" => "count",
+        "QuoteFreshnessSeconds" => "seconds",
+        "MinDepthRatio" or "MinTrendEfficiency" or "UpMinDepthObi" or "DownMinDepthObi" => "ratio",
+        _ => "ticks"
+    };
+
+    private static string StableReason(string reason) => reason switch
+    {
+        "使用者暫停" => "Paused",
+        "尚未啟動" => "NotStarted",
+        _ when string.IsNullOrWhiteSpace(reason) => "ReasonUnavailable",
+        _ => reason
+    };
 
     private bool ManagePreFillReversal(DateTimeOffset timestamp)
     {
@@ -494,6 +588,7 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
     private void EnterCooldown(int seconds)
     {
         if (_coordinator is null || _context is null || _cooldownUntil.HasValue) return;
+        if (_coordinator.HasAnyEntryFill && Position().NetQuantity == 0) _completedTrades++;
         _coordinator.EnterCooldown();
         _cooldownUntil = _context.Clock.Now.AddSeconds(seconds);
         _oneLegStartedAt = null;

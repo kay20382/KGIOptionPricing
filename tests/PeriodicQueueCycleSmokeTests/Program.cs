@@ -61,8 +61,47 @@ TestPeriodicLifecycleFirstStopWaitsForExecutionAndProtection();
 TestPeriodicFixedStopDoesNotTriggerBelowSixTicks();
 TestPeriodicExitCallbacksAreIdempotentOutOfOrder();
 TestPeriodicHealthFlattenUsesNextTradePriceThroughRealPaperBroker();
+TestPeriodicStrategyPublishesTypedDecisionEvidence();
 
 Console.WriteLine("PeriodicQueueCycle smoke tests passed.");
+
+static void TestPeriodicStrategyPublishesTypedDecisionEvidence()
+{
+    DateTimeOffset start = new(2026, 9, 24, 1, 0, 0, TimeSpan.Zero);
+    var clock = new MutableClock(start);
+    var strategy = (PeriodicQueueCycleStrategy)new PeriodicQueueCycleFactory().Create(
+        PeriodicDefinition("decision-evidence", RiskParameters()));
+    var decisions = new List<StrategyDecisionObservation>();
+    ((IStrategyDecisionSource)strategy).DecisionObserved += decisions.Add;
+    strategy.Start(PeriodicContext(clock));
+    strategy.OnMarketEvent(StrategyBook(100m, 105m, 20, 10, 1, start));
+    clock.Advance(start.AddSeconds(1));
+    strategy.OnMarketEvent(new MarketEvent
+    {
+        Sequence = 2, Timestamp = clock.Now, Symbol = "225MC", ProductId = "225MC",
+        Kind = MarketEventKind.Book,
+        BidPrices = new[] { 110m }, BidQuantities = new[] { 1 },
+        AskPrices = new[] { 115m }, AskQuantities = new[] { 1 }
+    });
+    clock.Advance(start.AddSeconds(2));
+    strategy.OnMarketEvent(StrategyBook(110m, 115m, 20, 10, 3, clock.Now));
+    clock.Advance(start.AddSeconds(3));
+    strategy.OnMarketEvent(StrategyBook(120m, 125m, 20, 10, 4, clock.Now));
+
+    StrategyDecisionObservation warmup = decisions.First(x => x.Decision == StrategyDecision.Warmup && x.Thresholds.Count > 0);
+    StrategyDecisionObservation rejected = decisions.First(x => x.PrimaryReasonCode == "InvalidBook");
+    StrategyDecisionObservation accepted = decisions.First(x => x.Decision == StrategyDecision.Accept);
+    Assert(warmup.Thresholds.Any(x => x.Name == "DirectionWindowSeconds" && !x.Passed),
+        "暖機 observation 必須包含尚未通過的方向窗門檻");
+    Assert(rejected.DataQualityFlags.Contains("InvalidBook"),
+        "健康拒絕 observation 必須包含穩定資料品質原因");
+    Assert(accepted.PrimaryReasonCode == "SignalAccepted" && accepted.CycleId == "cycle-1",
+        $"接受 observation 必須關聯真正 cycle；actual={accepted.PrimaryReasonCode}/{accepted.CycleId}");
+    Assert(accepted.Thresholds.Any(x => x.Name == "MinTrendEfficiency" && x.Passed) &&
+           accepted.Features.ContainsKey("averageObi") && accepted.QuoteAgeSeconds == 0m &&
+           accepted.SpreadTicks == 1m,
+        "接受 observation 必須包含特徵、門檻、報價年齡與價差");
+}
 
 static void TestParameterDefaultsAndSummary()
 {
@@ -741,6 +780,10 @@ static void TestPeriodicStrategyIsNotOcoWhenOneSideFills()
         "一側成交不得自動取消另一側；雙邊完成單不是 OCO");
     Assert(orders.Count == 2 && orders.Any(x => x.Side == BuySell.Sell),
         "一側成交後另一側完成單必須維持獨立工作");
+    PaperOrderRequest sell = orders.Single(x => x.Side == BuySell.Sell);
+    strategy.OnExecution(Fill(sell.ClientOrderId, strategy.InstanceId, BuySell.Sell, sell.Price, start.AddSeconds(3)));
+    Assert(strategy.GetSnapshot().CompletedTrades == 1,
+        "雙邊實際成交且帳本空手後必須記錄一筆 completed trade");
 }
 
 static void TestPeriodicStrategySuppressesReplacementAfterCancelFillRace()

@@ -92,13 +92,35 @@ using (var observationHost = new StrategyHost(observationSource))
         0m, observationBroker);
     observationProbe.Observe(new StrategyDecisionObservation
     {
+        Timestamp = DateTimeOffset.UtcNow, StrategyInstanceId = "another-instance",
+        StrategyType = observationProbe.StrategyType,
+        Decision = StrategyDecision.Accept, PrimaryReasonCode = "WrongOwner"
+    });
+    observationProbe.Observe(new StrategyDecisionObservation
+    {
         Timestamp = DateTimeOffset.UtcNow, StrategyInstanceId = observationProbe.InstanceId,
+        StrategyType = "AnotherStrategy",
+        Decision = StrategyDecision.Accept, PrimaryReasonCode = "WrongType"
+    });
+    observationProbe.Observe(new StrategyDecisionObservation
+    {
+        Timestamp = DateTimeOffset.UtcNow, StrategyInstanceId = observationProbe.InstanceId,
+        StrategyType = observationProbe.StrategyType,
         Decision = StrategyDecision.Accept, PrimaryReasonCode = "SignalAccepted"
     });
     observationProbe.Request("observation-buy-g1", BuySell.Buy, 100m);
     Assert(routedDecisions.Count == 1 && routedLifecycle.Select(x => x.State).SequenceEqual(new[]
         { OrderLifecycleState.Submitted, OrderLifecycleState.Working }),
         "StrategyHost 必須公開決策與 managed 委託生命週期供共用 recorder 路由");
+    observationHost.Remove(observationProbe.InstanceId);
+    observationProbe.Observe(new StrategyDecisionObservation
+    {
+        Timestamp = DateTimeOffset.UtcNow, StrategyInstanceId = observationProbe.InstanceId,
+        StrategyType = observationProbe.StrategyType,
+        Decision = StrategyDecision.Hold, PrimaryReasonCode = "DisposedRunner"
+    });
+    Assert(routedDecisions.Count == 1,
+        "Host 必須拒絕不同 instance/type 的決策，並在 runner Dispose 後停止轉發");
 }
 
 var managedFillBroker = new CrossPricePaperExecutionService();
@@ -835,17 +857,21 @@ try
         recorder.Record(accepted with { Sequence = 102, Timestamp = observedAt.AddSeconds(1) });
         recorder.Record(accepted with
         {
+            Sequence = 102, Timestamp = observedAt.AddSeconds(1).AddMilliseconds(1), QuoteAgeSeconds = 0.5m
+        });
+        recorder.Record(accepted with
+        {
             Sequence = 103, Timestamp = observedAt.AddSeconds(2), State = StrategyLifecycleState.Running,
             Decision = StrategyDecision.Hold, PrimaryReasonCode = "WorkingBoth"
         });
 
-        recorder.Record(Lifecycle("cycle-1-buy-g1", "SIM-1", OrderLifecycleState.Submitted,
+        recorder.Record(Lifecycle("observe-1-cycle-1-buy-g1", "SIM-1", OrderLifecycleState.Submitted,
             OrderLifecycleState.Submitted, 100m, observedAt.AddMilliseconds(10)));
-        recorder.Record(Lifecycle("cycle-1-buy-g1", "SIM-1", OrderLifecycleState.Submitted,
+        recorder.Record(Lifecycle("observe-1-cycle-1-buy-g1", "SIM-1", OrderLifecycleState.Submitted,
             OrderLifecycleState.Submitted, 100m, observedAt.AddMilliseconds(15)));
-        recorder.Record(Lifecycle("cycle-1-sell-g1", "SIM-2", OrderLifecycleState.Submitted,
+        recorder.Record(Lifecycle("observe-1-cycle-1-sell-g1", "SIM-2", OrderLifecycleState.Submitted,
             OrderLifecycleState.Submitted, 110m, observedAt.AddMilliseconds(20)));
-        recorder.Record(Lifecycle("cycle-1-sell-g1", "SIM-2", OrderLifecycleState.Working,
+        recorder.Record(Lifecycle("observe-1-cycle-1-sell-g1", "SIM-2", OrderLifecycleState.Working,
             OrderLifecycleState.Cancelled, 110m, observedAt.AddSeconds(1)));
         recorder.Record(ObservedExecution(1, "cycle-1-buy-g1", "SIM-1", BuySell.Buy,
             PaperOrderRole.EntryLong, 100m, 95m, 201, observedAt.AddSeconds(2)));
@@ -862,7 +888,17 @@ try
             ExperimentId = "experiment-1", BaselineRunId = "baseline-1", CandidateRunId = "run-observation-1",
             StrategyType = "PeriodicQueueCycle", SearchMethod = "manual", Status = ParameterExperimentStatus.Valid,
             CandidateParameters = new Dictionary<string, string> { ["MinMoveTicks"] = "2" },
-            Results = new Dictionary<string, decimal?> { ["completedTrades"] = 1m }
+            ParameterDefinitions = new Dictionary<string, ParameterSearchDefinition>
+            {
+                ["MinMoveTicks"] = new("decimal", "ticks", 0.5m, 50m, 1m, 3m, 0.5m)
+            },
+            ProductMapping = new Dictionary<string, string> { ["225MC"] = "MCM6" },
+            ExecutionAssumptions = new Dictionary<string, string> { ["fillModel"] = "strict-cross" },
+            DataSplitId = "out-of-sample-1", PrimaryObjective = "netPnl",
+            SecondaryObjectives = new[] { "drawdown" },
+            GuardrailValues = new Dictionary<string, decimal?> { ["minimumCompletedTrades"] = 1m },
+            Results = new Dictionary<string, decimal?> { ["completedTrades"] = 1m },
+            AdverseSlippageStress = new Dictionary<int, decimal?> { [0] = 28m, [1] = -72m, [2] = -172m }
         });
         recorder.FinalizeSummary(observedAt.AddSeconds(4));
     }
@@ -876,11 +912,12 @@ try
         "共用 recorder 必須產生六項可重現策略產物");
     string executionsCsv = File.ReadAllText(Path.Combine(observationDirectory, "executions.csv"));
     Assert(executionsCsv.Split('\n', StringSplitOptions.RemoveEmptyEntries).Length == 3 &&
-           executionsCsv.StartsWith("timestamp,sequence,marketSequence,instanceId,clientOrderId,orderId", StringComparison.Ordinal) &&
+           executionsCsv.StartsWith("timestamp,sequence,marketSequence,instanceId,cycleId,generation,clientOrderId,orderId", StringComparison.Ordinal) &&
            executionsCsv.Contains("\"cycle-1-buy-g1\"", StringComparison.Ordinal),
         "executions.csv 必須以 InvariantCulture 保留兩筆成交及 clientOrderId");
     string[] decisionLines = File.ReadAllLines(Path.Combine(observationDirectory, "strategy-decisions.jsonl"));
-    Assert(decisionLines.Length == 2, "相同決策心跳應壓縮，但狀態或原因變更必須保留");
+    Assert(decisionLines.Length == 3,
+        "只可壓縮完全相同的決策心跳；觀測值、狀態或原因變更必須保留");
     using (JsonDocument decisionDocument = JsonDocument.Parse(decisionLines[0]))
     {
         JsonElement decision = decisionDocument.RootElement;
@@ -898,8 +935,12 @@ try
     }
     using (JsonDocument lifecycleDocument = JsonDocument.Parse(
         File.ReadLines(Path.Combine(observationDirectory, "order-lifecycle.jsonl")).First()))
-        Assert(lifecycleDocument.RootElement.GetProperty("cycleId").GetString() == "cycle-1",
-            "訂單生命週期必須可關聯至週期識別");
+        Assert(lifecycleDocument.RootElement.GetProperty("cycleId").GetString() == "cycle-1" &&
+               lifecycleDocument.RootElement.GetProperty("generation").GetInt32() == 1 &&
+               lifecycleDocument.RootElement.GetProperty("symbol").GetString() == "MCM6" &&
+               lifecycleDocument.RootElement.GetProperty("role").GetString() == "EntryLong" &&
+               lifecycleDocument.RootElement.GetProperty("submittedAt").ValueKind == JsonValueKind.String,
+            "訂單生命週期必須以 typed metadata 關聯週期、商品、角色、世代與階段時間");
     Assert(File.ReadLines(Path.Combine(observationDirectory, "order-lifecycle.jsonl")).Count() == 3,
         "同一委託重送相同生命週期轉換不得重複落盤");
     using (JsonDocument summaryDocument = JsonDocument.Parse(
@@ -912,7 +953,15 @@ try
                summary.GetProperty("cancelledOrders").GetInt64() == 1 &&
                summary.GetProperty("fills").GetInt64() == 2 &&
                summary.GetProperty("completedTrades").GetInt64() == 1 &&
+               summary.GetProperty("grossPnl").GetDecimal() == 100m &&
+               summary.GetProperty("executionCosts").GetDecimal() == 72m &&
+               summary.GetProperty("netPnl").GetDecimal() == 28m &&
+               summary.GetProperty("fillRate").GetDecimal() == 1m &&
+               summary.GetProperty("cancellationRate").GetDecimal() == 0.5m &&
+               summary.GetProperty("adverseSlippageStress").GetProperty("1").GetDecimal() == -72m &&
+               summary.GetProperty("mfePoints").ValueKind == JsonValueKind.Null &&
                summary.GetProperty("marketEvents").ValueKind == JsonValueKind.Null &&
+               summary.GetProperty("unavailableReasons").GetProperty("mfePoints").GetString() == "ExecutableBookPathNotObserved" &&
                summary.GetProperty("unavailableReasons").GetProperty("marketEvents").GetString() == "MarketEventsNotObserved",
             "run summary 必須彙總漏斗與交易，無法取得的指標使用 null 及穩定原因碼");
     }
@@ -920,6 +969,115 @@ try
 finally
 {
     Directory.Delete(observationDirectory, recursive: true);
+}
+
+string failingRecorderDirectory = Path.Combine(Path.GetTempPath(), "kgi-recorder-dispose-" + Guid.NewGuid().ToString("N"));
+try
+{
+    var failingRecorder = new SimulationRunRecorder(failingRecorderDirectory);
+    Directory.CreateDirectory(Path.Combine(failingRecorderDirectory, "run-summary.json"));
+    bool finalizeFailed = false;
+    try { failingRecorder.Dispose(); }
+    catch (AggregateException) { finalizeFailed = true; }
+    Assert(finalizeFailed, "summary 無法寫入時 Dispose 必須回報錯誤");
+    failingRecorder.Dispose();
+    File.Delete(Path.Combine(failingRecorderDirectory, "strategy-events.jsonl"));
+    Assert(!File.Exists(Path.Combine(failingRecorderDirectory, "strategy-events.jsonl")),
+        "summary finalize 失敗不得略過 stream cleanup，重複 Dispose 必須幂等");
+}
+finally
+{
+    if (Directory.Exists(failingRecorderDirectory)) Directory.Delete(failingRecorderDirectory, recursive: true);
+}
+
+string recorderSetRoot = Path.Combine(Path.GetTempPath(), "kgi-recorder-set-" + Guid.NewGuid().ToString("N"));
+string recorderOnePath = Path.Combine(recorderSetRoot, "one");
+string recorderTwoPath = Path.Combine(recorderSetRoot, "two");
+try
+{
+    using var recorderSet = new StrategyRunRecorderSet();
+    recorderSet.Add("instance-one", new SimulationRunRecorder(recorderOnePath));
+    recorderSet.Add("instance-two", new SimulationRunRecorder(recorderTwoPath));
+    recorderSet.Record(new StrategySnapshot
+    {
+        InstanceId = "instance-one", StrategyType = "First", Reason = "only-one", UpdatedAt = DateTimeOffset.UtcNow
+    });
+    recorderSet.Record(new StrategySnapshot
+    {
+        InstanceId = "instance-two", StrategyType = "Second", Reason = "only-two", UpdatedAt = DateTimeOffset.UtcNow
+    });
+    recorderSet.Record(ObservedExecution(11, "instance-one-cycle-1-buy-g1", "ONE", BuySell.Buy,
+        PaperOrderRole.EntryLong, 100m, 95m, 301, DateTimeOffset.UtcNow) with { StrategyInstanceId = "instance-one" });
+    recorderSet.Record(ObservedExecution(12, "instance-two-cycle-1-buy-g1", "TWO", BuySell.Buy,
+        PaperOrderRole.EntryLong, 200m, 195m, 302, DateTimeOffset.UtcNow) with { StrategyInstanceId = "instance-two" });
+    recorderSet.RemoveAndFinalize("instance-one", DateTimeOffset.UtcNow);
+    recorderSet.RemoveAndFinalize("instance-two", DateTimeOffset.UtcNow);
+    string oneEvents = File.ReadAllText(Path.Combine(recorderOnePath, "strategy-events.jsonl"));
+    string twoEvents = File.ReadAllText(Path.Combine(recorderTwoPath, "strategy-events.jsonl"));
+    string oneExecutions = File.ReadAllText(Path.Combine(recorderOnePath, "executions.csv"));
+    string twoExecutions = File.ReadAllText(Path.Combine(recorderTwoPath, "executions.csv"));
+    Assert(oneEvents.Contains("only-one", StringComparison.Ordinal) && !oneEvents.Contains("only-two", StringComparison.Ordinal) &&
+           twoEvents.Contains("only-two", StringComparison.Ordinal) && !twoEvents.Contains("only-one", StringComparison.Ordinal) &&
+           oneExecutions.Contains("\"ONE\"", StringComparison.Ordinal) && !oneExecutions.Contains("\"TWO\"", StringComparison.Ordinal) &&
+           twoExecutions.Contains("\"TWO\"", StringComparison.Ordinal) && !twoExecutions.Contains("\"ONE\"", StringComparison.Ordinal),
+        "live-shadow recorder registry 必須依 StrategyInstanceId 完全隔離 artifact");
+}
+finally
+{
+    if (Directory.Exists(recorderSetRoot)) Directory.Delete(recorderSetRoot, recursive: true);
+}
+
+string integratedArtifactPath = Path.Combine(Path.GetTempPath(), "kgi-integrated-artifact-" + Guid.NewGuid().ToString("N"));
+try
+{
+    var integratedClock = new MutableStrategyClock(new DateTimeOffset(2026, 9, 22, 2, 0, 0, TimeSpan.Zero));
+    var integratedSource = new FakeSource();
+    var integratedBroker = new CrossPricePaperExecutionService(1m, integratedClock);
+    var integratedStrategy = new ArtifactCycleStrategy("artifact-cycle", "ART");
+    using (var integratedRecorder = new SimulationRunRecorder(integratedArtifactPath))
+    using (var integratedHost = new StrategyHost(integratedSource, integratedClock))
+    {
+        integratedRecorder.RecordManifest(new RunManifest
+        {
+            RunId = "integrated", StrategyType = integratedStrategy.StrategyType,
+            InstanceId = integratedStrategy.InstanceId, Mode = StrategyRunMode.HistoricalReplay,
+            StartedAt = integratedClock.Now,
+            Universe = new[] { new RunProductIdentity("225MC", "ART", "202612", 5m, 10m) }
+        });
+        integratedHost.SnapshotChanged += integratedRecorder.Record;
+        integratedHost.ExecutionOccurred += integratedRecorder.Record;
+        integratedHost.OrderLifecycleOccurred += integratedRecorder.Record;
+        integratedHost.DecisionObserved += integratedRecorder.Record;
+        integratedHost.Add(integratedStrategy,
+            new ResolvedStrategyUniverse { Tradable = Product("225MC", "ART", 5m, 10m) },
+            1m, integratedBroker);
+        integratedStrategy.CancelOriginalSellAndSubmitReplacement();
+        integratedClock.Advance(integratedClock.Now.AddSeconds(1));
+        integratedSource.Emit(Trade("ART", "225MC", 95m, 401, integratedClock.Now));
+        integratedClock.Advance(integratedClock.Now.AddSeconds(1));
+        integratedSource.Emit(Trade("ART", "225MC", 115m, 402, integratedClock.Now));
+        integratedRecorder.FinalizeSummary(integratedClock.Now);
+    }
+    string[] lifecycleLines = File.ReadAllLines(Path.Combine(integratedArtifactPath, "order-lifecycle.jsonl"));
+    string[] executionLines = File.ReadAllLines(Path.Combine(integratedArtifactPath, "executions.csv"));
+    string executionText = string.Join('\n', executionLines);
+    string[] filledIds = lifecycleLines.Select(line => JsonDocument.Parse(line))
+        .Where(document => document.RootElement.GetProperty("state").GetString() == "Filled")
+        .Select(document => document.RootElement.GetProperty("clientOrderId").GetString()!)
+        .ToArray();
+    Assert(lifecycleLines.Count(line => line.Contains("\"state\":\"Submitted\"", StringComparison.Ordinal)) == 3 &&
+           lifecycleLines.Count(line => line.Contains("\"state\":\"Cancelled\"", StringComparison.Ordinal)) == 1 &&
+           filledIds.Length == 2 && executionLines.Length == 3 &&
+           filledIds.All(id => executionText.Contains($"\"{id}\"", StringComparison.Ordinal)),
+        "Host+paper executor 整合產物必須把 submit/cancel/fill 與 executions 以同一 ClientOrderId 關聯");
+    using JsonDocument integratedSummary = JsonDocument.Parse(
+        File.ReadAllText(Path.Combine(integratedArtifactPath, "run-summary.json")));
+    Assert(integratedSummary.RootElement.GetProperty("completedTrades").GetInt64() == 1,
+        "Host+paper executor 完整買賣週期必須在摘要形成一筆 completed trade");
+}
+finally
+{
+    if (Directory.Exists(integratedArtifactPath)) Directory.Delete(integratedArtifactPath, recursive: true);
 }
 
 // UI regression: NumericUpDown defaults to Maximum=100, so Value=900 must be assigned only after its range.
@@ -973,6 +1131,9 @@ static OrderLifecycleEvent Lifecycle(string clientOrderId, string orderId, Order
     OrderLifecycleState state, decimal price, DateTimeOffset timestamp) => new()
 {
     Timestamp = timestamp, StrategyInstanceId = "observe-1", ClientOrderId = clientOrderId, OrderId = orderId,
+    Symbol = "MCM6", Side = clientOrderId.Contains("-buy-", StringComparison.Ordinal) ? BuySell.Buy : BuySell.Sell,
+    Role = clientOrderId.Contains("-buy-", StringComparison.Ordinal) ? PaperOrderRole.EntryLong : PaperOrderRole.EntryShort,
+    CycleId = "cycle-1", Generation = 1,
     PreviousState = previous, State = state, Price = price, Quantity = 1,
     FilledQuantity = state == OrderLifecycleState.Filled ? 1 : 0,
     RemainingQuantity = state == OrderLifecycleState.Filled ? 0 : 1,
@@ -1058,6 +1219,61 @@ sealed class FakeSource : IMarketEventSource
     public void Subscribe(IEnumerable<ResolvedProduct> products) { }
     public void Emit(MarketEvent marketEvent) => MarketEventReceived?.Invoke(marketEvent);
     public void Dispose() { }
+}
+
+sealed class ArtifactCycleStrategy : ISimulationStrategy, IManagedOrderStrategy, IStrategyDecisionSource
+{
+    private readonly string _symbol;
+    private int _fills;
+    public ArtifactCycleStrategy(string instanceId, string symbol) { InstanceId = instanceId; _symbol = symbol; }
+    public string StrategyType => "ArtifactCycle";
+    public string InstanceId { get; }
+    public StrategyLifecycleState State { get; private set; } = StrategyLifecycleState.Created;
+    public event Action<PaperOrderRequest>? OrderRequested;
+    public event Action? CancelAllRequested { add { } remove { } }
+    public event Action<StrategySnapshot>? SnapshotChanged;
+    public event Action<string>? CancelOrderRequested;
+    public event Action<StrategyDecisionObservation>? DecisionObserved;
+    public void Start(StrategyRuntimeContext context)
+    {
+        State = StrategyLifecycleState.Running;
+        DecisionObserved?.Invoke(new StrategyDecisionObservation
+        {
+            Timestamp = context.Clock.Now, StrategyType = StrategyType, StrategyInstanceId = InstanceId,
+            CandidateId = "candidate-1", CycleId = "cycle-1", Symbol = _symbol,
+            Direction = "Up", State = State, Decision = StrategyDecision.Accept,
+            PrimaryReasonCode = "SignalAccepted",
+            Thresholds = new[] { new ThresholdObservation("MinMoveTicks", 3m, 2m, "ticks", true) }
+        });
+        OrderRequested?.Invoke(Order("buy-g1", BuySell.Buy, PaperOrderRole.EntryLong, 100m, 1));
+        OrderRequested?.Invoke(Order("sell-g1", BuySell.Sell, PaperOrderRole.EntryShort, 110m, 1));
+        Publish();
+    }
+    public void CancelOriginalSellAndSubmitReplacement()
+    {
+        CancelOrderRequested?.Invoke($"{InstanceId}-cycle-1-sell-g1");
+        OrderRequested?.Invoke(Order("sell-g2", BuySell.Sell, PaperOrderRole.EntryShort, 110m, 2));
+    }
+    private PaperOrderRequest Order(string suffix, BuySell side, PaperOrderRole role, decimal price, int generation) => new()
+    {
+        ClientOrderId = $"{InstanceId}-cycle-1-{suffix}", CycleId = "cycle-1", Generation = generation,
+        StrategyInstanceId = InstanceId, Symbol = _symbol, Side = side, Type = PaperOrderType.BrokerLimit,
+        Role = role, Price = price, Quantity = 1
+    };
+    public void OnExecution(ExecutionEvent execution) { _fills++; Publish(); }
+    public void OnOrderLifecycle(OrderLifecycleEvent orderEvent) { }
+    public void OnMarketEvent(MarketEvent marketEvent) { }
+    public void Pause(string reason) => State = StrategyLifecycleState.Suspended;
+    public void Resume() => State = StrategyLifecycleState.Running;
+    public void Stop(string reason) { State = StrategyLifecycleState.Stopped; Publish(); }
+    public StrategySnapshot GetSnapshot() => new()
+    {
+        StrategyType = StrategyType, InstanceId = InstanceId, State = State,
+        Reason = _fills >= 2 ? "CycleCompleted" : "Working", CompletedTrades = _fills >= 2 ? 1 : 0,
+        RealizedPnl = _fills >= 2 ? 10m : 0m, NetPnl = _fills >= 2 ? 8m : 0m,
+        UpdatedAt = DateTimeOffset.UtcNow
+    };
+    private void Publish() => SnapshotChanged?.Invoke(GetSnapshot());
 }
 
 sealed class TransactionalSource : IMarketEventSource

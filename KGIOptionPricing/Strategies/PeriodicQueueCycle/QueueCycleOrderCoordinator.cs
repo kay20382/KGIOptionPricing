@@ -68,6 +68,7 @@ internal sealed class QueueCycleOrderCoordinator
     internal QueueCyclePhase Phase { get; private set; } = QueueCyclePhase.Ready;
     internal string ReasonCode { get; private set; } = "WarmupIncomplete";
     internal long CycleNumber { get; private set; }
+    internal string CurrentCycleId => _buy?.CycleId ?? string.Empty;
     internal CycleDirection FrozenDirection { get; private set; } = CycleDirection.Neutral;
     internal DirectionAssessment? FrozenAssessment { get; private set; }
     internal FrozenPriceBounds? FrozenBounds { get; private set; }
@@ -80,6 +81,7 @@ internal sealed class QueueCycleOrderCoordinator
     internal bool EntryOrdersTerminal => !IsOutstanding(_buy) && !IsOutstanding(_sell) &&
         !HasUnreconciledFill(_buy) && !HasUnreconciledFill(_sell);
     internal bool HasBothEntryFills => _buy?.HasFill == true && _sell?.HasFill == true;
+    internal bool HasAnyEntryFill => _buy?.HasFill == true || _sell?.HasFill == true;
     internal string CycleSummary =>
         $"Cycle={_buy?.CycleId ?? "none"};Direction={FrozenDirection};" +
         $"Buy={LegSummary(_buy)};Sell={LegSummary(_sell)};" +
@@ -184,6 +186,8 @@ internal sealed class QueueCycleOrderCoordinator
         OrderRequested?.Invoke(new PaperOrderRequest
         {
             ClientOrderId = _exitClientOrderId,
+            CycleId = $"cycle-{CycleNumber}",
+            Generation = 1,
             StrategyInstanceId = _instanceId,
             Symbol = _symbol,
             Side = position.NetQuantity > 0 ? BuySell.Sell : BuySell.Buy,
@@ -512,6 +516,8 @@ internal sealed class QueueCycleOrderCoordinator
     private PaperOrderRequest CreateOrder(OrderLeg leg) => new()
     {
         ClientOrderId = leg.ClientOrderId,
+        CycleId = leg.CycleId,
+        Generation = leg.Generation,
         StrategyInstanceId = _instanceId,
         Symbol = _symbol,
         Side = leg.Side,

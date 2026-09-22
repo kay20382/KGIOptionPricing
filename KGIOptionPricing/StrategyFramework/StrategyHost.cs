@@ -244,8 +244,17 @@ public sealed class StrategyInstanceRunner : IDisposable
         OrderLifecycleOccurred?.Invoke(orderEvent);
     }
 
-    private void OnDecisionObserved(StrategyDecisionObservation observation) =>
+    private void OnDecisionObserved(StrategyDecisionObservation observation)
+    {
+        if (!string.Equals(observation.StrategyInstanceId, _strategy.InstanceId, StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(observation.StrategyType, _strategy.StrategyType, StringComparison.OrdinalIgnoreCase))
+            return;
+        lock (_sync)
+        {
+            if (_disposed || _disposing) return;
+        }
         DecisionObserved?.Invoke(observation);
+    }
 
     private void OnFilled(ExecutionEvent execution)
     {

@@ -36,6 +36,8 @@ public sealed class CrossPricePaperExecutionService : IPaperExecutionService, IM
         {
             OrderId = $"SIM-{request.StrategyInstanceId}-{System.Threading.Interlocked.Increment(ref _orderSequence)}",
             ClientOrderId = request.ClientOrderId,
+            CycleId = request.CycleId,
+            Generation = request.Generation,
             StrategyInstanceId = request.StrategyInstanceId,
             Symbol = request.Symbol,
             Side = request.Side,
@@ -150,6 +152,8 @@ public sealed class CrossPricePaperExecutionService : IPaperExecutionService, IM
                     Timestamp = marketEvent.Timestamp,
                     StrategyInstanceId = order.StrategyInstanceId,
                     ClientOrderId = order.ClientOrderId,
+                    CycleId = order.CycleId,
+                    Generation = order.Generation,
                     OrderId = order.OrderId,
                     Symbol = order.Symbol,
                     Side = order.Side,
@@ -166,7 +170,7 @@ public sealed class CrossPricePaperExecutionService : IPaperExecutionService, IM
         {
             Filled?.Invoke(fills[i]);
             PublishLifecycle(filledOrders[i], OrderLifecycleState.Working, OrderLifecycleState.Filled,
-                marketEvent.Timestamp, "Filled", filledOrders[i].Quantity);
+                marketEvent.Timestamp, "Filled", filledOrders[i].Quantity, marketEvent.Sequence);
         }
     }
 
@@ -176,14 +180,21 @@ public sealed class CrossPricePaperExecutionService : IPaperExecutionService, IM
         OrderLifecycleState state,
         DateTimeOffset timestamp,
         string reasonCode,
-        int filledQuantity = 0)
+        int filledQuantity = 0,
+        long triggerMarketSequence = 0)
     {
         OrderLifecycleChanged?.Invoke(new OrderLifecycleEvent
         {
             Timestamp = timestamp,
             StrategyInstanceId = order.StrategyInstanceId,
             ClientOrderId = order.ClientOrderId,
+            CycleId = order.CycleId,
+            Generation = order.Generation,
             OrderId = order.OrderId,
+            Symbol = order.Symbol,
+            Side = order.Side,
+            Role = order.Role,
+            TriggerMarketSequence = triggerMarketSequence,
             PreviousState = previousState,
             State = state,
             Price = order.Price,

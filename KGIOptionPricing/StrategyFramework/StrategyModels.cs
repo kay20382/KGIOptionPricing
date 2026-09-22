@@ -77,6 +77,8 @@ public sealed record ResolvedStrategyUniverse
 public sealed record PaperOrderRequest
 {
     public string ClientOrderId { get; init; } = string.Empty;
+    public string CycleId { get; init; } = string.Empty;
+    public int Generation { get; init; }
     public string StrategyInstanceId { get; init; } = string.Empty;
     public string Symbol { get; init; } = string.Empty;
     public BuySell Side { get; init; }
@@ -90,6 +92,8 @@ public sealed record PaperOrder
 {
     public string OrderId { get; init; } = string.Empty;
     public string ClientOrderId { get; init; } = string.Empty;
+    public string CycleId { get; init; } = string.Empty;
+    public int Generation { get; init; }
     public string StrategyInstanceId { get; init; } = string.Empty;
     public string Symbol { get; init; } = string.Empty;
     public BuySell Side { get; init; }
@@ -107,6 +111,8 @@ public sealed record ExecutionEvent
     public DateTimeOffset Timestamp { get; init; }
     public string StrategyInstanceId { get; init; } = string.Empty;
     public string ClientOrderId { get; init; } = string.Empty;
+    public string CycleId { get; init; } = string.Empty;
+    public int Generation { get; init; }
     public string OrderId { get; init; } = string.Empty;
     public string Symbol { get; init; } = string.Empty;
     public BuySell Side { get; init; }
@@ -123,8 +129,14 @@ public sealed record OrderLifecycleEvent
     public DateTimeOffset Timestamp { get; init; }
     public string StrategyInstanceId { get; init; } = string.Empty;
     public string ClientOrderId { get; init; } = string.Empty;
+    public string CycleId { get; init; } = string.Empty;
+    public int Generation { get; init; }
     public string OrderId { get; init; } = string.Empty;
     public string BrokerOrderId { get; init; } = string.Empty;
+    public string Symbol { get; init; } = string.Empty;
+    public BuySell Side { get; init; }
+    public PaperOrderRole Role { get; init; }
+    public long TriggerMarketSequence { get; init; }
     public OrderLifecycleState PreviousState { get; init; }
     public OrderLifecycleState State { get; init; }
     public decimal Price { get; init; }

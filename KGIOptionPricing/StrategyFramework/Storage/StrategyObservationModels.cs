@@ -71,7 +71,6 @@ public sealed record RunManifest
     public string? CodeVersion { get; init; }
     public StrategyRunMode Mode { get; init; }
     public DateTimeOffset StartedAt { get; init; }
-    public DateTimeOffset? EndedAt { get; init; }
     public IReadOnlyDictionary<string, string> EffectiveParameters { get; init; } =
         new Dictionary<string, string>();
     public string NormalizedParameters { get; init; } = string.Empty;
@@ -93,6 +92,11 @@ public sealed record OrderLifecycleObservation
     public string ClientOrderId { get; init; } = string.Empty;
     public string OrderId { get; init; } = string.Empty;
     public string BrokerOrderId { get; init; } = string.Empty;
+    public string Symbol { get; init; } = string.Empty;
+    public KGIOptionPricing.OrderManagement.Core.BuySell Side { get; init; }
+    public PaperOrderRole Role { get; init; }
+    public int Generation { get; init; }
+    public long TriggerMarketSequence { get; init; }
     public OrderLifecycleState PreviousState { get; init; }
     public OrderLifecycleState State { get; init; }
     public decimal Price { get; init; }
@@ -100,6 +104,42 @@ public sealed record OrderLifecycleObservation
     public int FilledQuantity { get; init; }
     public int RemainingQuantity { get; init; }
     public string ReasonCode { get; init; } = string.Empty;
+    public DateTimeOffset? SubmittedAt { get; init; }
+    public DateTimeOffset? AcceptedAt { get; init; }
+    public DateTimeOffset? FirstFilledAt { get; init; }
+    public DateTimeOffset? FullyFilledAt { get; init; }
+    public DateTimeOffset? CancelRequestedAt { get; init; }
+    public DateTimeOffset? CancelledAt { get; init; }
+    public DateTimeOffset? RejectedAt { get; init; }
+    public IReadOnlyDictionary<string, string> UnavailableReasons { get; init; } =
+        new Dictionary<string, string>();
+}
+
+public static class ManagedOrderCorrelation
+{
+    public static bool TryParse(string clientOrderId, out string cycleId, out int generation)
+    {
+        cycleId = string.Empty;
+        generation = 0;
+        if (string.IsNullOrWhiteSpace(clientOrderId)) return false;
+        int marker = clientOrderId.IndexOf("-cycle-", StringComparison.OrdinalIgnoreCase);
+        if (marker < 0) return false;
+        int numberStart = marker + "-cycle-".Length;
+        int numberEnd = numberStart;
+        while (numberEnd < clientOrderId.Length && char.IsDigit(clientOrderId[numberEnd])) numberEnd++;
+        if (numberEnd == numberStart) return false;
+        cycleId = "cycle-" + clientOrderId[numberStart..numberEnd];
+        int generationMarker = clientOrderId.LastIndexOf("-g", StringComparison.OrdinalIgnoreCase);
+        if (generationMarker >= 0 &&
+            int.TryParse(clientOrderId[(generationMarker + 2)..],
+                System.Globalization.NumberStyles.None,
+                System.Globalization.CultureInfo.InvariantCulture,
+                out int parsedGeneration))
+            generation = parsedGeneration;
+        else
+            generation = 1;
+        return true;
+    }
 }
 
 public sealed record RunSummary
@@ -115,6 +155,12 @@ public sealed record RunSummary
     public long RejectedOrders { get; init; }
     public long Fills { get; init; }
     public long CompletedTrades { get; init; }
+    public long BothLegFilledCycles { get; init; }
+    public long OneLegFilledCycles { get; init; }
+    public long StopLossExits { get; init; }
+    public long OneLegTimeouts { get; init; }
+    public decimal? FillRate { get; init; }
+    public decimal? CancellationRate { get; init; }
     public decimal? GrossPnl { get; init; }
     public decimal? ExecutionCosts { get; init; }
     public decimal? ModelSlippage { get; init; }
@@ -124,6 +170,15 @@ public sealed record RunSummary
     public decimal? AverageLosingPoints { get; init; }
     public decimal? UserDefinedProfitFactor { get; init; }
     public decimal? MaximumDrawdown { get; init; }
+    public decimal? MfePoints { get; init; }
+    public decimal? MaePoints { get; init; }
+    public decimal? HoldingSeconds { get; init; }
+    public IReadOnlyDictionary<int, decimal?> AdverseSlippageStress { get; init; } =
+        new Dictionary<int, decimal?>();
+    public IReadOnlyDictionary<string, ThresholdFunnelCount> ThresholdFunnel { get; init; } =
+        new Dictionary<string, ThresholdFunnelCount>();
+    public IReadOnlyDictionary<string, long> DataQualityCounts { get; init; } =
+        new Dictionary<string, long>();
     public IReadOnlyDictionary<string, long> PrimaryReasonCounts { get; init; } =
         new Dictionary<string, long>();
     public IReadOnlyDictionary<string, long> SecondaryReasonCounts { get; init; } =
@@ -131,6 +186,17 @@ public sealed record RunSummary
     public IReadOnlyDictionary<string, string> UnavailableReasons { get; init; } =
         new Dictionary<string, string>();
 }
+
+public sealed record ThresholdFunnelCount(long Evaluated, long Passed, long Failed);
+
+public sealed record ParameterSearchDefinition(
+    string Type,
+    string Unit,
+    decimal? AllowedMinimum,
+    decimal? AllowedMaximum,
+    decimal? SearchMinimum,
+    decimal? SearchMaximum,
+    decimal? Step);
 
 public sealed record ParameterExperimentRecord
 {
@@ -143,15 +209,27 @@ public sealed record ParameterExperimentRecord
         new Dictionary<string, string>();
     public IReadOnlyDictionary<string, string> ChangedParameters { get; init; } =
         new Dictionary<string, string>();
+    public IReadOnlyDictionary<string, ParameterSearchDefinition> ParameterDefinitions { get; init; } =
+        new Dictionary<string, ParameterSearchDefinition>();
+    public IReadOnlyDictionary<string, string> ProductMapping { get; init; } =
+        new Dictionary<string, string>();
+    public IReadOnlyDictionary<string, string> ExecutionAssumptions { get; init; } =
+        new Dictionary<string, string>();
     public string SearchMethod { get; init; } = string.Empty;
     public int? RandomSeed { get; init; }
     public int? CandidateOrdinal { get; init; }
     public string? InputArchiveSha256 { get; init; }
     public string? DataSplitId { get; init; }
+    public string PrimaryObjective { get; init; } = string.Empty;
+    public IReadOnlyList<string> SecondaryObjectives { get; init; } = Array.Empty<string>();
     public IReadOnlyList<string> Objectives { get; init; } = Array.Empty<string>();
     public IReadOnlyList<string> Guardrails { get; init; } = Array.Empty<string>();
+    public IReadOnlyDictionary<string, decimal?> GuardrailValues { get; init; } =
+        new Dictionary<string, decimal?>();
     public IReadOnlyDictionary<string, decimal?> Results { get; init; } =
         new Dictionary<string, decimal?>();
+    public IReadOnlyDictionary<int, decimal?> AdverseSlippageStress { get; init; } =
+        new Dictionary<int, decimal?>();
     public ParameterExperimentStatus Status { get; init; }
     public string? ReasonCode { get; init; }
 }

@@ -19,6 +19,73 @@ using KGIOptionPricing.StrategyFramework.Storage;
 
 namespace KGIOptionPricing.StrategyFramework;
 
+public sealed class StrategyRunRecorderSet : IDisposable
+{
+    private readonly object _sync = new();
+    private readonly Dictionary<string, SimulationRunRecorder> _recorders =
+        new(StringComparer.OrdinalIgnoreCase);
+    private bool _disposed;
+
+    public void Add(string instanceId, SimulationRunRecorder recorder)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(instanceId);
+        ArgumentNullException.ThrowIfNull(recorder);
+        lock (_sync)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (!_recorders.TryAdd(instanceId, recorder))
+                throw new InvalidOperationException($"Recorder 已存在：{instanceId}");
+        }
+    }
+
+    public void Record(StrategySnapshot value) { lock (_sync) if (_recorders.TryGetValue(value.InstanceId, out SimulationRunRecorder? recorder)) recorder.Record(value); }
+    public void Record(ExecutionEvent value) { lock (_sync) if (_recorders.TryGetValue(value.StrategyInstanceId, out SimulationRunRecorder? recorder)) recorder.Record(value); }
+    public void Record(OrderLifecycleEvent value) { lock (_sync) if (_recorders.TryGetValue(value.StrategyInstanceId, out SimulationRunRecorder? recorder)) recorder.Record(value); }
+    public void Record(StrategyDecisionObservation value) { lock (_sync) if (_recorders.TryGetValue(value.StrategyInstanceId, out SimulationRunRecorder? recorder)) recorder.Record(value); }
+
+    public void RemoveAndFinalize(string instanceId, DateTimeOffset endedAt) =>
+        RemoveCore(instanceId, endedAt, deleteDirectory: false);
+
+    public void Discard(string instanceId, bool deleteDirectory) =>
+        RemoveCore(instanceId, null, deleteDirectory);
+
+    private void RemoveCore(string instanceId, DateTimeOffset? endedAt, bool deleteDirectory)
+    {
+        SimulationRunRecorder? recorder;
+        lock (_sync)
+        {
+            if (!_recorders.Remove(instanceId, out recorder)) return;
+        }
+        List<Exception>? errors = null;
+        if (endedAt.HasValue)
+            try { recorder.FinalizeSummary(endedAt.Value); } catch (Exception exception) { (errors ??= new()).Add(exception); }
+        try { recorder.Dispose(); } catch (Exception exception) { (errors ??= new()).Add(exception); }
+        if (deleteDirectory)
+            try { if (Directory.Exists(recorder.DirectoryPath)) Directory.Delete(recorder.DirectoryPath, true); }
+            catch (Exception exception) { (errors ??= new()).Add(exception); }
+        if (errors is { Count: > 0 }) throw new AggregateException("Recorder finalize/dispose 失敗。", errors);
+    }
+
+    public void Dispose()
+    {
+        KeyValuePair<string, SimulationRunRecorder>[] entries;
+        lock (_sync)
+        {
+            if (_disposed) return;
+            _disposed = true;
+            entries = _recorders.ToArray();
+            _recorders.Clear();
+        }
+        List<Exception>? errors = null;
+        foreach (KeyValuePair<string, SimulationRunRecorder> entry in entries)
+        {
+            try { entry.Value.FinalizeSummary(DateTimeOffset.UtcNow); } catch (Exception exception) { (errors ??= new()).Add(exception); }
+            try { entry.Value.Dispose(); } catch (Exception exception) { (errors ??= new()).Add(exception); }
+        }
+        if (errors is { Count: > 0 }) throw new AggregateException("一或多個 recorder 無法完整釋放。", errors);
+    }
+}
+
 public sealed class StrategySimulationService : IDisposable
 {
     private readonly StrategyRegistry _registry = new();
@@ -27,10 +94,8 @@ public sealed class StrategySimulationService : IDisposable
     private StrategyHeartbeatTimer _heartbeat;
     private readonly object _disposeSync = new();
     private DisposeAttempt? _disposeAttempt;
-    private readonly SimulationRunRecorder _liveRecorder;
+    private readonly StrategyRunRecorderSet _liveRecorders = new();
     private readonly string _root;
-    private readonly string _liveRunId;
-    private bool _liveManifestWritten;
     private bool _disposed;
 
     public event Action<StrategySnapshot>? SnapshotChanged;
@@ -41,11 +106,10 @@ public sealed class StrategySimulationService : IDisposable
     public StrategySimulationService(KGIQuoteService quote, string rootDirectory)
     {
         _root = Path.GetFullPath(rootDirectory);
-        _liveRunId = $"live-{DateTime.Now:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}";
-        var archive = new MarketDataArchiveWriter(Path.Combine(_root, "MarketDataArchive"), _liveRunId);
+        string archiveRunId = $"live-{DateTime.Now:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}";
+        var archive = new MarketDataArchiveWriter(Path.Combine(_root, "MarketDataArchive"), archiveRunId);
         var source = new RecordingMarketEventSource(new KgiStrategyMarketDataSource(quote), archive);
         LiveArchivePath = archive.DirectoryPath;
-        _liveRecorder = new SimulationRunRecorder(Path.Combine(_root, "StrategyRuns", _liveRunId));
         _liveHost = new StrategyHost(source);
         _registry.Register(new MeanReversionScalperFactory());
         _registry.Register(new WaveletScalperFactory());
@@ -54,8 +118,8 @@ public sealed class StrategySimulationService : IDisposable
         _registry.Register(new OrderBookTrendFactory());
         _liveHost.SnapshotChanged += OnSnapshot;
         _liveHost.ExecutionOccurred += OnExecution;
-        _liveHost.OrderLifecycleOccurred += _liveRecorder.Record;
-        _liveHost.DecisionObserved += _liveRecorder.Record;
+        _liveHost.OrderLifecycleOccurred += _liveRecorders.Record;
+        _liveHost.DecisionObserved += _liveRecorders.Record;
         _heartbeat = new StrategyHeartbeatTimer(_liveHost.Pulse);
     }
 
@@ -63,23 +127,56 @@ public sealed class StrategySimulationService : IDisposable
     {
         EnsureUnique(definition.InstanceId, _liveHost.GetSnapshots());
         ResolvedStrategyUniverse universe = _resolver.Resolve(definition.Universe);
-        lock (_disposeSync)
-        {
-            if (!_liveManifestWritten)
-            {
-                _liveRecorder.RecordManifest(CreateManifest(_liveRunId, StrategyRunMode.LiveShadow,
-                    definition, universe, commissionPerContract, LiveArchivePath));
-                _liveManifestWritten = true;
-            }
-        }
         ISimulationStrategy strategy = _registry.Get(definition.StrategyType).Create(definition);
-        return _liveHost.Add(strategy, universe, commissionPerContract);
+        string runId = $"live-{DateTime.Now:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}";
+        string output = Path.Combine(_root, "StrategyRuns", runId);
+        var recorder = new SimulationRunRecorder(output);
+        _liveRecorders.Add(definition.InstanceId, recorder);
+        try
+        {
+            StrategyInstanceRunner runner = _liveHost.Add(strategy, universe, commissionPerContract);
+            recorder.RecordManifest(CreateManifest(runId, StrategyRunMode.LiveShadow,
+                definition, EffectiveParameters(runner.GetSnapshot(), definition), universe,
+                commissionPerContract, LiveArchivePath));
+            return runner;
+        }
+        catch (Exception addError)
+        {
+            var errors = new List<Exception> { addError };
+            bool retainedRunner = false;
+            try { _liveHost.Remove(definition.InstanceId); }
+            catch (Exception cleanupError) { errors.Add(cleanupError); }
+            try
+            {
+                retainedRunner = _liveHost.GetSnapshots().Any(snapshot =>
+                    string.Equals(snapshot.InstanceId, definition.InstanceId, StringComparison.OrdinalIgnoreCase));
+            }
+            catch (Exception ownershipError)
+            {
+                // If ownership cannot be proven absent, retain the recorder so a
+                // fail-closed runner can continue routing late fills/lifecycle.
+                retainedRunner = true;
+                errors.Add(ownershipError);
+            }
+            if (!retainedRunner)
+            {
+                try { _liveRecorders.Discard(definition.InstanceId, deleteDirectory: true); }
+                catch (Exception recorderError) { errors.Add(recorderError); }
+            }
+            if (errors.Count == 1) ExceptionDispatchInfo.Capture(addError).Throw();
+            throw new AggregateException("策略新增失敗，cleanup 亦發生錯誤。", errors);
+        }
     }
 
     public bool Stop(string instanceId) => _liveHost.Stop(instanceId);
     public bool Pause(string instanceId) => _liveHost.Pause(instanceId);
     public bool Resume(string instanceId) => _liveHost.Resume(instanceId);
-    public bool Remove(string instanceId) => _liveHost.Remove(instanceId);
+    public bool Remove(string instanceId)
+    {
+        if (!_liveHost.Remove(instanceId)) return false;
+        _liveRecorders.RemoveAndFinalize(instanceId, DateTimeOffset.UtcNow);
+        return true;
+    }
     public void StopAll() => _liveHost.StopAll();
     public IReadOnlyList<StrategySnapshot> GetSnapshots() => _liveHost.GetSnapshots();
 
@@ -100,9 +197,11 @@ public sealed class StrategySimulationService : IDisposable
         host.ExecutionOccurred += execution => { recorder.Record(execution); ExecutionOccurred?.Invoke(execution); };
         host.OrderLifecycleOccurred += recorder.Record;
         host.DecisionObserved += recorder.Record;
+        StrategyInstanceRunner runner = host.Add(
+            _registry.Get(definition.StrategyType).Create(definition), universe, commissionPerContract);
         recorder.RecordManifest(CreateManifest(runId, StrategyRunMode.HistoricalReplay,
-            definition, universe, commissionPerContract, eventFilePath));
-        host.Add(_registry.Get(definition.StrategyType).Create(definition), universe, commissionPerContract);
+            definition, EffectiveParameters(runner.GetSnapshot(), definition), universe,
+            commissionPerContract, eventFilePath));
         await source.ReplayAsync(speed, cancellationToken);
         host.StopAll("歷史重播完成");
         recorder.FinalizeSummary(DateTimeOffset.UtcNow);
@@ -111,13 +210,13 @@ public sealed class StrategySimulationService : IDisposable
 
     private void OnSnapshot(StrategySnapshot snapshot)
     {
-        _liveRecorder.Record(snapshot);
+        _liveRecorders.Record(snapshot);
         SnapshotChanged?.Invoke(snapshot);
     }
 
     private void OnExecution(ExecutionEvent execution)
     {
-        _liveRecorder.Record(execution);
+        _liveRecorders.Record(execution);
         ExecutionOccurred?.Invoke(execution);
     }
 
@@ -131,41 +230,20 @@ public sealed class StrategySimulationService : IDisposable
         string runId,
         StrategyRunMode mode,
         StrategyDefinition definition,
+        IReadOnlyDictionary<string, string> effectiveParameters,
         ResolvedStrategyUniverse universe,
         decimal commissionPerContract,
         string inputPath)
     {
         var parameters = new SortedDictionary<string, string>(StringComparer.Ordinal);
-        foreach (KeyValuePair<string, string> parameter in definition.Parameters)
+        foreach (KeyValuePair<string, string> parameter in effectiveParameters)
             parameters[parameter.Key] = parameter.Value;
         string normalized = JsonSerializer.Serialize(parameters);
         string parameterHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(normalized)));
         string absoluteInput = Path.GetFullPath(inputPath);
-        InputArchiveIdentity input;
         var missing = new List<string>();
-        if (File.Exists(absoluteInput))
-        {
-            var info = new FileInfo(absoluteInput);
-            using FileStream stream = File.OpenRead(absoluteInput);
-            input = new InputArchiveIdentity
-            {
-                AbsolutePath = absoluteInput,
-                SizeBytes = info.Length,
-                LastWriteTimeUtc = info.LastWriteTimeUtc,
-                Sha256 = Convert.ToHexString(SHA256.HashData(stream)),
-                MissingFields = new[] { "FirstEventAt", "LastEventAt" }
-            };
-            missing.AddRange(input.MissingFields);
-        }
-        else
-        {
-            input = new InputArchiveIdentity
-            {
-                AbsolutePath = absoluteInput,
-                MissingFields = new[] { "SizeBytes", "LastWriteTimeUtc", "Sha256", "FirstEventAt", "LastEventAt" }
-            };
-            missing.AddRange(input.MissingFields);
-        }
+        InputArchiveIdentity input = BuildInputIdentity(absoluteInput);
+        missing.AddRange(input.MissingFields);
 
         return new RunManifest
         {
@@ -192,6 +270,76 @@ public sealed class StrategySimulationService : IDisposable
             },
             MissingProvenanceFields = missing.Concat(new[] { "GitCommit", "LatencyModel", "SlippageModel" }).ToArray()
         };
+    }
+
+    private static InputArchiveIdentity BuildInputIdentity(string absoluteInput)
+    {
+        string[] missingRange = { "FirstEventAt", "LastEventAt" };
+        if (File.Exists(absoluteInput))
+        {
+            var info = new FileInfo(absoluteInput);
+            using FileStream stream = File.OpenRead(absoluteInput);
+            return new InputArchiveIdentity
+            {
+                AbsolutePath = absoluteInput,
+                SizeBytes = info.Length,
+                LastWriteTimeUtc = info.LastWriteTimeUtc,
+                Sha256 = Convert.ToHexString(SHA256.HashData(stream)),
+                MissingFields = missingRange
+            };
+        }
+        if (Directory.Exists(absoluteInput))
+        {
+            string[] files = Directory.GetFiles(absoluteInput, "*", SearchOption.AllDirectories)
+                .OrderBy(path => Path.GetRelativePath(absoluteInput, path), StringComparer.Ordinal).ToArray();
+            using IncrementalHash hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+            long size = 0;
+            DateTimeOffset? latest = null;
+            foreach (string file in files)
+            {
+                string relative = Path.GetRelativePath(absoluteInput, file).Replace('\\', '/');
+                hash.AppendData(Encoding.UTF8.GetBytes(relative + "\n"));
+                using FileStream stream = File.OpenRead(file);
+                byte[] buffer = new byte[81920];
+                int read;
+                while ((read = stream.Read(buffer, 0, buffer.Length)) > 0) hash.AppendData(buffer, 0, read);
+                var info = new FileInfo(file);
+                size += info.Length;
+                DateTimeOffset write = info.LastWriteTimeUtc;
+                if (!latest.HasValue || write > latest.Value) latest = write;
+            }
+            var absent = new List<string>(missingRange);
+            if (files.Length == 0) absent.Add("ArchiveFiles");
+            return new InputArchiveIdentity
+            {
+                AbsolutePath = absoluteInput,
+                SizeBytes = size,
+                LastWriteTimeUtc = latest,
+                Sha256 = Convert.ToHexString(hash.GetHashAndReset()),
+                MissingFields = absent
+            };
+        }
+        return new InputArchiveIdentity
+        {
+            AbsolutePath = absoluteInput,
+            MissingFields = new[] { "SizeBytes", "LastWriteTimeUtc", "Sha256", "FirstEventAt", "LastEventAt" }
+        };
+    }
+
+    private static IReadOnlyDictionary<string, string> EffectiveParameters(
+        StrategySnapshot snapshot,
+        StrategyDefinition definition)
+    {
+        var effective = new SortedDictionary<string, string>(StringComparer.Ordinal);
+        foreach (string item in snapshot.ParameterSummary.Split(';', StringSplitOptions.RemoveEmptyEntries))
+        {
+            int separator = item.IndexOf('=');
+            if (separator > 0) effective[item[..separator]] = item[(separator + 1)..];
+        }
+        if (effective.Count == 0)
+            foreach (KeyValuePair<string, string> parameter in definition.Parameters)
+                effective[parameter.Key] = parameter.Value;
+        return effective;
     }
 
     private ResolvedStrategyUniverse ResolveArchiveUniverse(string eventFilePath, StrategyUniverse requested)
@@ -253,14 +401,32 @@ public sealed class StrategySimulationService : IDisposable
         {
             _heartbeat.Dispose();
             timerDrained = true;
-            _liveHost.Dispose();
-            _liveHost.SnapshotChanged -= OnSnapshot;
-            _liveHost.ExecutionOccurred -= OnExecution;
-            _liveHost.OrderLifecycleOccurred -= _liveRecorder.Record;
-            _liveHost.DecisionObserved -= _liveRecorder.Record;
-            _liveRecorder.FinalizeSummary(DateTimeOffset.UtcNow);
-            _liveRecorder.Dispose();
-            _disposed = true;
+            Exception? hostError = null;
+            try { _liveHost.Dispose(); }
+            catch (Exception exception) { hostError = exception; }
+
+            if (_liveHost.IsDisposed)
+            {
+                var errors = new List<Exception>();
+                if (hostError != null) errors.Add(hostError);
+                // Host is terminal: detach every route before finalizing each
+                // recorder, and keep cleaning even when one output fails.
+                _liveHost.SnapshotChanged -= OnSnapshot;
+                _liveHost.ExecutionOccurred -= OnExecution;
+                _liveHost.OrderLifecycleOccurred -= _liveRecorders.Record;
+                _liveHost.DecisionObserved -= _liveRecorders.Record;
+                try { _liveRecorders.Dispose(); }
+                catch (Exception exception) { errors.Add(exception); }
+                _disposed = true;
+                if (errors.Count > 0) throw new AggregateException("策略服務釋放不完整。", errors);
+            }
+            else if (hostError != null)
+            {
+                // A fail-closed runner is still owned by the host. Keep event
+                // routes and recorders alive so late fills remain observable.
+                ExceptionDispatchInfo.Capture(hostError).Throw();
+            }
+            else throw new InvalidOperationException("StrategyHost Dispose 返回後仍未進入已釋放狀態。");
         }
         catch (Exception exception)
         {
