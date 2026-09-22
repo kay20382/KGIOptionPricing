@@ -44,6 +44,8 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
     private readonly Action? _beforeFlattenRegistration;
     private readonly Dictionary<string, PaperOrder> _conditions = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, TrackedRealOrder> _realOrders = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _ownedClientOrderIds = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _clientOrderReservations = new(StringComparer.OrdinalIgnoreCase);
     private long _localSequence;
     private long _executionSequence;
     private bool _disposed;
@@ -125,7 +127,11 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
             throw new InvalidOperationException("策略實例與實盤執行器不一致。");
         if (!string.Equals(request.Symbol, _quoteSymbol, StringComparison.OrdinalIgnoreCase))
             throw new InvalidOperationException("策略商品與實盤執行器不一致。");
-        if (request.Quantity <= 0) throw new InvalidOperationException("實盤策略下單口數必須大於 0。");
+        if (request.Quantity != 1) throw new InvalidOperationException("實盤策略第一版固定每次 1 口。");
+
+        bool ownsReservation = !string.IsNullOrWhiteSpace(request.ClientOrderId);
+        if (ownsReservation && !TryReserveClientOrderIdCore(request.ClientOrderId))
+            throw new InvalidOperationException($"ClientOrderId 已存在或已保留：{request.ClientOrderId}");
 
         bool brokerLimit = request.Type == PaperOrderType.BrokerLimit;
         string orderId = brokerLimit
@@ -146,14 +152,26 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
             CreatedAt = now
         };
 
-        if (brokerLimit)
-            SendBrokerLimit(request, order, now);
-        else if (request.Type == PaperOrderType.Market)
-            SendMarket(order, request.Price);
-        else
+        try
         {
-            lock (_sync) _conditions[order.OrderId] = order;
-            StateChanged?.Invoke();
+            if (brokerLimit)
+                SendBrokerLimit(request, order, now);
+            else if (request.Type == PaperOrderType.Market)
+                SendMarket(order, request.Price);
+            else
+            {
+                lock (_sync)
+                {
+                    _conditions[order.OrderId] = order;
+                    CommitClientOrderReservationLocked(order.ClientOrderId);
+                }
+                StateChanged?.Invoke();
+            }
+        }
+        catch
+        {
+            if (ownsReservation) AbandonClientOrderReservation(request.ClientOrderId);
+            throw;
         }
         return order;
         }
@@ -275,17 +293,78 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         finally { ExitOperation(); }
     }
 
-    public void Flatten(int netPosition) => Flatten(
-        netPosition, $"flatten-{_instanceId}-{Interlocked.Increment(ref _localSequence)}");
+    public bool TryReserveClientOrderId(string clientOrderId)
+    {
+        EnterOperation();
+        try
+        {
+            if (string.IsNullOrWhiteSpace(clientOrderId)) return false;
+            return TryReserveClientOrderIdCore(clientOrderId);
+        }
+        finally { ExitOperation(); }
+    }
 
-    public void Flatten(int netPosition, string clientOrderId)
+    public void ReleaseClientOrderIdReservation(string clientOrderId)
+    {
+        EnterOperation();
+        try { AbandonClientOrderReservation(clientOrderId); }
+        finally { ExitOperation(); }
+    }
+
+    private bool TryReserveClientOrderIdCore(string clientOrderId)
+    {
+        lock (_sync)
+        {
+            ThrowIfClosingLocked();
+            if (!_ownedClientOrderIds.Add(clientOrderId)) return false;
+            _clientOrderReservations.Add(clientOrderId);
+            return true;
+        }
+    }
+
+    private void CommitClientOrderReservationLocked(string clientOrderId)
+    {
+        if (!string.IsNullOrWhiteSpace(clientOrderId)) _clientOrderReservations.Remove(clientOrderId);
+    }
+
+    private void AbandonClientOrderReservation(string clientOrderId)
+    {
+        if (string.IsNullOrWhiteSpace(clientOrderId)) return;
+        lock (_sync)
+        {
+            if (_clientOrderReservations.Remove(clientOrderId)) _ownedClientOrderIds.Remove(clientOrderId);
+        }
+    }
+
+    public void Flatten(int netPosition)
+    {
+        if (netPosition == 0) return;
+        string clientOrderId = $"flatten-{_instanceId}-{Interlocked.Increment(ref _localSequence)}";
+        if (!TryReserveClientOrderId(clientOrderId))
+            throw new InvalidOperationException($"ClientOrderId 已存在或已保留：{clientOrderId}");
+        try { FlattenReserved(netPosition, clientOrderId); }
+        catch
+        {
+            ReleaseClientOrderIdReservation(clientOrderId);
+            throw;
+        }
+    }
+
+    public void FlattenReserved(int netPosition, string clientOrderId)
     {
         EnterOperation();
         try
         {
         if (netPosition == 0) return;
+        if (Math.Abs(netPosition) != 1)
+            throw new InvalidOperationException("實盤策略平倉硬閘固定每次 1 口；非一口部位必須人工核對。");
         if (string.IsNullOrWhiteSpace(clientOrderId))
             throw new ArgumentException("Flatten ClientOrderId 不得空白。", nameof(clientOrderId));
+        lock (_sync)
+        {
+            if (!_clientOrderReservations.Contains(clientOrderId))
+                throw new InvalidOperationException($"Flatten ClientOrderId 未先取得唯一保留權：{clientOrderId}");
+        }
         var order = new PaperOrder
         {
             OrderId = $"FLAT-{_instanceId}-{Interlocked.Increment(ref _localSequence)}",
@@ -296,12 +375,20 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
             Type = PaperOrderType.Market,
             Role = PaperOrderRole.Flatten,
             Price = 1m,
-            Quantity = Math.Abs(netPosition),
+            Quantity = 1,
             State = PaperOrderState.Working,
             CreatedAt = _now()
         };
-        _beforeFlattenRegistration?.Invoke();
-        SendMarket(order, 0m);
+        try
+        {
+            _beforeFlattenRegistration?.Invoke();
+            SendMarket(order, 0m);
+        }
+        catch
+        {
+            AbandonClientOrderReservation(clientOrderId);
+            throw;
+        }
         }
         finally { ExitOperation(); }
     }
@@ -323,6 +410,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
                 RemainingQuantity = order.Quantity,
                 AwaitingSettlement = true
             };
+            CommitClientOrderReservationLocked(order.ClientOrderId);
         }
         PublishTransition(order.OrderId, OrderLifecycleState.Submitted, null, "Submitted", now);
 
@@ -339,6 +427,8 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
 
     private void SendMarket(PaperOrder condition, decimal trigger)
     {
+        if (condition.Quantity != 1)
+            throw new InvalidOperationException("實盤策略市價單硬閘固定每次 1 口。");
         if (!_gateway.IsLoggedIn)
             throw new InvalidOperationException("交易服務已離線，實盤市價單未送出。");
         string realId = $"STRAT-{_instanceId}-{Interlocked.Increment(ref _localSequence)}";
@@ -351,6 +441,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
                 RemainingQuantity = condition.Quantity,
                 AwaitingSettlement = true
             };
+            CommitClientOrderReservationLocked(condition.ClientOrderId);
         }
         PublishTransition(realId, OrderLifecycleState.Submitted, null, "Submitted", _now());
         try
@@ -466,7 +557,13 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
                     allowLateFill: true);
             else if (!partial)
             {
-                _realOrders.Remove(brokerOrder.OrderId);
+                if (tracked.ProtocolViolation)
+                {
+                    tracked.Terminal = true;
+                    tracked.TerminalAt = _now();
+                    tracked.AwaitingSettlement = true;
+                }
+                else _realOrders.Remove(brokerOrder.OrderId);
                 legacyTerminal = true;
             }
         PublishOnly:;
@@ -798,6 +895,8 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
                 throw new InvalidOperationException($"仍有 {active} 張實盤委託未終結，禁止釋放執行器。");
             if (_inflightCallbacks > 0 || _inflightOperations > 0)
                 throw new InvalidOperationException($"仍有 {_inflightCallbacks} 個 callback／{_inflightOperations} 個操作尚未完成，禁止釋放執行器。");
+            if (_clientOrderReservations.Count > 0)
+                throw new InvalidOperationException($"仍有 {_clientOrderReservations.Count} 個 ClientOrderId 保留尚未提交，禁止釋放執行器。");
             int quarantined = _realOrders.Values.Count(x => x.Terminal && x.AwaitingSettlement);
             if (quarantined > 0)
                 throw new InvalidOperationException($"仍有 {quarantined} 張已撤委託等待 late-fill settlement，禁止釋放執行器。");
@@ -816,6 +915,8 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
             changed = _conditions.Count > 0 || _realOrders.Count > 0;
             _conditions.Clear();
             _realOrders.Clear();
+            _clientOrderReservations.Clear();
+            _ownedClientOrderIds.Clear();
             _disposing = false;
             Monitor.PulseAll(_sync);
         }

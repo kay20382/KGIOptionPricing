@@ -406,9 +406,9 @@ Assert(mappedSell.BuySell == BuySell.Sell && mappedSell.Price == 65005d &&
        mappedSell.OrderId == "REAL-2",
     "BrokerLimit 賣單必須保留方向、限價與真實委託識別");
 
-Assert(LiveStrategyOrderMapper.CreateBrokerLimit(
-        liveBuy with { Quantity = 2 }, liveInstrument, "BRK", "ACC", "REAL-Q").Quantity == 2,
-    "BrokerLimit mapper 必須保留正數口數；策略本身仍可限制固定一口");
+AssertThrows<ArgumentOutOfRangeException>(() => LiveStrategyOrderMapper.CreateBrokerLimit(
+    liveBuy with { Quantity = 2 }, liveInstrument, "BRK", "ACC", "REAL-Q"),
+    "BrokerLimit gateway硬閘必須拒絕非一口數量");
 AssertThrows<ArgumentOutOfRangeException>(() => LiveStrategyOrderMapper.CreateBrokerLimit(
     liveBuy with { Price = 0m }, liveInstrument, "BRK", "ACC", "REAL-P"),
     "BrokerLimit 必須拒絕非正價格");
@@ -566,18 +566,14 @@ var partialService = new KgiLiveStrategyExecutionService(
 partialService.OrderLifecycleChanged += partialLifecycle.Add;
 partialService.Filled += partialExecutions.Add;
 PaperOrder partialOrder = partialService.Submit(
-    liveBuy with { StrategyInstanceId = "partial-live", ClientOrderId = "partial-g1", Quantity = 2 },
+    liveBuy with { StrategyInstanceId = "partial-live", ClientOrderId = "partial-g1" },
     DateTimeOffset.UtcNow);
-partialGateway.EmitFill(partialOrder.OrderId, cumulativeQuantity: 1, remainingQuantity: 1,
-    OrderStatus.PartiallyFilled, dealQuantity: 1, dealPrice: 65000d);
+partialGateway.EmitState(partialOrder.OrderId, OrderStatus.PartiallyFilled, 0, 1);
 Assert(partialLifecycle.Last().State == OrderLifecycleState.PartiallyFilled &&
-       partialLifecycle.Last().FilledQuantity == 1 && partialLifecycle.Last().RemainingQuantity == 1 &&
-       partialExecutions.Count == 1 && partialService.ActiveBrokerOrderCount == 1,
-    "部分成交必須回報準確累計／剩餘量且繼續列為工作單");
-partialGateway.EmitState(partialOrder.OrderId, OrderStatus.Cancelled, 1, 0);
-AssertThrows<InvalidOperationException>(partialService.Dispose,
-    "部分成交後 Cancelled 仍須 quarantine，禁止拆 callback");
-partialGateway.EmitFill(partialOrder.OrderId, cumulativeQuantity: 2, remainingQuantity: 0,
+       partialLifecycle.Last().FilledQuantity == 0 && partialLifecycle.Last().RemainingQuantity == 1 &&
+       partialExecutions.Count == 0 && partialService.ActiveBrokerOrderCount == 1,
+    "一口硬閘下的合法中間狀態0→1必須保持working且不得虛構execution");
+partialGateway.EmitFill(partialOrder.OrderId, cumulativeQuantity: 1, remainingQuantity: 0,
     OrderStatus.Filled, dealQuantity: 1, dealPrice: 65000d);
 partialService.Dispose();
 Assert(partialService.ActiveBrokerOrderCount == 0 && partialService.LocalConditionCount == 0,
@@ -605,6 +601,17 @@ Assert(reportedExecutions.Count == 1 && reportedFillService.QuarantinedBrokerOrd
     "完整 Fill callback delivered quantity 一致後才算 settled");
 reportedFillService.Dispose();
 
+var quantityGateGateway = new FakeLiveStrategyOrderGateway();
+var quantityGateService = CreateLiveService(quantityGateGateway, "quantity-gate-live");
+AssertThrows<InvalidOperationException>(() => quantityGateService.Submit(
+        liveBuy with { StrategyInstanceId = "quantity-gate-live", ClientOrderId = "qty-two", Quantity = 2 },
+        DateTimeOffset.UtcNow),
+    "managed live execution gateway必須在送券商前拒絕兩口委託");
+AssertThrows<InvalidOperationException>(() => quantityGateService.Flatten(2),
+    "Flatten gateway硬閘必須拒絕非一口部位且不可留下ClientOrderId reservation");
+Assert(quantityGateGateway.PlaceOrderCount == 0, "Quantity硬閘失敗不得觸及live gateway");
+quantityGateService.Dispose();
+
 // Broker cumulative quantities are untrusted. A one-lot order reporting two
 // fills may deliver at most one lot to the ledger and is never auto-settled.
 var overfillGateway = new FakeLiveStrategyOrderGateway();
@@ -624,6 +631,25 @@ Assert(overfillExecutions.Sum(x => x.Quantity) == 1 && overfillService.ProtocolV
     "overfill/duplicate/out-of-order cumulative 最多入帳委託量一次，並須保留protocol violation quarantine");
 AssertThrows<InvalidOperationException>(overfillService.Dispose,
     "overfill protocol violation 不得因 delivered quantity 達標而自動settle");
+
+var legacyOverfillGateway = new FakeLiveStrategyOrderGateway();
+var legacyOverfillService = CreateLiveService(legacyOverfillGateway, "legacy-overfill-live");
+var legacyOverfillExecutions = new List<ExecutionEvent>();
+legacyOverfillService.Filled += legacyOverfillExecutions.Add;
+PaperOrder legacyMarket = legacyOverfillService.Submit(
+    liveBuy with
+    {
+        StrategyInstanceId = "legacy-overfill-live", ClientOrderId = "",
+        Type = PaperOrderType.Market, Role = PaperOrderRole.Flatten
+    }, DateTimeOffset.UtcNow);
+legacyOverfillGateway.EmitFill(legacyOverfillGateway.LastOrderId, 2, 0, OrderStatus.Filled, 2, 65000d);
+Assert(legacyOverfillExecutions.Sum(x => x.Quantity) == 1 &&
+       legacyOverfillService.ProtocolViolationCount == 1 &&
+       legacyOverfillService.QuarantinedBrokerOrderCount == 1 &&
+       legacyOverfillService.ActiveBrokerOrderCount == 0,
+    "non-managed Market overfill最多入帳一口且必須留下terminal quarantine callback ownership");
+AssertThrows<InvalidOperationException>(legacyOverfillService.Dispose,
+    "non-managed overfill不得移除real order或自動cleanup");
 
 // Dispose 必須 fail closed：有 active broker order 時不可清除追蹤或解除 callback。
 var disposeGateway = new FakeLiveStrategyOrderGateway();
@@ -915,8 +941,15 @@ AssertThrows<AggregateException>(() => overfillLive.Add(
 overfillLiveGateway.EmitFill(overfillLiveGateway.LastOrderId, 2, 0, OrderStatus.Filled, 2, 65000d);
 LiveStrategyCloseStatus overfillStatus = overfillLive.GetCloseStatus("live-overfill");
 Assert(overfillStatus.Position == 1 && overfillStatus.ProtocolViolations == 1 &&
-       overfillStatus.QuarantinedBrokerOrders == 1,
+       overfillStatus.QuarantinedBrokerOrders == 1 && overfillStatus.ManualReconciliationRequired,
     "close status 必須暴露overfill異常，ledger部位最多一口且不可安全Dispose");
+int overfillPlaceCount = overfillLiveGateway.PlaceOrderCount;
+Assert(overfillLive.EmergencyStop("live-overfill", "protocol reconciliation") &&
+       !overfillLive.RequestClose("live-overfill", true, out string overfillCloseMessage) &&
+       overfillLiveGateway.PlaceOrderCount == overfillPlaceCount &&
+       overfillCloseMessage.Contains("人工", StringComparison.Ordinal) &&
+       overfillLive.GetShutdownWarnings().Single().Contains("人工", StringComparison.Ordinal),
+    "protocol violation 必須優先阻斷Cancel/Flatten，自動close不可宣稱完成");
 AssertThrows<InvalidOperationException>(overfillLive.Dispose,
     "overfill retained runner 必須fail closed");
 
@@ -988,6 +1021,31 @@ Assert(!correlatedFlattenLive.RequestClose("live-correlated-flatten", true, out 
 releaseFlattenRegistration.Set();
 Assert(correlatedFirst.Wait(TimeSpan.FromSeconds(2)) && correlatedFlattenGateway.PlaceOrderCount == 3,
     "釋放barrier後只能註冊原本那張flatten");
+
+var collisionHost = new StrategyHost(new FakeHostMarketSource());
+var collisionGateway = new FakeLiveStrategyOrderGateway { EmitFillBeforePlaceOrderRelease = true };
+var collisionLive = new LiveStrategyService(
+    collisionHost, () => true, () => "TEST", _ => atomicUniverse,
+    definition => new ThrowAfterOrderStartStrategy(definition.InstanceId, "225MC"),
+    (definition, universe, commission) => CreateLiveService(collisionGateway, definition.InstanceId),
+    enableHeartbeat: false);
+AssertThrows<AggregateException>(() => collisionLive.Add(
+        atomicDefinition with { InstanceId = "live-collision" }, 36m, 1000m),
+    "collision前置必須保留一口部位");
+collisionGateway.EmitFillBeforePlaceOrderRelease = false;
+KgiLiveStrategyExecutionService collisionExecution = GetLiveExecution(collisionLive, "live-collision");
+PaperOrder collidingTombstone = collisionExecution.Submit(
+    liveBuy with { StrategyInstanceId = "live-collision", ClientOrderId = "flatten-live-collision-1" },
+    DateTimeOffset.UtcNow);
+collisionGateway.EmitState(collidingTombstone.OrderId, OrderStatus.Cancelled, 0, 0, "forced collision");
+int collisionBaseline = collisionGateway.PlaceOrderCount;
+bool collisionClosed = collisionLive.RequestClose("live-collision", true, out string collisionMessage);
+Assert(!collisionClosed && collisionGateway.PlaceOrderCount == collisionBaseline,
+    $"既有terminal tombstone的相同ClientOrderId必須讓flatten reservation失敗且不得送單；closed={collisionClosed}, count={collisionGateway.PlaceOrderCount}, baseline={collisionBaseline}, message={collisionMessage}");
+collisionLive.Pulse(DateTimeOffset.UtcNow);
+Assert(collisionGateway.PlaceOrderCount == collisionBaseline + 1 &&
+       collisionExecution.GetWorkingOrders("live-collision").Single().ClientOrderId == "flatten-live-collision-2",
+    "reservation collision後下一Pulse必須以新token/client id恰送一張flatten");
 
 var offlineFlattenHost = new StrategyHost(new FakeHostMarketSource());
 var offlineFlattenGateway = new FakeLiveStrategyOrderGateway { EmitFillBeforePlaceOrderRelease = true };

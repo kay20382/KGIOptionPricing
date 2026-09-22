@@ -73,8 +73,8 @@ public static class LiveStrategyOrderMapper
             throw new ArgumentException("StrategyInstanceId 不得空白。", nameof(request));
         if (string.IsNullOrWhiteSpace(request.Symbol))
             throw new ArgumentException("商品代碼不得空白。", nameof(request));
-        if (request.Quantity <= 0)
-            throw new ArgumentOutOfRangeException(nameof(request), request.Quantity, "實盤策略委託口數必須大於零。");
+        if (request.Quantity != 1)
+            throw new ArgumentOutOfRangeException(nameof(request), request.Quantity, "實盤策略委託固定為一口。");
         if (request.Price <= 0m)
             throw new ArgumentOutOfRangeException(nameof(request), request.Price, "實盤限價必須為正數。");
         if (string.IsNullOrWhiteSpace(brokerId))
@@ -90,7 +90,7 @@ public static class LiveStrategyOrderMapper
             Instrument = instrument,
             BuySell = request.Side,
             Price = (double)request.Price,
-            Quantity = request.Quantity,
+            Quantity = 1,
             TimeInForce = TimeInForce.ROD,
             PositionEffect = PositionEffect.Auto,
             BrokerId = brokerId,

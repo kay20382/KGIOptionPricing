@@ -18,6 +18,7 @@ public sealed record LiveStrategyCloseStatus(
     int ActiveBrokerOrders,
     int QuarantinedBrokerOrders,
     int ProtocolViolations,
+    bool ManualReconciliationRequired,
     int LocalConditions,
     bool ClosePending);
 
@@ -202,7 +203,7 @@ public sealed class LiveStrategyService : IDisposable
         _host.Pause(instanceId); // Stop new signals, but keep the runner alive to receive cancel/flatten fills.
         if (_executions.TryGetValue(instanceId, out KgiLiveStrategyExecutionService? execution))
         {
-            execution.CancelAll(instanceId);
+            if (execution.ProtocolViolationCount == 0) execution.CancelAll(instanceId);
         }
         TryFinalizeClose(instanceId);
         return true;
@@ -212,7 +213,7 @@ public sealed class LiveStrategyService : IDisposable
     {
         WaitForAdd(instanceId);
         StrategySnapshot? snapshot = Find(instanceId);
-        if (snapshot == null) return new LiveStrategyCloseStatus(false, 0, 0, 0, 0, 0, false);
+        if (snapshot == null) return new LiveStrategyCloseStatus(false, 0, 0, 0, 0, false, 0, false);
         _executions.TryGetValue(instanceId, out KgiLiveStrategyExecutionService? execution);
         return new LiveStrategyCloseStatus(
             true,
@@ -220,6 +221,7 @@ public sealed class LiveStrategyService : IDisposable
             execution?.ActiveBrokerOrderCount ?? 0,
             execution?.QuarantinedBrokerOrderCount ?? 0,
             execution?.ProtocolViolationCount ?? 0,
+            (execution?.ProtocolViolationCount ?? 0) > 0,
             execution?.LocalConditionCount ?? 0,
             _pendingClose.ContainsKey(instanceId));
     }
@@ -242,12 +244,16 @@ public sealed class LiveStrategyService : IDisposable
         if (flattenPosition || status.ActiveBrokerOrders > 0) _closeFlattenAuthorized.TryAdd(instanceId, 0);
         _host.Pause(instanceId);
         if (_executions.TryGetValue(instanceId, out KgiLiveStrategyExecutionService? execution))
-            execution.CancelAll(instanceId);
+        {
+            if (execution.ProtocolViolationCount == 0) execution.CancelAll(instanceId);
+        }
         bool closed = TryFinalizeClose(instanceId);
         LiveStrategyCloseStatus after = GetCloseStatus(instanceId);
         closed = closed || (after.Exists && !after.ClosePending && Find(instanceId)?.State == StrategyLifecycleState.Stopped);
         message = closed
             ? "已確認市場委託為 0、部位為 0，策略已關閉。"
+            : after.ManualReconciliationRequired
+                ? "偵測到成交數量協定異常，已停止自動刪單／平倉；必須人工核對券商委託、成交與實際部位。"
             : after.Position != 0
                 ? $"仍有部位 {after.Position} 口，正在等待撤單完成後送出平倉單。"
                 : after.QuarantinedBrokerOrders != 0
@@ -297,8 +303,9 @@ public sealed class LiveStrategyService : IDisposable
         foreach (StrategySnapshot snapshot in _host.GetSnapshots())
         {
             LiveStrategyCloseStatus status = GetCloseStatus(snapshot.InstanceId);
-            if (status.Position != 0 || status.ActiveBrokerOrders != 0 || status.QuarantinedBrokerOrders != 0)
-                warnings.Add($"{snapshot.InstanceId}：部位 {status.Position} 口／市場委託 {status.ActiveBrokerOrders} 筆／待 late-fill settlement {status.QuarantinedBrokerOrders} 筆");
+            if (status.Position != 0 || status.ActiveBrokerOrders != 0 || status.QuarantinedBrokerOrders != 0 ||
+                status.ManualReconciliationRequired)
+                warnings.Add($"{snapshot.InstanceId}：部位 {status.Position} 口／市場委託 {status.ActiveBrokerOrders} 筆／待 late-fill settlement {status.QuarantinedBrokerOrders} 筆／protocol violations {status.ProtocolViolations} 筆（需人工核對券商部位）");
         }
         return warnings;
     }
@@ -374,17 +381,28 @@ public sealed class LiveStrategyService : IDisposable
             return false;
         StrategySnapshot? snapshot = Find(instanceId);
         if (snapshot == null) return false;
+        if (execution.ProtocolViolationCount > 0) return false;
         if (execution.ActiveBrokerOrderCount > 0) return false;
         if (snapshot.Position != 0)
         {
+            if (!_closeFlattenAuthorized.ContainsKey(instanceId)) return false;
             long token = Interlocked.Increment(ref _flattenToken);
             var attempt = new FlattenAttempt(token, $"flatten-{instanceId}-{token}");
-            if (!_closeFlattenAuthorized.ContainsKey(instanceId) ||
-                !_flattenPending.TryAdd(instanceId, attempt)) return false;
-            try { execution.Flatten(snapshot.Position, attempt.ClientOrderId); }
+            if (!execution.TryReserveClientOrderId(attempt.ClientOrderId))
+            {
+                _closeRetryNeeded.TryAdd(instanceId, 0);
+                return false;
+            }
+            if (!_flattenPending.TryAdd(instanceId, attempt))
+            {
+                execution.ReleaseClientOrderIdReservation(attempt.ClientOrderId);
+                return false;
+            }
+            try { execution.FlattenReserved(snapshot.Position, attempt.ClientOrderId); }
             catch
             {
                 TryRemoveFlatten(instanceId, attempt);
+                execution.ReleaseClientOrderIdReservation(attempt.ClientOrderId);
                 _closeRetryNeeded.TryAdd(instanceId, 0);
                 return false;
             }
@@ -440,7 +458,7 @@ public sealed class LiveStrategyService : IDisposable
             LiveStrategyCloseStatus[] unsafeStates = _host.GetSnapshots()
                 .Select(x => GetCloseStatus(x.InstanceId))
                 .Where(x => x.Position != 0 || x.ActiveBrokerOrders != 0 ||
-                            x.QuarantinedBrokerOrders != 0 || x.LocalConditions != 0)
+                            x.QuarantinedBrokerOrders != 0 || x.ProtocolViolations != 0 || x.LocalConditions != 0)
                 .ToArray();
             if (unsafeStates.Length > 0)
                 throw new InvalidOperationException("實盤策略尚有部位、broker 委託或本地條件，禁止釋放服務。");
