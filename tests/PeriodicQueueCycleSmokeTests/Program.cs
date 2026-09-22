@@ -1010,6 +1010,8 @@ static void TestPeriodicStrategyPreservesReentrantInitialRejection()
             PeriodicDefinition($"reentrant-reject-{rejectedSide}", NoRepriceParameters()));
         var submitted = new List<PaperOrderRequest>();
         var cancels = new List<string>();
+        var decisions = new List<StrategyDecisionObservation>();
+        ((IStrategyDecisionSource)strategy).DecisionObserved += decisions.Add;
         strategy.CancelOrderRequested += cancels.Add;
         strategy.OrderRequested += order =>
         {
@@ -1025,6 +1027,11 @@ static void TestPeriodicStrategyPreservesReentrantInitialRejection()
         Assert(strategy.State == StrategyLifecycleState.Faulted &&
                strategy.GetSnapshot().Reason == "OrderRejected",
             $"初始 {rejectedSide} 同步拒絕不得被 TryStart 覆寫 Faulted");
+        Assert(!decisions.Any(x => x.Decision == StrategyDecision.Accept ||
+                                   x.PrimaryReasonCode == "SignalAccepted") &&
+               decisions.Last().Decision == StrategyDecision.Halt &&
+               decisions.Last().PrimaryReasonCode == "OrderRejected",
+            $"初始 {rejectedSide} 同步拒絕後不得發布 Accept，且最後決策必須保留 OrderRejected");
         if (rejectedSide == BuySell.Buy)
             Assert(submitted.Count == 1 && cancels.Count == 0,
                 "第一張買單同步拒絕後不得再送出或撤銷尚未送出的賣單");

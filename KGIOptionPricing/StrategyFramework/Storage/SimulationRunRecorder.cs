@@ -31,6 +31,16 @@ public sealed class SimulationRunRecorder : IDisposable
         internal required decimal CommissionPerUnit;
         internal required DateTimeOffset Timestamp;
     }
+    private sealed class OpenTradeExcursion
+    {
+        internal List<OpenExecutionLot> Lots { get; } = new();
+        internal int NetQuantity;
+        internal int ClosedQuantity;
+        internal decimal GrossPnl;
+        internal decimal Commission;
+        internal required decimal Multiplier;
+        internal required DateTimeOffset StartedAt;
+    }
     private sealed record CompletedRoundTrip(
         decimal GrossPnl, decimal Commission, decimal NetPnl, decimal NetPoints, decimal HoldingSeconds);
 
@@ -47,7 +57,7 @@ public sealed class SimulationRunRecorder : IDisposable
     private readonly HashSet<string> _warmupCandidates = new(StringComparer.Ordinal);
     private readonly HashSet<string> _primaryReasonFacts = new(StringComparer.Ordinal);
     private readonly HashSet<string> _secondaryReasonFacts = new(StringComparer.Ordinal);
-    private readonly HashSet<string> _thresholdFacts = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, bool> _thresholdFacts = new(StringComparer.Ordinal);
     private readonly HashSet<string> _dataQualityFacts = new(StringComparer.Ordinal);
     private readonly HashSet<string> _timeoutCycles = new(StringComparer.Ordinal);
     private readonly HashSet<string> _lifecycleTransitions = new(StringComparer.Ordinal);
@@ -57,8 +67,9 @@ public sealed class SimulationRunRecorder : IDisposable
     private readonly Dictionary<string, (long Evaluated, long Passed, long Failed)> _thresholdFunnel = new(StringComparer.Ordinal);
     private readonly Dictionary<string, long> _dataQualityCounts = new(StringComparer.Ordinal);
     private readonly Dictionary<string, HashSet<string>> _cycleEntrySides = new(StringComparer.Ordinal);
-    private readonly Dictionary<string, List<OpenExecutionLot>> _openExecutionLots = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, OpenTradeExcursion> _openExcursions = new(StringComparer.Ordinal);
     private readonly List<CompletedRoundTrip> _completedRoundTrips = new();
+    private readonly Dictionary<string, StrategySnapshot> _latestSnapshots = new(StringComparer.Ordinal);
     private readonly JsonSerializerOptions _json = new()
     {
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
@@ -83,7 +94,6 @@ public sealed class SimulationRunRecorder : IDisposable
     private decimal _peakNetPnl;
     private decimal _maximumDrawdown;
     private bool _hasSnapshot;
-    private StrategySnapshot? _latestSnapshot;
     private RunManifest? _manifest;
 
     public string DirectoryPath { get; }
@@ -164,12 +174,14 @@ public sealed class SimulationRunRecorder : IDisposable
         ArgumentNullException.ThrowIfNull(snapshot);
         lock (_sync)
         {
-            if (_disposed) return;
+            ObjectDisposedException.ThrowIf(_disposed, this);
             _events.WriteLine(JsonSerializer.Serialize(snapshot, _json));
-            _latestSnapshot = snapshot;
+            string snapshotKey = string.Join("\u001f", snapshot.InstanceId, snapshot.TradableSymbol);
+            _latestSnapshots[snapshotKey] = snapshot;
             _hasSnapshot = true;
-            _peakNetPnl = Math.Max(_peakNetPnl, snapshot.NetPnl);
-            _maximumDrawdown = Math.Max(_maximumDrawdown, _peakNetPnl - snapshot.NetPnl);
+            decimal aggregateNetPnl = _latestSnapshots.Values.Sum(item => item.NetPnl);
+            _peakNetPnl = Math.Max(_peakNetPnl, aggregateNetPnl);
+            _maximumDrawdown = Math.Max(_maximumDrawdown, _peakNetPnl - aggregateNetPnl);
         }
     }
 
@@ -178,7 +190,7 @@ public sealed class SimulationRunRecorder : IDisposable
         ArgumentNullException.ThrowIfNull(observation);
         lock (_sync)
         {
-            if (_disposed) return;
+            ObjectDisposedException.ThrowIf(_disposed, this);
             string key = string.Join("\u001f", observation.StrategyInstanceId,
                 observation.CandidateId, observation.CycleId);
             string fingerprint = JsonSerializer.Serialize(
@@ -196,9 +208,11 @@ public sealed class SimulationRunRecorder : IDisposable
                 _warmupObservations++;
             string candidateKey = string.Join("\u001f", observation.StrategyInstanceId,
                 observation.CandidateId, observation.CycleId);
-            if (!string.IsNullOrWhiteSpace(observation.CandidateId) && _candidates.Add(candidateKey))
+            if (observation.IsCandidate && !string.IsNullOrWhiteSpace(observation.CandidateId) &&
+                _candidates.Add(candidateKey))
                 _candidateSignals++;
-            if (observation.Decision == StrategyDecision.Accept && _acceptedCandidates.Add(candidateKey))
+            if (observation.IsCandidate && observation.Decision == StrategyDecision.Accept &&
+                _acceptedCandidates.Add(candidateKey))
                 _acceptedSignals++;
             if (_primaryReasonFacts.Add(factScope + "\u001f" + observation.PrimaryReasonCode))
                 Increment(_primaryReasons, observation.PrimaryReasonCode);
@@ -206,11 +220,23 @@ public sealed class SimulationRunRecorder : IDisposable
                 if (_secondaryReasonFacts.Add(factScope + "\u001f" + reason)) Increment(_secondaryReasons, reason);
             foreach (ThresholdObservation threshold in observation.Thresholds)
             {
-                if (!_thresholdFacts.Add(factScope + "\u001f" + threshold.Name)) continue;
+                if (!observation.IsCandidate) continue;
+                string thresholdKey = factScope + "\u001f" + threshold.Name;
                 (long evaluated, long passed, long failed) = _thresholdFunnel.TryGetValue(threshold.Name, out var count)
                     ? count : default;
-                _thresholdFunnel[threshold.Name] = (evaluated + 1,
-                    passed + (threshold.Passed ? 1 : 0), failed + (threshold.Passed ? 0 : 1));
+                if (_thresholdFacts.TryGetValue(thresholdKey, out bool previous))
+                {
+                    if (previous == threshold.Passed) continue;
+                    _thresholdFacts[thresholdKey] = threshold.Passed;
+                    _thresholdFunnel[threshold.Name] = (evaluated,
+                        passed + (threshold.Passed ? 1 : -1), failed + (threshold.Passed ? -1 : 1));
+                }
+                else
+                {
+                    _thresholdFacts[thresholdKey] = threshold.Passed;
+                    _thresholdFunnel[threshold.Name] = (evaluated + 1,
+                        passed + (threshold.Passed ? 1 : 0), failed + (threshold.Passed ? 0 : 1));
+                }
             }
             foreach (string flag in observation.DataQualityFlags)
                 if (_dataQualityFacts.Add(factScope + "\u001f" + flag)) Increment(_dataQualityCounts, flag);
@@ -224,7 +250,7 @@ public sealed class SimulationRunRecorder : IDisposable
         ArgumentNullException.ThrowIfNull(orderEvent);
         lock (_sync)
         {
-            if (_disposed) return;
+            ObjectDisposedException.ThrowIf(_disposed, this);
             string cycleId = orderEvent.CycleId;
             int generation = orderEvent.Generation;
             if ((cycleId.Length == 0 || generation <= 0) &&
@@ -315,7 +341,7 @@ public sealed class SimulationRunRecorder : IDisposable
         ArgumentNullException.ThrowIfNull(execution);
         lock (_sync)
         {
-            if (_disposed) return;
+            ObjectDisposedException.ThrowIf(_disposed, this);
             string cycleId = execution.CycleId;
             int generation = execution.Generation;
             if ((cycleId.Length == 0 || generation <= 0) &&
@@ -340,7 +366,7 @@ public sealed class SimulationRunRecorder : IDisposable
             _fills++;
             _totalCommission += execution.Commission;
             _totalFillQuantity += execution.Quantity;
-            CaptureRoundTrips(execution, cycleId);
+            CaptureRoundTrips(execution);
             if (execution.Role == PaperOrderRole.StopLoss) _stopLossExits++;
             if (cycleId.Length > 0 && execution.Role is PaperOrderRole.EntryLong or PaperOrderRole.EntryShort)
             {
@@ -352,46 +378,58 @@ public sealed class SimulationRunRecorder : IDisposable
         }
     }
 
-    private void CaptureRoundTrips(ExecutionEvent execution, string cycleId)
+    private void CaptureRoundTrips(ExecutionEvent execution)
     {
         if (execution.Quantity <= 0) return;
-        string positionKey = string.Join("\u001f", execution.StrategyInstanceId, execution.Symbol,
-            string.IsNullOrWhiteSpace(cycleId) ? "uncorrelated" : cycleId);
-        if (!_openExecutionLots.TryGetValue(positionKey, out List<OpenExecutionLot>? lots))
-            _openExecutionLots[positionKey] = lots = new List<OpenExecutionLot>();
+        string positionKey = string.Join("\u001f", execution.StrategyInstanceId, execution.Symbol);
         int remaining = execution.Quantity;
-        decimal exitCommissionPerUnit = execution.Commission / execution.Quantity;
+        decimal commissionPerUnit = execution.Commission / execution.Quantity;
         decimal multiplier = _manifest?.Universe.FirstOrDefault(product =>
             string.Equals(product.Symbol, execution.Symbol, StringComparison.OrdinalIgnoreCase))?.ContractMultiplier ?? 1m;
         if (multiplier <= 0m) multiplier = 1m;
-        while (remaining > 0 && lots.Count > 0 && lots[0].Side != execution.Side)
+        int executionSign = execution.Side == BuySell.Buy ? 1 : -1;
+        while (remaining > 0)
         {
-            OpenExecutionLot entry = lots[0];
+            if (!_openExcursions.TryGetValue(positionKey, out OpenTradeExcursion? excursion))
+            {
+                excursion = new OpenTradeExcursion { Multiplier = multiplier, StartedAt = execution.Timestamp };
+                _openExcursions[positionKey] = excursion;
+            }
+            int netSign = Math.Sign(excursion.NetQuantity);
+            if (netSign == 0 || netSign == executionSign)
+            {
+                excursion.Lots.Add(new OpenExecutionLot
+                {
+                    Side = execution.Side, Price = execution.Price, Quantity = remaining,
+                    CommissionPerUnit = commissionPerUnit, Timestamp = execution.Timestamp
+                });
+                excursion.NetQuantity += executionSign * remaining;
+                excursion.Commission += commissionPerUnit * remaining;
+                break;
+            }
+
+            OpenExecutionLot entry = excursion.Lots[0];
             int closed = Math.Min(remaining, entry.Quantity);
             decimal grossPoints = entry.Side == BuySell.Buy
                 ? execution.Price - entry.Price
                 : entry.Price - execution.Price;
-            decimal gross = grossPoints * closed * multiplier;
-            decimal commission = (entry.CommissionPerUnit + exitCommissionPerUnit) * closed;
-            decimal net = gross - commission;
-            decimal netPoints = grossPoints - commission / (multiplier * closed);
-            decimal holding = Math.Max(0m,
-                (decimal)(execution.Timestamp - entry.Timestamp).Ticks / TimeSpan.TicksPerSecond);
-            _completedRoundTrips.Add(new CompletedRoundTrip(gross, commission, net, netPoints, holding));
+            excursion.GrossPnl += grossPoints * closed * excursion.Multiplier;
+            excursion.Commission += commissionPerUnit * closed;
+            excursion.ClosedQuantity += closed;
+            excursion.NetQuantity += executionSign * closed;
             entry.Quantity -= closed;
             remaining -= closed;
-            if (entry.Quantity == 0) lots.RemoveAt(0);
-        }
-        if (remaining > 0)
-        {
-            lots.Add(new OpenExecutionLot
-            {
-                Side = execution.Side,
-                Price = execution.Price,
-                Quantity = remaining,
-                CommissionPerUnit = exitCommissionPerUnit,
-                Timestamp = execution.Timestamp
-            });
+            if (entry.Quantity == 0) excursion.Lots.RemoveAt(0);
+            if (excursion.NetQuantity != 0) continue;
+
+            decimal net = excursion.GrossPnl - excursion.Commission;
+            decimal netPoints = excursion.ClosedQuantity == 0
+                ? 0m : net / (excursion.Multiplier * excursion.ClosedQuantity);
+            decimal holding = Math.Max(0m,
+                (decimal)(execution.Timestamp - excursion.StartedAt).Ticks / TimeSpan.TicksPerSecond);
+            _completedRoundTrips.Add(new CompletedRoundTrip(
+                excursion.GrossPnl, excursion.Commission, net, netPoints, holding));
+            _openExcursions.Remove(positionKey);
         }
     }
 
@@ -400,7 +438,7 @@ public sealed class SimulationRunRecorder : IDisposable
         ArgumentNullException.ThrowIfNull(experiment);
         lock (_sync)
         {
-            if (_disposed) return;
+            ObjectDisposedException.ThrowIf(_disposed, this);
             ValidateExperiment(experiment);
             _experiments.WriteLine(JsonSerializer.Serialize(experiment, _json));
         }
@@ -408,16 +446,27 @@ public sealed class SimulationRunRecorder : IDisposable
 
     private static void ValidateExperiment(ParameterExperimentRecord experiment)
     {
-        if (experiment.Status != ParameterExperimentStatus.Valid) return;
         var missing = new List<string>();
+        if (string.IsNullOrWhiteSpace(experiment.ExperimentId)) missing.Add("ExperimentId");
+        if (string.IsNullOrWhiteSpace(experiment.BaselineRunId)) missing.Add("BaselineRunId");
+        if (string.IsNullOrWhiteSpace(experiment.CandidateRunId)) missing.Add("CandidateRunId");
+        if (string.IsNullOrWhiteSpace(experiment.StrategyType)) missing.Add("StrategyType");
+        if (string.IsNullOrWhiteSpace(experiment.CodeVersion)) missing.Add("CodeVersion");
+        if (experiment.CandidateParameters.Count == 0) missing.Add("CandidateParameters");
+        if (experiment.ChangedParameters.Count == 0) missing.Add("ChangedParameters");
+        if (string.IsNullOrWhiteSpace(experiment.SearchMethod)) missing.Add("SearchMethod");
         if (string.IsNullOrWhiteSpace(experiment.InputArchiveSha256)) missing.Add("InputArchiveSha256");
         if (string.IsNullOrWhiteSpace(experiment.DataSplitId)) missing.Add("DataSplitId");
-        if (string.IsNullOrWhiteSpace(experiment.PrimaryObjective)) missing.Add("PrimaryObjective");
-        if (experiment.SecondaryObjectives.Count == 0) missing.Add("SecondaryObjectives");
+        if (string.IsNullOrWhiteSpace(experiment.PrimaryObjective) && experiment.Objectives.Count == 0)
+            missing.Add("Objectives");
+        if (experiment.SecondaryObjectives.Count == 0 && experiment.Objectives.Count < 2)
+            missing.Add("SecondaryObjectives");
         if (experiment.GuardrailValues.Count == 0 && experiment.Guardrails.Count == 0) missing.Add("Guardrails");
+        if (experiment.Results.Count == 0) missing.Add("Results");
         if (experiment.ExecutionAssumptions.Count == 0) missing.Add("ExecutionAssumptions");
         if (experiment.ProductMapping.Count == 0) missing.Add("ProductMapping");
-        if (!new[] { 0, 1, 2 }.All(experiment.AdverseSlippageStress.ContainsKey))
+        if (!new[] { 0, 1, 2 }.All(key => experiment.AdverseSlippageStress.TryGetValue(key, out decimal? value) &&
+                                               value.HasValue))
             missing.Add("AdverseSlippageStress[0,1,2]");
         if (experiment.ParameterDefinitions.Count == 0) missing.Add("ParameterDefinitions");
         foreach ((string name, ParameterSearchDefinition definition) in experiment.ParameterDefinitions)
@@ -432,8 +481,12 @@ public sealed class SimulationRunRecorder : IDisposable
                 definition.SearchMaximum > definition.AllowedMaximum)
                 missing.Add($"ParameterDefinitions.{name}");
         }
+        if (experiment.Status is ParameterExperimentStatus.Rejected or ParameterExperimentStatus.Incomplete &&
+            string.IsNullOrWhiteSpace(experiment.ReasonCode))
+            missing.Add("ReasonCode");
         if (missing.Count > 0)
-            throw new ArgumentException("Valid parameter experiment 缺少可重現欄位：" + string.Join(",", missing),
+            throw new ArgumentException($"{experiment.Status} parameter experiment 缺少可重現欄位：" +
+                                        string.Join(",", missing),
                 nameof(experiment));
     }
 
@@ -495,10 +548,16 @@ public sealed class SimulationRunRecorder : IDisposable
                 ? _completedRoundTrips.Sum(x => x.Commission) : null;
             decimal? roundTripNet = _completedRoundTrips.Count > 0
                 ? _completedRoundTrips.Sum(x => x.NetPnl) : null;
+            long? ledgerCompletedTrades = _hasSnapshot
+                ? _latestSnapshots.Values.Sum(snapshot => (long)snapshot.CompletedTrades) : null;
+            decimal? ledgerRealizedPnl = _hasSnapshot
+                ? _latestSnapshots.Values.Sum(snapshot => snapshot.RealizedPnl) : null;
+            decimal? ledgerNetPnl = _hasSnapshot
+                ? _latestSnapshots.Values.Sum(snapshot => snapshot.NetPnl) : null;
             if (roundTripGross.HasValue) unavailable.Remove("grossPnl");
             if (roundTripCosts.HasValue) unavailable.Remove("executionCosts");
             if (roundTripNet.HasValue) unavailable.Remove("netPnl");
-            decimal? stressBase = roundTripNet ?? (_hasSnapshot ? _latestSnapshot?.NetPnl : null);
+            decimal? stressBase = roundTripNet ?? ledgerNetPnl;
             decimal? adversePerTick = null;
             RunProductIdentity? tradable = _manifest?.Universe.FirstOrDefault();
             if (stressBase.HasValue && tradable is not null)
@@ -522,16 +581,16 @@ public sealed class SimulationRunRecorder : IDisposable
                 CancelledOrders = _cancelledOrders,
                 RejectedOrders = _rejectedOrders,
                 Fills = _fills,
-                CompletedTrades = _hasSnapshot ? _latestSnapshot?.CompletedTrades : null,
+                CompletedTrades = ledgerCompletedTrades,
                 BothLegFilledCycles = _cycleEntrySides.Values.LongCount(sides => sides.Count >= 2),
                 OneLegFilledCycles = _cycleEntrySides.Values.LongCount(sides => sides.Count == 1),
                 StopLossExits = _stopLossExits,
                 OneLegTimeouts = _oneLegTimeouts,
                 FillRate = fillRate,
                 CancellationRate = cancellationRate,
-                GrossPnl = roundTripGross ?? (_hasSnapshot ? _latestSnapshot?.RealizedPnl : null),
+                GrossPnl = roundTripGross ?? ledgerRealizedPnl,
                 ExecutionCosts = roundTripCosts ?? (_fills > 0 ? _totalCommission : null),
-                NetPnl = roundTripNet ?? (_hasSnapshot ? _latestSnapshot?.NetPnl : null),
+                NetPnl = roundTripNet ?? ledgerNetPnl,
                 WinRate = winRate,
                 AverageWinningPoints = averageWinning,
                 AverageLosingPoints = averageLosing,

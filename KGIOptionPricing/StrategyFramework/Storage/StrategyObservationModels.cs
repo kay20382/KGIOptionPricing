@@ -21,6 +21,7 @@ public sealed record StrategyDecisionObservation
     public string StrategyType { get; init; } = string.Empty;
     public string StrategyInstanceId { get; init; } = string.Empty;
     public string CandidateId { get; init; } = string.Empty;
+    public bool IsCandidate { get; init; }
     public string CycleId { get; init; } = string.Empty;
     public string Symbol { get; init; } = string.Empty;
     public string Direction { get; init; } = string.Empty;
@@ -55,7 +56,29 @@ public sealed record InputArchiveIdentity
     public string? Sha256 { get; init; }
     public DateTimeOffset? FirstEventAt { get; init; }
     public DateTimeOffset? LastEventAt { get; init; }
+    public IReadOnlyList<InputArchiveFileRange> Files { get; init; } = Array.Empty<InputArchiveFileRange>();
+    public string? MutationReasonCode { get; init; }
     public IReadOnlyList<string> MissingFields { get; init; } = Array.Empty<string>();
+}
+
+public sealed record InputArchiveFileRange(
+    string RelativePath,
+    long StartOffset,
+    long EndOffset,
+    DateTimeOffset LastWriteTimeUtc);
+
+public sealed record InputArchiveBoundaryFile(
+    string RelativePath,
+    long Length,
+    DateTimeOffset LastWriteTimeUtc,
+    string Sha256);
+
+public sealed record InputArchiveBoundary
+{
+    public string AbsolutePath { get; init; } = string.Empty;
+    public bool AppendOnly { get; init; }
+    public DateTimeOffset StartedAt { get; init; }
+    public IReadOnlyList<InputArchiveBoundaryFile> Files { get; init; } = Array.Empty<InputArchiveBoundaryFile>();
 }
 
 public sealed record RunProductIdentity(

@@ -20,6 +20,141 @@ using KGIOptionPricing.StrategyFramework.Storage;
 
 namespace KGIOptionPricing.StrategyFramework;
 
+public static class InputArchiveBoundaryCapture
+{
+    public static InputArchiveBoundary Begin(string path, bool appendOnly, DateTimeOffset startedAt)
+    {
+        string absolute = Path.GetFullPath(path);
+        return new InputArchiveBoundary
+        {
+            AbsolutePath = absolute,
+            AppendOnly = appendOnly,
+            StartedAt = startedAt,
+            Files = Enumerate(absolute).Select(item => new InputArchiveBoundaryFile(
+                item.RelativePath, item.Length, item.LastWriteTimeUtc,
+                HashRanges(absolute, new[]
+                {
+                    new InputArchiveFileRange(item.RelativePath, 0, item.Length, item.LastWriteTimeUtc)
+                }))).ToArray()
+        };
+    }
+
+    public static InputArchiveIdentity Complete(InputArchiveBoundary boundary, DateTimeOffset endedAt)
+    {
+        ArgumentNullException.ThrowIfNull(boundary);
+        Dictionary<string, InputArchiveBoundaryFile> initial = boundary.Files.ToDictionary(
+            file => file.RelativePath, StringComparer.Ordinal);
+        (string RelativePath, long Length, DateTimeOffset LastWriteTimeUtc)[] current =
+            Enumerate(boundary.AbsolutePath).ToArray();
+        var mutation = new List<string>();
+        var ranges = new List<InputArchiveFileRange>();
+        if (boundary.AppendOnly)
+        {
+            foreach (var file in current)
+            {
+                long start = initial.TryGetValue(file.RelativePath, out InputArchiveBoundaryFile? before)
+                    ? before.Length : 0L;
+                if (file.Length < start) mutation.Add(file.RelativePath);
+                ranges.Add(new InputArchiveFileRange(file.RelativePath, Math.Min(start, file.Length),
+                    file.Length, file.LastWriteTimeUtc));
+            }
+            foreach (string removed in initial.Keys.Except(current.Select(file => file.RelativePath), StringComparer.Ordinal))
+                mutation.Add(removed);
+        }
+        else
+        {
+            foreach (var file in current)
+            {
+                if (!initial.TryGetValue(file.RelativePath, out InputArchiveBoundaryFile? before) ||
+                    before.Length != file.Length)
+                    mutation.Add(file.RelativePath);
+                ranges.Add(new InputArchiveFileRange(file.RelativePath, 0, file.Length, file.LastWriteTimeUtc));
+            }
+            foreach (string removed in initial.Keys.Except(current.Select(file => file.RelativePath), StringComparer.Ordinal))
+                mutation.Add(removed);
+        }
+
+        string hash = HashRanges(boundary.AbsolutePath, ranges);
+        if (!boundary.AppendOnly && mutation.Count == 0)
+        {
+            foreach (InputArchiveBoundaryFile before in boundary.Files)
+            {
+                InputArchiveFileRange range = ranges.Single(item => item.RelativePath == before.RelativePath);
+                string currentFileHash = HashRanges(boundary.AbsolutePath, new[] { range });
+                if (!string.Equals(currentFileHash, before.Sha256, StringComparison.Ordinal))
+                    mutation.Add(before.RelativePath);
+            }
+        }
+        return new InputArchiveIdentity
+        {
+            AbsolutePath = boundary.AbsolutePath,
+            SizeBytes = ranges.Sum(range => Math.Max(0L, range.EndOffset - range.StartOffset)),
+            LastWriteTimeUtc = ranges.Count == 0 ? null : ranges.Max(range => range.LastWriteTimeUtc),
+            Sha256 = hash,
+            Files = ranges,
+            MutationReasonCode = mutation.Count == 0 ? null : "InputMutatedDuringRun",
+            MissingFields = new[] { "FirstEventAt", "LastEventAt" }
+        };
+    }
+
+    public static bool Verify(InputArchiveIdentity identity)
+    {
+        ArgumentNullException.ThrowIfNull(identity);
+        if (string.IsNullOrWhiteSpace(identity.Sha256) || identity.Files.Count == 0) return false;
+        try
+        {
+            return string.Equals(HashRanges(identity.AbsolutePath, identity.Files), identity.Sha256,
+                StringComparison.Ordinal);
+        }
+        catch (IOException) { return false; }
+        catch (UnauthorizedAccessException) { return false; }
+    }
+
+    private static IEnumerable<(string RelativePath, long Length, DateTimeOffset LastWriteTimeUtc)> Enumerate(
+        string absolutePath)
+    {
+        if (File.Exists(absolutePath))
+        {
+            var info = new FileInfo(absolutePath);
+            yield return (info.Name, info.Length, info.LastWriteTimeUtc);
+            yield break;
+        }
+        if (!Directory.Exists(absolutePath)) yield break;
+        foreach (string file in Directory.GetFiles(absolutePath, "*", SearchOption.AllDirectories)
+                     .OrderBy(item => Path.GetRelativePath(absolutePath, item), StringComparer.Ordinal))
+        {
+            var info = new FileInfo(file);
+            yield return (Path.GetRelativePath(absolutePath, file).Replace('\\', '/'),
+                info.Length, info.LastWriteTimeUtc);
+        }
+    }
+
+    private static string HashRanges(string absolutePath, IEnumerable<InputArchiveFileRange> ranges)
+    {
+        using IncrementalHash hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        foreach (InputArchiveFileRange range in ranges.OrderBy(item => item.RelativePath, StringComparer.Ordinal))
+        {
+            hash.AppendData(Encoding.UTF8.GetBytes($"{range.RelativePath}\n{range.StartOffset}\n{range.EndOffset}\n"));
+            string file = File.Exists(absolutePath)
+                ? absolutePath
+                : Path.Combine(absolutePath, range.RelativePath.Replace('/', Path.DirectorySeparatorChar));
+            using var stream = new FileStream(file, FileMode.Open, FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete);
+            stream.Position = range.StartOffset;
+            long remaining = range.EndOffset - range.StartOffset;
+            byte[] buffer = new byte[81920];
+            while (remaining > 0)
+            {
+                int read = stream.Read(buffer, 0, (int)Math.Min(buffer.Length, remaining));
+                if (read == 0) throw new EndOfStreamException($"Archive range truncated: {range.RelativePath}");
+                hash.AppendData(buffer, 0, read);
+                remaining -= read;
+            }
+        }
+        return Convert.ToHexString(hash.GetHashAndReset());
+    }
+}
+
 public sealed class StrategyRunRecorderSet : IDisposable
 {
     private readonly object _sync = new();
@@ -30,7 +165,10 @@ public sealed class StrategyRunRecorderSet : IDisposable
     private readonly HashSet<string> _reservations = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, List<Action<SimulationRunRecorder>>> _pendingRecords =
         new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _failedInstances = new(StringComparer.OrdinalIgnoreCase);
     private bool _disposed;
+
+    public event Action<string, Exception>? FatalObservationFailure;
 
     public void Add(string instanceId, SimulationRunRecorder recorder)
     {
@@ -99,11 +237,26 @@ public sealed class StrategyRunRecorderSet : IDisposable
 
     private void Route(string instanceId, Action<SimulationRunRecorder> write)
     {
+        Exception? failure = null;
         lock (_sync)
         {
-            if (_recorders.TryGetValue(instanceId, out SimulationRunRecorder? recorder)) write(recorder);
+            if (_failedInstances.Contains(instanceId)) return;
+            if (_recorders.TryGetValue(instanceId, out SimulationRunRecorder? recorder))
+            {
+                try { write(recorder); }
+                catch (Exception exception)
+                {
+                    _failedInstances.Add(instanceId);
+                    failure = exception;
+                }
+            }
             else if (_pendingRecords.TryGetValue(instanceId, out List<Action<SimulationRunRecorder>>? pending))
                 pending.Add(write);
+        }
+        if (failure != null)
+        {
+            FatalObservationFailure?.Invoke(instanceId, failure);
+            ExceptionDispatchInfo.Capture(failure).Throw();
         }
     }
 
@@ -121,6 +274,7 @@ public sealed class StrategyRunRecorderSet : IDisposable
         {
             if (!_recorders.Remove(instanceId, out recorder)) return;
             _manifestFinalizers.Remove(instanceId, out manifestFinalizer);
+            _failedInstances.Remove(instanceId);
         }
         List<Exception>? errors = null;
         if (endedAt.HasValue && manifestFinalizer != null)
@@ -150,6 +304,7 @@ public sealed class StrategyRunRecorderSet : IDisposable
             _manifestFinalizers.Clear();
             _reservations.Clear();
             _pendingRecords.Clear();
+            _failedInstances.Clear();
         }
         List<Exception>? errors = null;
         foreach (KeyValuePair<string, SimulationRunRecorder> entry in entries)
@@ -161,6 +316,54 @@ public sealed class StrategyRunRecorderSet : IDisposable
             try { entry.Value.Dispose(); } catch (Exception exception) { (errors ??= new()).Add(exception); }
         }
         if (errors is { Count: > 0 }) throw new AggregateException("一或多個 recorder 無法完整釋放。", errors);
+    }
+}
+
+public sealed class StrategyInstanceOperationGate : IDisposable
+{
+    private readonly object _sync = new();
+    private readonly HashSet<string> _active = new(StringComparer.OrdinalIgnoreCase);
+    private bool _disposed;
+
+    public IDisposable Enter(string instanceId)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(instanceId);
+        lock (_sync)
+        {
+            while (_active.Contains(instanceId) && !_disposed) Monitor.Wait(_sync);
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            _active.Add(instanceId);
+            return new Lease(this, instanceId);
+        }
+    }
+
+    public void Dispose()
+    {
+        lock (_sync)
+        {
+            if (_disposed) return;
+            _disposed = true;
+            Monitor.PulseAll(_sync);
+            while (_active.Count > 0) Monitor.Wait(_sync);
+        }
+    }
+
+    private void Exit(string instanceId)
+    {
+        lock (_sync)
+        {
+            _active.Remove(instanceId);
+            Monitor.PulseAll(_sync);
+        }
+    }
+
+    private sealed class Lease : IDisposable
+    {
+        private StrategyInstanceOperationGate? _owner;
+        private readonly string _instanceId;
+        internal Lease(StrategyInstanceOperationGate owner, string instanceId) =>
+            (_owner, _instanceId) = (owner, instanceId);
+        public void Dispose() => Interlocked.Exchange(ref _owner, null)?.Exit(_instanceId);
     }
 }
 
@@ -177,9 +380,9 @@ public sealed class StrategySimulationService : IDisposable
     private readonly object _disposeSync = new();
     private DisposeAttempt? _disposeAttempt;
     private readonly StrategyRunRecorderSet _liveRecorders = new();
+    private readonly StrategyInstanceOperationGate _operationGate = new();
     private readonly string _root;
     private bool _disposed;
-    private int _activeAdds;
 
     public event Action<StrategySnapshot>? SnapshotChanged;
     public event Action<ExecutionEvent>? ExecutionOccurred;
@@ -204,32 +407,38 @@ public sealed class StrategySimulationService : IDisposable
         _liveHost.ExecutionOccurred += OnExecution;
         _liveHost.OrderLifecycleOccurred += _liveRecorders.Record;
         _liveHost.DecisionObserved += _liveRecorders.Record;
+        _liveRecorders.FatalObservationFailure += OnFatalObservationFailure;
         _heartbeat = new StrategyHeartbeatTimer(_liveHost.Pulse);
     }
 
     public StrategyInstanceRunner AddLive(StrategyDefinition definition, decimal commissionPerContract)
     {
-        BeginAdd(definition.InstanceId);
+        using IDisposable operation = _operationGate.Enter(definition.InstanceId);
+        if (!_liveRecorders.TryReserve(definition.InstanceId))
+            throw new InvalidOperationException($"策略實例識別碼已存在：{definition.InstanceId}");
         SimulationRunRecorder? recorder = null;
         string? output = null;
         try
         {
             ResolvedStrategyUniverse universe = _resolver.Resolve(definition.Universe);
             ISimulationStrategy strategy = _registry.Get(definition.StrategyType).Create(definition);
-            StrategyInstanceRunner runner = _liveHost.Add(strategy, universe, commissionPerContract);
+            DateTimeOffset startedAt = DateTimeOffset.UtcNow;
+            InputArchiveBoundary inputBoundary = InputArchiveBoundaryCapture.Begin(
+                LiveArchivePath, appendOnly: true, startedAt);
             string runId = $"live-{DateTime.Now:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}";
             output = Path.Combine(_root, "StrategyRuns", runId);
             recorder = new SimulationRunRecorder(output);
-            DateTimeOffset startedAt = DateTimeOffset.UtcNow;
-            ParameterResolution parameters = ResolveParameters(runner.GetSnapshot(), definition);
+            ParameterResolution parameters = ResolveParameters(strategy.GetSnapshot(), definition);
             RunManifest prepared = CreateManifest(runId, StrategyRunMode.LiveShadow,
                 definition, parameters, universe, commissionPerContract, LiveArchivePath, startedAt, null,
-                includeInputIdentity: false);
+                inputIdentity: null);
             recorder.PrepareManifest(prepared);
             _liveRecorders.CommitReservation(definition.InstanceId, recorder, endedAt =>
                 CreateManifest(runId, StrategyRunMode.LiveShadow, definition, parameters, universe,
-                    commissionPerContract, LiveArchivePath, startedAt, endedAt, includeInputIdentity: true));
+                    commissionPerContract, LiveArchivePath, startedAt, endedAt,
+                    InputArchiveBoundaryCapture.Complete(inputBoundary, endedAt)));
             recorder = null;
+            StrategyInstanceRunner runner = _liveHost.Add(strategy, universe, commissionPerContract);
             _liveRecorders.Record(runner.GetSnapshot());
             return runner;
         }
@@ -267,7 +476,7 @@ public sealed class StrategySimulationService : IDisposable
             if (errors.Count == 1) ExceptionDispatchInfo.Capture(addError).Throw();
             throw new AggregateException("策略新增失敗，cleanup 亦發生錯誤。", errors);
         }
-        finally { EndAdd(definition.InstanceId); }
+        finally { _liveRecorders.ReleaseReservation(definition.InstanceId); }
     }
 
     public bool Stop(string instanceId) => _liveHost.Stop(instanceId);
@@ -275,6 +484,7 @@ public sealed class StrategySimulationService : IDisposable
     public bool Resume(string instanceId) => _liveHost.Resume(instanceId);
     public bool Remove(string instanceId)
     {
+        using IDisposable operation = _operationGate.Enter(instanceId);
         bool removed = false;
         Exception? hostError = null;
         try { removed = _liveHost.Remove(instanceId); }
@@ -301,6 +511,9 @@ public sealed class StrategySimulationService : IDisposable
         double speed = 0d,
         CancellationToken cancellationToken = default)
     {
+        DateTimeOffset startedAt = DateTimeOffset.UtcNow;
+        InputArchiveBoundary inputBoundary = InputArchiveBoundaryCapture.Begin(
+            eventFilePath, appendOnly: false, startedAt);
         ResolvedStrategyUniverse universe = ResolveArchiveUniverse(eventFilePath, definition.Universe);
         string runId = $"backtest-{DateTime.Now:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}";
         string output = Path.Combine(_root, "Backtests", runId);
@@ -311,20 +524,22 @@ public sealed class StrategySimulationService : IDisposable
         host.ExecutionOccurred += execution => { recorder.Record(execution); ExecutionOccurred?.Invoke(execution); };
         host.OrderLifecycleOccurred += recorder.Record;
         host.DecisionObserved += recorder.Record;
-        StrategyInstanceRunner runner = host.Add(
-            _registry.Get(definition.StrategyType).Create(definition), universe, commissionPerContract);
-        DateTimeOffset startedAt = DateTimeOffset.UtcNow;
-        ParameterResolution parameters = ResolveParameters(runner.GetSnapshot(), definition);
+        ISimulationStrategy strategy = _registry.Get(definition.StrategyType).Create(definition);
+        ParameterResolution parameters = ResolveParameters(strategy.GetSnapshot(), definition);
         recorder.PrepareManifest(CreateManifest(runId, StrategyRunMode.HistoricalReplay,
             definition, parameters, universe, commissionPerContract, eventFilePath, startedAt, null,
-            includeInputIdentity: true));
+            inputIdentity: null));
+        StrategyInstanceRunner runner = host.Add(strategy, universe, commissionPerContract);
         await source.ReplayAsync(speed, cancellationToken);
         host.StopAll("歷史重播完成");
         DateTimeOffset endedAt = DateTimeOffset.UtcNow;
+        InputArchiveIdentity finalInput = InputArchiveBoundaryCapture.Complete(inputBoundary, endedAt);
         recorder.FinalizeManifest(CreateManifest(runId, StrategyRunMode.HistoricalReplay,
             definition, parameters, universe, commissionPerContract, eventFilePath, startedAt, endedAt,
-            includeInputIdentity: true));
+            finalInput));
         recorder.FinalizeSummary(endedAt);
+        if (finalInput.MutationReasonCode != null)
+            throw new InvalidDataException(finalInput.MutationReasonCode);
         return output;
     }
 
@@ -340,25 +555,9 @@ public sealed class StrategySimulationService : IDisposable
         ExecutionOccurred?.Invoke(execution);
     }
 
-    private void BeginAdd(string instanceId)
+    private void OnFatalObservationFailure(string instanceId, Exception exception)
     {
-        lock (_disposeSync)
-        {
-            if (_disposed || _disposeAttempt != null) throw new ObjectDisposedException(nameof(StrategySimulationService));
-            if (!_liveRecorders.TryReserve(instanceId))
-                throw new InvalidOperationException($"策略實例識別碼已存在：{instanceId}");
-            _activeAdds++;
-        }
-    }
-
-    private void EndAdd(string instanceId)
-    {
-        _liveRecorders.ReleaseReservation(instanceId);
-        lock (_disposeSync)
-        {
-            _activeAdds--;
-            Monitor.PulseAll(_disposeSync);
-        }
+        _liveHost.Stop(instanceId, "FatalObservationFailure");
     }
 
     private bool HostContains(string instanceId)
@@ -381,7 +580,7 @@ public sealed class StrategySimulationService : IDisposable
         string inputPath,
         DateTimeOffset startedAt,
         DateTimeOffset? endedAt,
-        bool includeInputIdentity)
+        InputArchiveIdentity? inputIdentity)
     {
         var parameters = new SortedDictionary<string, string>(StringComparer.Ordinal);
         foreach (KeyValuePair<string, string> parameter in parameterResolution.Effective)
@@ -394,7 +593,7 @@ public sealed class StrategySimulationService : IDisposable
             ? Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(normalized))) : string.Empty;
         string absoluteInput = Path.GetFullPath(inputPath);
         var missing = new List<string>();
-        InputArchiveIdentity? input = includeInputIdentity ? BuildInputIdentity(absoluteInput) : null;
+        InputArchiveIdentity? input = inputIdentity;
         if (input != null) missing.AddRange(input.MissingFields);
         else missing.Add("InputArchiveFinalizedAtRunEnd");
         if (parameterResolution.UnavailableReason != null) missing.Add("EffectiveParameters");
@@ -556,11 +755,15 @@ public sealed class StrategySimulationService : IDisposable
                 attempt = _disposeAttempt;
                 owner = false;
             }
-            else { attempt = _disposeAttempt = new DisposeAttempt(Environment.CurrentManagedThreadId); owner = true; }
+            else
+            {
+                attempt = _disposeAttempt = new DisposeAttempt(Environment.CurrentManagedThreadId);
+                owner = true;
+                Monitor.PulseAll(_disposeSync);
+            }
         }
         if (!owner) { attempt.Completed.Wait(); if (attempt.Error != null) ExceptionDispatchInfo.Capture(attempt.Error).Throw(); return; }
-        lock (_disposeSync)
-            while (_activeAdds > 0) Monitor.Wait(_disposeSync);
+        _operationGate.Dispose();
         bool timerDrained = false;
         try
         {
@@ -580,6 +783,7 @@ public sealed class StrategySimulationService : IDisposable
                 _liveHost.ExecutionOccurred -= OnExecution;
                 _liveHost.OrderLifecycleOccurred -= _liveRecorders.Record;
                 _liveHost.DecisionObserved -= _liveRecorders.Record;
+                _liveRecorders.FatalObservationFailure -= OnFatalObservationFailure;
                 try { _liveRecorders.Dispose(); }
                 catch (Exception exception) { errors.Add(exception); }
                 _disposed = true;

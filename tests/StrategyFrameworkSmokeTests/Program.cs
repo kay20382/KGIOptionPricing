@@ -844,6 +844,7 @@ try
         {
             Sequence = 101, Timestamp = observedAt, StrategyType = "PeriodicQueueCycle",
             StrategyInstanceId = "observe-1", CandidateId = "candidate-1", CycleId = "cycle-1",
+            IsCandidate = true,
             Symbol = "MCM6", Direction = "Up", State = StrategyLifecycleState.Ready,
             Decision = StrategyDecision.Accept, PrimaryReasonCode = "SignalAccepted",
             SecondaryReasonCodes = new[] { "AllHealthGatesPassed" }, QuoteAgeSeconds = 0.25m,
@@ -854,6 +855,12 @@ try
                 new ThresholdObservation("MinDepthObi", 0.14m, 0.10m, "ratio", true)
             }
         };
+        recorder.Record(accepted with
+        {
+            Sequence = 100, Timestamp = observedAt.AddSeconds(-1), CandidateId = "warmup-heartbeat",
+            CycleId = string.Empty, IsCandidate = false, Decision = StrategyDecision.Warmup,
+            PrimaryReasonCode = "WarmupIncomplete"
+        });
         recorder.Record(accepted);
         recorder.Record(accepted with { Sequence = 102, Timestamp = observedAt.AddSeconds(1) });
         recorder.Record(accepted with
@@ -874,6 +881,12 @@ try
         };
         recorder.Record(timeoutDecision);
         recorder.Record(timeoutDecision with { Sequence = 106, Timestamp = observedAt.AddSeconds(80) });
+        recorder.Record(accepted with
+        {
+            Sequence = 107, Timestamp = observedAt.AddSeconds(90), Decision = StrategyDecision.Reject,
+            PrimaryReasonCode = "DirectionThresholdFailed",
+            Thresholds = new[] { new ThresholdObservation("MinMoveTicks", 1m, 2m, "ticks", false) }
+        });
 
         recorder.Record(Lifecycle("observe-1-cycle-1-buy-g1", "SIM-1", OrderLifecycleState.Submitted,
             OrderLifecycleState.Submitted, 100m, observedAt.AddMilliseconds(10)));
@@ -897,11 +910,21 @@ try
         {
             ExperimentId = "invalid-empty", Status = ParameterExperimentStatus.Valid
         }), "Valid parameter experiment 缺少可重現必要欄位時必須拒絕");
+        AssertThrows<ArgumentException>(() => recorder.Record(new ParameterExperimentRecord
+        {
+            ExperimentId = "rejected-empty", Status = ParameterExperimentStatus.Rejected
+        }), "Rejected parameter experiment 仍須保留完整 identity、結果與穩定淘汰原因");
+        AssertThrows<ArgumentException>(() => recorder.Record(new ParameterExperimentRecord
+        {
+            ExperimentId = "incomplete-empty", Status = ParameterExperimentStatus.Incomplete
+        }), "Incomplete parameter experiment 仍須保留完整 identity、結果與穩定缺失原因");
         recorder.Record(new ParameterExperimentRecord
         {
             ExperimentId = "experiment-1", BaselineRunId = "baseline-1", CandidateRunId = "run-observation-1",
-            StrategyType = "PeriodicQueueCycle", SearchMethod = "manual", Status = ParameterExperimentStatus.Valid,
+            StrategyType = "PeriodicQueueCycle", CodeVersion = "test-version",
+            SearchMethod = "manual", Status = ParameterExperimentStatus.Valid,
             CandidateParameters = new Dictionary<string, string> { ["MinMoveTicks"] = "2" },
+            ChangedParameters = new Dictionary<string, string> { ["MinMoveTicks"] = "2" },
             ParameterDefinitions = new Dictionary<string, ParameterSearchDefinition>
             {
                 ["MinMoveTicks"] = new("decimal", "ticks", 0.5m, 50m, 1m, 3m, 0.5m)
@@ -930,9 +953,10 @@ try
            executionsCsv.Contains("\"cycle-1-buy-g1\"", StringComparison.Ordinal),
         "executions.csv 必須以 InvariantCulture 保留兩筆成交及 clientOrderId");
     string[] decisionLines = File.ReadAllLines(Path.Combine(observationDirectory, "strategy-decisions.jsonl"));
-    Assert(decisionLines.Length == 6,
+    Assert(decisionLines.Length == 8,
         "完全相同的決策只在心跳間隔內壓縮；跨間隔心跳可留存");
-    using (JsonDocument decisionDocument = JsonDocument.Parse(decisionLines[0]))
+    using (JsonDocument decisionDocument = JsonDocument.Parse(
+        decisionLines.First(line => line.Contains("\"decision\":\"Accept\"", StringComparison.Ordinal))))
     {
         JsonElement decision = decisionDocument.RootElement;
         JsonElement threshold = decision.GetProperty("thresholds")[0];
@@ -980,6 +1004,8 @@ try
                summary.GetProperty("adverseSlippageStress").GetProperty("1").GetDecimal() == -72m &&
                summary.GetProperty("primaryReasonCounts").GetProperty("SignalAccepted").GetInt64() == 1 &&
                summary.GetProperty("thresholdFunnel").GetProperty("MinMoveTicks").GetProperty("evaluated").GetInt64() == 1 &&
+               summary.GetProperty("thresholdFunnel").GetProperty("MinMoveTicks").GetProperty("passed").GetInt64() == 0 &&
+               summary.GetProperty("thresholdFunnel").GetProperty("MinMoveTicks").GetProperty("failed").GetInt64() == 1 &&
                summary.GetProperty("mfePoints").ValueKind == JsonValueKind.Null &&
                summary.GetProperty("marketEvents").ValueKind == JsonValueKind.Null &&
                summary.GetProperty("unavailableReasons").GetProperty("mfePoints").GetString() == "NoMarkToMarketPath" &&
@@ -1033,6 +1059,41 @@ try
 finally
 {
     if (Directory.Exists(deferredManifestDirectory)) Directory.Delete(deferredManifestDirectory, recursive: true);
+}
+
+string boundaryDirectory = Path.Combine(Path.GetTempPath(), "kgi-archive-boundary-" + Guid.NewGuid().ToString("N"));
+try
+{
+    Directory.CreateDirectory(boundaryDirectory);
+    string liveFile = Path.Combine(boundaryDirectory, "events.jsonl");
+    File.WriteAllText(liveFile, "before\n");
+    DateTimeOffset boundaryStarted = new(2026, 9, 22, 4, 0, 0, TimeSpan.Zero);
+    InputArchiveBoundary liveBoundary = InputArchiveBoundaryCapture.Begin(
+        boundaryDirectory, appendOnly: true, boundaryStarted);
+    File.AppendAllText(liveFile, "run-a\n");
+    InputArchiveIdentity liveIdentity = InputArchiveBoundaryCapture.Complete(
+        liveBoundary, boundaryStarted.AddMinutes(1));
+    string rangeHash = liveIdentity.Sha256!;
+    long capturedEnd = liveIdentity.Files.Single().EndOffset;
+    File.AppendAllText(liveFile, "run-b\n");
+    Assert(InputArchiveBoundaryCapture.Verify(liveIdentity) && liveIdentity.Sha256 == rangeHash &&
+           liveIdentity.Files.Single().StartOffset == "before\n".Length &&
+           liveIdentity.Files.Single().EndOffset == capturedEnd,
+        "live archive identity 必須固定 start/end byte range；其他 instance 後續 append 不得改變既有 run hash");
+
+    string replayFile = Path.Combine(boundaryDirectory, "replay.jsonl");
+    File.WriteAllText(replayFile, "immutable\n");
+    InputArchiveBoundary replayBoundary = InputArchiveBoundaryCapture.Begin(
+        replayFile, appendOnly: false, boundaryStarted);
+    File.AppendAllText(replayFile, "mutated\n");
+    InputArchiveIdentity replayIdentity = InputArchiveBoundaryCapture.Complete(
+        replayBoundary, boundaryStarted.AddMinutes(1));
+    Assert(replayIdentity.MutationReasonCode == "InputMutatedDuringRun",
+        "backtest 輸入在執行中變動必須標記 InputMutatedDuringRun，不得悄悄採用結束時 hash");
+}
+finally
+{
+    if (Directory.Exists(boundaryDirectory)) Directory.Delete(boundaryDirectory, recursive: true);
 }
 
 string failingRecorderDirectory = Path.Combine(Path.GetTempPath(), "kgi-recorder-dispose-" + Guid.NewGuid().ToString("N"));
@@ -1112,15 +1173,130 @@ using (var reservationSet = new StrategyRunRecorderSet())
             Reason = "start-buffered", UpdatedAt = DateTimeOffset.UtcNow
         });
         reservationSet.CommitReservation("same-live-instance", new SimulationRunRecorder(reservedOutput));
+        reservationSet.ReleaseReservation("same-live-instance");
+        reservationSet.Record(new StrategySnapshot
+        {
+            InstanceId = "same-live-instance", StrategyType = "Reserved",
+            Reason = "retained-after-add-failure", UpdatedAt = DateTimeOffset.UtcNow.AddSeconds(1)
+        });
         reservationSet.RemoveAndFinalize("same-live-instance", DateTimeOffset.UtcNow);
-        Assert(File.ReadAllText(Path.Combine(reservedOutput, "strategy-events.jsonl"))
-                .Contains("start-buffered", StringComparison.Ordinal),
-            "Host.Add 成功前 reservation 期間的 Start decision/snapshot 必須緩衝並在 recorder commit 後寫入");
+        string reservedEvents = File.ReadAllText(Path.Combine(reservedOutput, "strategy-events.jsonl"));
+        Assert(reservedEvents.Contains("start-buffered", StringComparison.Ordinal) &&
+               reservedEvents.Contains("retained-after-add-failure", StringComparison.Ordinal),
+            "Host.Add 前事件必須緩衝；若 Add 失敗但 runner retained，finally 不得清掉已 commit recorder");
     }
     finally
     {
         if (Directory.Exists(reservedOutput)) Directory.Delete(reservedOutput, recursive: true);
     }
+}
+
+using (var operationGate = new StrategyInstanceOperationGate())
+{
+    using IDisposable addLease = operationGate.Enter("linearized-instance");
+    using var removeAttempted = new ManualResetEventSlim(false);
+    using var removeEntered = new ManualResetEventSlim(false);
+    Task removeTask = Task.Run(() =>
+    {
+        removeAttempted.Set();
+        using IDisposable removeLease = operationGate.Enter("linearized-instance");
+        removeEntered.Set();
+    });
+    Assert(removeAttempted.Wait(TimeSpan.FromSeconds(2)), "Remove race 測試必須確實抵達同 instance lease");
+    Assert(!removeEntered.Wait(TimeSpan.FromMilliseconds(100)),
+        "同 instance Remove 必須等待 Add recorder-first lifecycle 完整結束");
+    addLease.Dispose();
+    Assert(removeEntered.Wait(TimeSpan.FromSeconds(2)),
+        "Add lease 結束後 Remove 必須取得 ownership，避免 orphan recorder");
+    removeTask.GetAwaiter().GetResult();
+}
+
+var disposedOperationGate = new StrategyInstanceOperationGate();
+disposedOperationGate.Dispose();
+AssertThrows<ObjectDisposedException>(() => disposedOperationGate.Enter("after-dispose"),
+    "service dispose 後不可再開始 Add/Remove lifecycle");
+
+string observationFailurePath = Path.Combine(Path.GetTempPath(), "kgi-observation-failure-" + Guid.NewGuid().ToString("N"));
+try
+{
+    using var failureSet = new StrategyRunRecorderSet();
+    var brokenRecorder = new SimulationRunRecorder(observationFailurePath);
+    failureSet.Add("fatal-observation", brokenRecorder);
+    string? fatalInstance = null;
+    failureSet.FatalObservationFailure += (instanceId, _) => fatalInstance = instanceId;
+    brokenRecorder.Dispose();
+    AssertThrows<ObjectDisposedException>(() => failureSet.Record(new StrategySnapshot
+    {
+        InstanceId = "fatal-observation", StrategyType = "Probe", Reason = "must-fail-closed",
+        UpdatedAt = DateTimeOffset.UtcNow
+    }), "artifact write 失敗必須顯式回報，不能讓 runner 在未記錄狀態繼續");
+    Assert(fatalInstance == "fatal-observation",
+        "recorder write failure 必須攜帶 instance correlation 觸發 fail-closed");
+}
+finally
+{
+    if (Directory.Exists(observationFailurePath)) Directory.Delete(observationFailurePath, recursive: true);
+}
+
+string excursionArtifactPath = Path.Combine(Path.GetTempPath(), "kgi-excursion-artifact-" + Guid.NewGuid().ToString("N"));
+try
+{
+    DateTimeOffset excursionStart = new(2026, 9, 22, 6, 0, 0, TimeSpan.Zero);
+    using (var recorder = new SimulationRunRecorder(excursionArtifactPath))
+    {
+        recorder.RecordManifest(new RunManifest
+        {
+            RunId = "excursions", StrategyType = "ExcursionProbe", InstanceId = "excursion-probe",
+            Mode = StrategyRunMode.HistoricalReplay, StartedAt = excursionStart,
+            Universe = new[]
+            {
+                new RunProductIdentity("A", "A", "202612", 1m, 10m),
+                new RunProductIdentity("B", "B", "202612", 1m, 10m),
+                new RunProductIdentity("C", "C", "202612", 1m, 10m),
+                new RunProductIdentity("D", "D", "202612", 1m, 10m)
+            }
+        });
+        long sequence = 0;
+        void Fill(string symbol, string cycle, BuySell side, decimal price, int quantity, decimal commission, int seconds)
+        {
+            recorder.Record(new ExecutionEvent
+            {
+                Sequence = ++sequence, MarketSequence = sequence, Timestamp = excursionStart.AddSeconds(seconds),
+                StrategyInstanceId = "excursion-probe", ClientOrderId = $"excursion-probe-{cycle}-{side}-{sequence}-g1",
+                OrderId = $"E-{sequence}", Symbol = symbol, Side = side,
+                Role = side == BuySell.Buy ? PaperOrderRole.EntryLong : PaperOrderRole.EntryShort,
+                Price = price, Quantity = quantity, Commission = commission, CycleId = cycle, Generation = 1
+            });
+        }
+
+        Fill("A", "cycle-1", BuySell.Buy, 100m, 2, 2m, 0);
+        Fill("A", "cycle-1", BuySell.Sell, 110m, 1, 1m, 1);
+        Fill("A", "cycle-1", BuySell.Sell, 120m, 1, 1m, 2);
+        Fill("B", "cycle-1", BuySell.Sell, 200m, 1, 1m, 0);
+        Fill("B", "cycle-1", BuySell.Buy, 190m, 1, 1m, 1);
+        Fill("C", "cycle-1", BuySell.Buy, 100m, 1, 1m, 0);
+        Fill("C", "cycle-1", BuySell.Sell, 110m, 2, 2m, 1);
+        Fill("C", "cycle-2", BuySell.Buy, 105m, 1, 1m, 2);
+        Fill("D", "cycle-1", BuySell.Buy, 100m, 1, 1m, 0);
+        Fill("D", "cycle-2", BuySell.Sell, 110m, 1, 1m, 1);
+        foreach (string symbol in new[] { "A", "B", "C", "D" })
+            recorder.Record(new StrategySnapshot
+            {
+                StrategyType = "ExcursionProbe", InstanceId = "excursion-probe", TradableSymbol = symbol,
+                State = StrategyLifecycleState.Ready, Reason = "Flat", CompletedTrades = symbol == "C" ? 2 : 1,
+                UpdatedAt = excursionStart.AddSeconds(3)
+            });
+        recorder.FinalizeSummary(excursionStart.AddSeconds(4));
+    }
+    using JsonDocument excursionSummary = JsonDocument.Parse(
+        File.ReadAllText(Path.Combine(excursionArtifactPath, "run-summary.json")));
+    Assert(excursionSummary.RootElement.GetProperty("completedTrades").GetInt64() == 5 &&
+           excursionSummary.RootElement.GetProperty("averageWinningPoints").GetDecimal() == 9.8m,
+        "roundtrip 必須以 instance+symbol 的 flat→nonzero→flat excursion 計一次；部分平倉、跨 cycle 與跨 flat fill 必須和 ledger 一致");
+}
+finally
+{
+    if (Directory.Exists(excursionArtifactPath)) Directory.Delete(excursionArtifactPath, recursive: true);
 }
 
 string integratedArtifactPath = Path.Combine(Path.GetTempPath(), "kgi-integrated-artifact-" + Guid.NewGuid().ToString("N"));

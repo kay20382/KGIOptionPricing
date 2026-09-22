@@ -191,12 +191,15 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
             marketEvent.MidPrice,
             _context.Universe.Tradable.TickSize,
             _parameters.MaxChaseTicks);
+        _activeCandidateId = $"{InstanceId}-cycle-{_coordinator.CycleNumber + 1}-candidate";
+        _acceptDecisionPending = false;
         if (_coordinator.TryStart(_lastAssessment.Direction, _lastAssessment, bounds, marketEvent))
         {
             State = _coordinator.IsFaulted ? StrategyLifecycleState.Faulted : StrategyLifecycleState.Running;
             _reason = _coordinator.ReasonCode;
             _activeCandidateId = $"{InstanceId}-{_coordinator.CurrentCycleId}-candidate";
-            _acceptDecisionPending = true;
+            _acceptDecisionPending = !_coordinator.IsFaulted &&
+                _coordinator.Phase is QueueCyclePhase.WorkingBoth or QueueCyclePhase.WorkingOneLeg;
         }
         else
         {
@@ -471,6 +474,8 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
             StrategyType = StrategyType,
             StrategyInstanceId = InstanceId,
             CandidateId = candidateId,
+            IsCandidate = _activeCandidateId.Length > 0 &&
+                (cycleId.Length > 0 || assessment?.Direction != CycleDirection.Neutral),
             CycleId = cycleId,
             Symbol = _context.Universe.Tradable.Symbol,
             Direction = assessment?.Direction.ToString() ?? CycleDirection.Neutral.ToString(),
