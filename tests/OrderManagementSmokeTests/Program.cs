@@ -406,9 +406,9 @@ Assert(mappedSell.BuySell == BuySell.Sell && mappedSell.Price == 65005d &&
        mappedSell.OrderId == "REAL-2",
     "BrokerLimit 賣單必須保留方向、限價與真實委託識別");
 
-AssertThrows<ArgumentOutOfRangeException>(() => LiveStrategyOrderMapper.CreateBrokerLimit(
-    liveBuy with { Quantity = 2 }, liveInstrument, "BRK", "ACC", "REAL-Q"),
-    "BrokerLimit 必須拒絕非一口數量");
+Assert(LiveStrategyOrderMapper.CreateBrokerLimit(
+        liveBuy with { Quantity = 2 }, liveInstrument, "BRK", "ACC", "REAL-Q").Quantity == 2,
+    "BrokerLimit mapper 必須保留正數口數；策略本身仍可限制固定一口");
 AssertThrows<ArgumentOutOfRangeException>(() => LiveStrategyOrderMapper.CreateBrokerLimit(
     liveBuy with { Price = 0m }, liveInstrument, "BRK", "ACC", "REAL-P"),
     "BrokerLimit 必須拒絕非正價格");
@@ -546,6 +546,8 @@ using (var liveService = new KgiLiveStrategyExecutionService(
     Assert(managedExecutions.Count == executionsBeforeLateSell + 1 &&
            managedEventOrder.Take(2).SequenceEqual(new[] { "execution", "lifecycle:Filled" }),
         "Rejected 後 late fill 仍必須入帳，且 lifecycle Filled 不得早於 ledger");
+    Assert(liveService.ActiveBrokerOrderCount == 0,
+        "兩張managed orders完整late fill後不得殘留active broker order");
 }
 
 var partialGateway = new FakeLiveStrategyOrderGateway();
@@ -564,7 +566,7 @@ var partialService = new KgiLiveStrategyExecutionService(
 partialService.OrderLifecycleChanged += partialLifecycle.Add;
 partialService.Filled += partialExecutions.Add;
 PaperOrder partialOrder = partialService.Submit(
-    liveBuy with { StrategyInstanceId = "partial-live", ClientOrderId = "partial-g1" },
+    liveBuy with { StrategyInstanceId = "partial-live", ClientOrderId = "partial-g1", Quantity = 2 },
     DateTimeOffset.UtcNow);
 partialGateway.EmitFill(partialOrder.OrderId, cumulativeQuantity: 1, remainingQuantity: 1,
     OrderStatus.PartiallyFilled, dealQuantity: 1, dealPrice: 65000d);
@@ -602,6 +604,26 @@ reportedFillGateway.EmitFill(reportedFillOrder.OrderId, 1, 0, OrderStatus.Filled
 Assert(reportedExecutions.Count == 1 && reportedFillService.QuarantinedBrokerOrderCount == 0,
     "完整 Fill callback delivered quantity 一致後才算 settled");
 reportedFillService.Dispose();
+
+// Broker cumulative quantities are untrusted. A one-lot order reporting two
+// fills may deliver at most one lot to the ledger and is never auto-settled.
+var overfillGateway = new FakeLiveStrategyOrderGateway();
+var overfillService = CreateLiveService(overfillGateway, "overfill-live");
+var overfillExecutions = new List<ExecutionEvent>();
+var overfillFailures = new List<string>();
+overfillService.Filled += overfillExecutions.Add;
+overfillService.Failed += overfillFailures.Add;
+PaperOrder overfillOrder = overfillService.Submit(
+    liveBuy with { StrategyInstanceId = "overfill-live", ClientOrderId = "overfill-g1" },
+    DateTimeOffset.UtcNow);
+overfillGateway.EmitFill(overfillOrder.OrderId, 2, 0, OrderStatus.Filled, 2, 65000d);
+overfillGateway.EmitFill(overfillOrder.OrderId, 2, 0, OrderStatus.Filled, 2, 65000d);
+overfillGateway.EmitFill(overfillOrder.OrderId, 1, 0, OrderStatus.Filled, 1, 65000d);
+Assert(overfillExecutions.Sum(x => x.Quantity) == 1 && overfillService.ProtocolViolationCount == 1 &&
+       overfillService.QuarantinedBrokerOrderCount == 1 && overfillFailures.Count == 1,
+    "overfill/duplicate/out-of-order cumulative 最多入帳委託量一次，並須保留protocol violation quarantine");
+AssertThrows<InvalidOperationException>(overfillService.Dispose,
+    "overfill protocol violation 不得因 delivered quantity 達標而自動settle");
 
 // Dispose 必須 fail closed：有 active broker order 時不可清除追蹤或解除 callback。
 var disposeGateway = new FakeLiveStrategyOrderGateway();
@@ -880,6 +902,24 @@ Assert(filledLive.RequestClose("live-filled-retained", true, out _),
     "Flatten fill 後必須可安全完成 retained cleanup");
 filledLive.Dispose();
 
+var overfillHost = new StrategyHost(new FakeHostMarketSource());
+var overfillLiveGateway = new FakeLiveStrategyOrderGateway();
+var overfillLive = new LiveStrategyService(
+    overfillHost, () => true, () => "TEST", _ => atomicUniverse,
+    definition => new ThrowAfterOrderStartStrategy(definition.InstanceId, "225MC"),
+    (definition, universe, commission) => CreateLiveService(overfillLiveGateway, definition.InstanceId),
+    enableHeartbeat: false);
+AssertThrows<AggregateException>(() => overfillLive.Add(
+        atomicDefinition with { InstanceId = "live-overfill" }, 36m, 1000m),
+    "active entry 後 Start failure 必須保留供overfill測試");
+overfillLiveGateway.EmitFill(overfillLiveGateway.LastOrderId, 2, 0, OrderStatus.Filled, 2, 65000d);
+LiveStrategyCloseStatus overfillStatus = overfillLive.GetCloseStatus("live-overfill");
+Assert(overfillStatus.Position == 1 && overfillStatus.ProtocolViolations == 1 &&
+       overfillStatus.QuarantinedBrokerOrders == 1,
+    "close status 必須暴露overfill異常，ledger部位最多一口且不可安全Dispose");
+AssertThrows<InvalidOperationException>(overfillLive.Dispose,
+    "overfill retained runner 必須fail closed");
+
 // The flatten token is the ownership gate: while the winning caller is still
 // inside the gateway, a concurrent close attempt must not submit a second exit.
 var parallelFlattenHost = new StrategyHost(new FakeHostMarketSource());
@@ -911,6 +951,63 @@ parallelFlattenGateway.EmitFill(parallelFlattenGateway.LastOrderId, 1, 0, OrderS
 Assert(parallelFlattenLive.RequestClose("live-parallel-flatten", true, out _),
     "唯一 flatten 成交後應可完成 close");
 parallelFlattenLive.Dispose();
+
+using var flattenRegistrationEntered = new ManualResetEventSlim(false);
+using var releaseFlattenRegistration = new ManualResetEventSlim(false);
+int flattenRegistrationCalls = 0;
+var correlatedFlattenHost = new StrategyHost(new FakeHostMarketSource());
+var correlatedFlattenGateway = new FakeLiveStrategyOrderGateway { EmitFillBeforePlaceOrderRelease = true };
+var correlatedFlattenLive = new LiveStrategyService(
+    correlatedFlattenHost, () => true, () => "TEST", _ => atomicUniverse,
+    definition => new ThrowAfterOrderStartStrategy(definition.InstanceId, "225MC"),
+    (definition, universe, commission) => CreateLiveService(
+        correlatedFlattenGateway, definition.InstanceId, beforeFlattenRegistration: () =>
+        {
+            if (Interlocked.Increment(ref flattenRegistrationCalls) != 1) return;
+            flattenRegistrationEntered.Set();
+            releaseFlattenRegistration.Wait();
+        }),
+    enableHeartbeat: false);
+AssertThrows<AggregateException>(() => correlatedFlattenLive.Add(
+        atomicDefinition with { InstanceId = "live-correlated-flatten" }, 36m, 1000m),
+    "correlated flatten 前置必須保留一口部位");
+correlatedFlattenGateway.EmitFillBeforePlaceOrderRelease = false;
+KgiLiveStrategyExecutionService correlatedExecution = GetLiveExecution(correlatedFlattenLive, "live-correlated-flatten");
+Task<bool> correlatedFirst = Task.Factory.StartNew(
+    () => correlatedFlattenLive.RequestClose("live-correlated-flatten", true, out _),
+    TaskCreationOptions.LongRunning);
+Assert(flattenRegistrationEntered.Wait(TimeSpan.FromSeconds(2)),
+    "flatten token reserve 後、real order註冊前必須進入測試barrier");
+PaperOrder unrelated = correlatedExecution.Submit(
+    liveBuy with { StrategyInstanceId = "live-correlated-flatten", ClientOrderId = "unrelated-entry" },
+    DateTimeOffset.UtcNow);
+correlatedFlattenGateway.EmitState(unrelated.OrderId, OrderStatus.Cancelled, 0, 0);
+Assert(!correlatedFlattenLive.RequestClose("live-correlated-flatten", true, out _) &&
+       correlatedFlattenGateway.PlaceOrderCount == 2,
+    "不相干entry terminal不得清除目前flatten token或送第二張exit");
+releaseFlattenRegistration.Set();
+Assert(correlatedFirst.Wait(TimeSpan.FromSeconds(2)) && correlatedFlattenGateway.PlaceOrderCount == 3,
+    "釋放barrier後只能註冊原本那張flatten");
+
+var offlineFlattenHost = new StrategyHost(new FakeHostMarketSource());
+var offlineFlattenGateway = new FakeLiveStrategyOrderGateway { EmitFillBeforePlaceOrderRelease = true };
+var offlineFlattenLive = new LiveStrategyService(
+    offlineFlattenHost, () => true, () => "TEST", _ => atomicUniverse,
+    definition => new ThrowAfterOrderStartStrategy(definition.InstanceId, "225MC"),
+    (definition, universe, commission) => CreateLiveService(offlineFlattenGateway, definition.InstanceId),
+    enableHeartbeat: false);
+AssertThrows<AggregateException>(() => offlineFlattenLive.Add(
+        atomicDefinition with { InstanceId = "live-offline-flatten" }, 36m, 1000m),
+    "offline flatten 前置必須保留一口部位");
+offlineFlattenGateway.EmitFillBeforePlaceOrderRelease = false;
+offlineFlattenGateway.IsLoggedIn = false;
+Assert(!offlineFlattenLive.RequestClose("live-offline-flatten", true, out _) &&
+       offlineFlattenGateway.PlaceOrderCount == 1,
+    "gateway離線的單次RequestClose不得送單、遞迴或留下永久token");
+offlineFlattenGateway.IsLoggedIn = true;
+offlineFlattenLive.Pulse(DateTimeOffset.UtcNow);
+Assert(offlineFlattenGateway.PlaceOrderCount == 2,
+    "登入後下一個Pulse必須恰好重送一張flatten");
 
 // Flatten terminal failure clears the in-flight guard exactly once. Rejected
 // and Cancelled attempts may be retried without concurrent duplicate exits.
@@ -1017,6 +1114,36 @@ AssertThrows<ObjectDisposedException>(() => hookExecution!.Submit(
         liveBuy with { StrategyInstanceId = "live-hook-failure", ClientOrderId = "disposed-hook" }, DateTimeOffset.UtcNow),
     "hook failure 後 executor 必須已安全Dispose");
 hookLive.Dispose();
+
+var retainedHookHost = new StrategyHost(new FakeHostMarketSource());
+var retainedHookGateway = new FakeLiveStrategyOrderGateway();
+var retainedHookLive = new LiveStrategyService(
+    retainedHookHost, () => true, () => "TEST", _ => atomicUniverse,
+    definition => new ThrowAfterOrderStartStrategy(definition.InstanceId, "225MC"),
+    (definition, universe, commission) => CreateLiveService(retainedHookGateway, definition.InstanceId),
+    enableHeartbeat: false,
+    afterHostAddFailure: () => throw new InvalidOperationException("hook failed retained"));
+AggregateException? retainedHookError = null;
+try
+{
+    retainedHookLive.Add(atomicDefinition with { InstanceId = "live-hook-retained" }, 36m, 1000m);
+}
+catch (AggregateException exception) { retainedHookError = exception; }
+string retainedHookDiagnostics = string.Join(" | ", retainedHookError?.Flatten().InnerExceptions.Select(x => x.Message)
+    ?? Array.Empty<string>());
+Assert(retainedHookError != null && retainedHookDiagnostics.Contains("start failed") &&
+       retainedHookDiagnostics.Contains("hook failed retained") &&
+       retainedHookDiagnostics.Contains("實盤委託", StringComparison.Ordinal),
+    "Start/add cleanup與afterHostAddFailure三類診斷必須完整保留於AggregateException");
+Assert(retainedHookLive.GetCloseStatus("live-hook-retained").Exists,
+    "aggregate diagnostics不得破壞retained public ownership");
+retainedHookGateway.EmitFill(retainedHookGateway.LastOrderId, 1, 0, OrderStatus.Filled, 1, 65000d);
+Assert(!retainedHookLive.RequestClose("live-hook-retained", true, out _),
+    "retained hook late fill後必須可由public API送flatten");
+retainedHookGateway.EmitFill(retainedHookGateway.LastOrderId, 1, 0, OrderStatus.Filled, 1, 64995d);
+Assert(retainedHookLive.RequestClose("live-hook-retained", true, out _),
+    "retained hook flatten後必須可安全close");
+retainedHookLive.Dispose();
 
 // Start is a lifecycle lease. Close APIs wait for it; a duplicate Add is
 // rejected before creating a second executor or live path.
@@ -1154,7 +1281,8 @@ static KgiLiveStrategyExecutionService CreateLiveService(
     ILiveStrategyOrderGateway gateway,
     string instanceId,
     Func<DateTimeOffset>? now = null,
-    Action? beforeFilledPublished = null) => new(
+    Action? beforeFilledPublished = null,
+    Action? beforeFlattenRegistration = null) => new(
         gateway,
         instanceId,
         new ResolvedProduct { ProductId = "225MC", Symbol = "225MC", TickSize = 5m, ContractMultiplier = 10m },
@@ -1165,7 +1293,8 @@ static KgiLiveStrategyExecutionService CreateLiveService(
         },
         36m,
         now,
-        beforeFilledPublished);
+        beforeFilledPublished,
+        beforeFlattenRegistration);
 
 static KgiLiveStrategyExecutionService GetLiveExecution(LiveStrategyService service, string instanceId)
 {

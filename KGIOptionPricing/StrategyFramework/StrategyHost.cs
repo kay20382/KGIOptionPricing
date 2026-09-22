@@ -371,6 +371,13 @@ public sealed class StrategyHost : IDisposable
                 try { runner.Dispose(); _ledger.RemoveFlatInstance(strategy.InstanceId); }
                 catch (Exception cleanupError)
                 {
+                    if (runner.IsDisposed)
+                    {
+                        _ledger.RemoveFlatInstance(strategy.InstanceId);
+                        throw new AggregateException(
+                            "策略 Start 失敗；執行資源已安全關閉，但 Stop cleanup 亦回報錯誤。",
+                            startError, cleanupError);
+                    }
                     lock (_sync) _runners.Add(runner);
                     throw new AggregateException("策略 Start 失敗且仍有活動執行資源；Runner 已保留供安全關閉。", startError, cleanupError);
                 }

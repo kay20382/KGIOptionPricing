@@ -28,6 +28,8 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         public DateTimeOffset? TerminalAt { get; set; }
         public bool FailurePublished { get; set; }
         public bool AwaitingSettlement { get; set; }
+        public bool ProtocolViolation { get; set; }
+        public bool ProtocolViolationPublished { get; set; }
         public bool IsManaged => !string.IsNullOrWhiteSpace(Order.ClientOrderId);
     }
 
@@ -39,6 +41,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
     private readonly decimal _commission;
     private readonly Func<DateTimeOffset> _now;
     private readonly Action? _beforeFilledPublished;
+    private readonly Action? _beforeFlattenRegistration;
     private readonly Dictionary<string, PaperOrder> _conditions = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, TrackedRealOrder> _realOrders = new(StringComparer.OrdinalIgnoreCase);
     private long _localSequence;
@@ -70,6 +73,10 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
     {
         get { lock (_sync) return _realOrders.Values.Count(x => x.Terminal && x.AwaitingSettlement); }
     }
+    public int ProtocolViolationCount
+    {
+        get { lock (_sync) return _realOrders.Values.Count(x => x.ProtocolViolation); }
+    }
 
     public KgiLiveStrategyExecutionService(
         OrderManager orders,
@@ -90,7 +97,8 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         ContractInfo contract,
         decimal commissionPerContract,
         Func<DateTimeOffset>? now = null,
-        Action? beforeFilledPublished = null)
+        Action? beforeFilledPublished = null,
+        Action? beforeFlattenRegistration = null)
     {
         _gateway = gateway ?? throw new ArgumentNullException(nameof(gateway));
         _instanceId = instanceId;
@@ -98,6 +106,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         _commission = Math.Max(0m, commissionPerContract);
         _now = now ?? (() => DateTimeOffset.Now);
         _beforeFilledPublished = beforeFilledPublished;
+        _beforeFlattenRegistration = beforeFlattenRegistration;
         _instrument = LiveStrategyOrderMapper.ToInstrument(contract);
         _gateway.OrderFilled += OnOrderFilled;
         _gateway.OrderFailed += OnOrderFailed;
@@ -116,7 +125,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
             throw new InvalidOperationException("策略實例與實盤執行器不一致。");
         if (!string.Equals(request.Symbol, _quoteSymbol, StringComparison.OrdinalIgnoreCase))
             throw new InvalidOperationException("策略商品與實盤執行器不一致。");
-        if (request.Quantity != 1) throw new InvalidOperationException("實盤策略第一版固定每次 1 口。");
+        if (request.Quantity <= 0) throw new InvalidOperationException("實盤策略下單口數必須大於 0。");
 
         bool brokerLimit = request.Type == PaperOrderType.BrokerLimit;
         string orderId = brokerLimit
@@ -132,7 +141,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
             Type = request.Type,
             Role = request.Role,
             Price = request.Price,
-            Quantity = 1,
+            Quantity = request.Quantity,
             State = PaperOrderState.Working,
             CreatedAt = now
         };
@@ -266,25 +275,32 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         finally { ExitOperation(); }
     }
 
-    public void Flatten(int netPosition)
+    public void Flatten(int netPosition) => Flatten(
+        netPosition, $"flatten-{_instanceId}-{Interlocked.Increment(ref _localSequence)}");
+
+    public void Flatten(int netPosition, string clientOrderId)
     {
         EnterOperation();
         try
         {
         if (netPosition == 0) return;
+        if (string.IsNullOrWhiteSpace(clientOrderId))
+            throw new ArgumentException("Flatten ClientOrderId 不得空白。", nameof(clientOrderId));
         var order = new PaperOrder
         {
             OrderId = $"FLAT-{_instanceId}-{Interlocked.Increment(ref _localSequence)}",
+            ClientOrderId = clientOrderId,
             StrategyInstanceId = _instanceId,
             Symbol = _quoteSymbol,
             Side = netPosition > 0 ? BuySell.Sell : BuySell.Buy,
             Type = PaperOrderType.Market,
             Role = PaperOrderRole.Flatten,
             Price = 1m,
-            Quantity = 1,
+            Quantity = Math.Abs(netPosition),
             State = PaperOrderState.Working,
             CreatedAt = _now()
         };
+        _beforeFlattenRegistration?.Invoke();
         SendMarket(order, 0m);
         }
         finally { ExitOperation(); }
@@ -324,10 +340,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
     private void SendMarket(PaperOrder condition, decimal trigger)
     {
         if (!_gateway.IsLoggedIn)
-        {
-            Failed?.Invoke("交易服務已離線，實盤市價單未送出。");
-            return;
-        }
+            throw new InvalidOperationException("交易服務已離線，實盤市價單未送出。");
         string realId = $"STRAT-{_instanceId}-{Interlocked.Increment(ref _localSequence)}";
         lock (_sync)
         {
@@ -339,7 +352,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
                 AwaitingSettlement = true
             };
         }
-        StateChanged?.Invoke();
+        PublishTransition(realId, OrderLifecycleState.Submitted, null, "Submitted", _now());
         try
         {
             _gateway.PlaceOrder(new OrderRequest
@@ -348,7 +361,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
                 Instrument = _instrument,
                 BuySell = condition.Side,
                 Price = 0d,
-                Quantity = 1,
+                Quantity = condition.Quantity,
                 TimeInForce = TimeInForce.IOC,
                 PositionEffect = PositionEffect.Auto,
                 BrokerId = _gateway.BrokerId,
@@ -357,17 +370,8 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         }
         catch (Exception ex)
         {
-            lock (_sync)
-            {
-                if (_realOrders.TryGetValue(realId, out TrackedRealOrder? tracked))
-                {
-                    tracked.Terminal = true;
-                    tracked.TerminalAt = _now();
-                    tracked.AwaitingSettlement = true;
-                }
-            }
-            Failed?.Invoke("實盤送單例外：" + ex.GetBaseException().Message);
-            StateChanged?.Invoke();
+            PublishTransition(realId, OrderLifecycleState.Rejected, null, "SubmitException", _now());
+            PublishFailureOnce(realId, "實盤送單例外：" + ex.GetBaseException().Message);
         }
     }
 
@@ -408,22 +412,31 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         ExecutionEvent? execution = null;
         OrderLifecycleEvent? lifecycle = null;
         bool legacyTerminal = false;
+        string? protocolFailure = null;
         lock (_sync)
         {
             PurgeExpiredTerminalsLocked(_now());
             if (!_realOrders.TryGetValue(brokerOrder.OrderId, out TrackedRealOrder? tracked)) return;
             UpdateBrokerOrderId(tracked, brokerOrder);
-
-            int cumulative = brokerOrder.FilledQty > 0
+            int reportedCumulative = brokerOrder.FilledQty > 0
                 ? brokerOrder.FilledQty
                 : tracked.DeliveredFilledQuantity + Math.Max(0, quantity);
-            if (cumulative <= tracked.DeliveredFilledQuantity) return;
-            int delta = cumulative - tracked.DeliveredFilledQuantity;
-            tracked.DeliveredFilledQuantity = cumulative;
-            tracked.FilledQuantity = Math.Max(tracked.FilledQuantity, cumulative);
-            tracked.RemainingQuantity = brokerOrder.LeavesQty >= 0
-                ? brokerOrder.LeavesQty
-                : Math.Max(0, tracked.Order.Quantity - cumulative);
+            if (reportedCumulative > tracked.Order.Quantity)
+            {
+                tracked.ProtocolViolation = true;
+                tracked.AwaitingSettlement = true;
+                if (!tracked.ProtocolViolationPublished)
+                {
+                    tracked.ProtocolViolationPublished = true;
+                    protocolFailure = $"成交累計 {reportedCumulative} 超過委託量 {tracked.Order.Quantity}，已限制入帳並隔離等待人工核對。";
+                }
+            }
+            int effectiveCumulative = Math.Clamp(reportedCumulative, 0, tracked.Order.Quantity);
+            int delta = Math.Max(0, effectiveCumulative - tracked.DeliveredFilledQuantity);
+            if (delta == 0) goto PublishOnly;
+            tracked.DeliveredFilledQuantity += delta;
+            tracked.FilledQuantity = Math.Max(tracked.FilledQuantity, effectiveCumulative);
+            tracked.RemainingQuantity = Math.Max(0, tracked.Order.Quantity - effectiveCumulative);
 
             execution = new ExecutionEvent
             {
@@ -442,7 +455,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
                 MarketSequence = 0
             };
 
-            bool partial = brokerOrder.Status == OrderStatus.PartiallyFilled || tracked.RemainingQuantity > 0;
+            bool partial = tracked.RemainingQuantity > 0;
             if (tracked.IsManaged)
                 lifecycle = CreateTransitionLocked(
                     tracked,
@@ -456,13 +469,18 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
                 _realOrders.Remove(brokerOrder.OrderId);
                 legacyTerminal = true;
             }
+        PublishOnly:;
         }
 
         // Match paper execution ordering: ledger first, then terminal lifecycle.
-        _beforeFilledPublished?.Invoke();
-        Filled?.Invoke(execution);
+        if (execution != null)
+        {
+            _beforeFilledPublished?.Invoke();
+            Filled?.Invoke(execution);
+        }
         if (lifecycle != null) OrderLifecycleChanged?.Invoke(lifecycle);
-        if (execution != null || lifecycle != null || legacyTerminal) StateChanged?.Invoke();
+        if (protocolFailure != null) Failed?.Invoke(protocolFailure);
+        if (execution != null || lifecycle != null || legacyTerminal || protocolFailure != null) StateChanged?.Invoke();
         }
         finally
         {
@@ -542,6 +560,16 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
             PurgeExpiredTerminalsLocked(_now());
             if (!_realOrders.TryGetValue(brokerOrder.OrderId, out TrackedRealOrder? tracked)) return;
             UpdateBrokerOrderId(tracked, brokerOrder);
+            if (brokerOrder.FilledQty > tracked.Order.Quantity)
+            {
+                tracked.ProtocolViolation = true;
+                tracked.AwaitingSettlement = true;
+                if (!tracked.ProtocolViolationPublished)
+                {
+                    tracked.ProtocolViolationPublished = true;
+                    failure = $"成交累計 {brokerOrder.FilledQty} 超過委託量 {tracked.Order.Quantity}，已限制入帳並隔離等待人工核對。";
+                }
+            }
             if (!tracked.IsManaged)
             {
                 if (brokerOrder.Status is OrderStatus.Filled or OrderStatus.Cancelled or OrderStatus.Rejected)
@@ -589,9 +617,10 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
                         if (!tracked.FailurePublished)
                         {
                             tracked.FailurePublished = true;
-                            failure = string.IsNullOrWhiteSpace(brokerOrder.Message)
+                            string rejectedFailure = string.IsNullOrWhiteSpace(brokerOrder.Message)
                                 ? "實盤委託遭券商拒絕。"
                                 : $"實盤委託失敗：{brokerOrder.Message}";
+                            failure = failure == null ? rejectedFailure : failure + " " + rejectedFailure;
                         }
                         break;
                 }
@@ -599,7 +628,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         }
         if (lifecycle != null) OrderLifecycleChanged?.Invoke(lifecycle);
         if (failure != null) Failed?.Invoke(failure);
-        if (lifecycle != null || legacyChanged) StateChanged?.Invoke();
+        if (lifecycle != null || legacyChanged || failure != null) StateChanged?.Invoke();
         }
         finally { ExitCallback(); }
     }
@@ -631,17 +660,23 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         bool allowCancelFailureRecovery = false)
     {
         UpdateBrokerOrderId(tracked, brokerOrder);
-        int filled = brokerOrder == null ? tracked.FilledQuantity : Math.Max(tracked.FilledQuantity, brokerOrder.FilledQty);
-        int remaining = brokerOrder?.LeavesQty >= 0
-            ? brokerOrder.LeavesQty
-            : tracked.RemainingQuantity;
+        int reportedFilled = brokerOrder == null ? tracked.FilledQuantity : Math.Max(tracked.FilledQuantity, brokerOrder.FilledQty);
+        if (reportedFilled > tracked.Order.Quantity)
+        {
+            tracked.ProtocolViolation = true;
+            tracked.AwaitingSettlement = true;
+        }
+        int filled = Math.Clamp(reportedFilled, 0, tracked.Order.Quantity);
+        int remaining = brokerOrder == null
+            ? tracked.RemainingQuantity
+            : Math.Max(0, tracked.Order.Quantity - filled);
         bool terminal = state is OrderLifecycleState.Filled or OrderLifecycleState.Cancelled or OrderLifecycleState.Rejected;
         if (!CanTransition(tracked, state, allowLateFill, allowCancelFailureRecovery)) return null;
         if (tracked.LifecycleState == state &&
             tracked.FilledQuantity == filled && tracked.RemainingQuantity == remaining)
         {
             if (state == OrderLifecycleState.Filled &&
-                tracked.DeliveredFilledQuantity >= tracked.Order.Quantity && remaining == 0)
+                !tracked.ProtocolViolation && tracked.DeliveredFilledQuantity >= tracked.Order.Quantity && remaining == 0)
                 tracked.AwaitingSettlement = false;
             if (terminal)
             {
@@ -657,7 +692,8 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         tracked.RemainingQuantity = remaining;
         tracked.Terminal = tracked.Terminal || terminal;
         if (terminal) tracked.TerminalAt = timestamp;
-        if (state == OrderLifecycleState.Filled && tracked.DeliveredFilledQuantity >= tracked.Order.Quantity && remaining == 0)
+        if (state == OrderLifecycleState.Filled && !tracked.ProtocolViolation &&
+            tracked.DeliveredFilledQuantity >= tracked.Order.Quantity && remaining == 0)
             tracked.AwaitingSettlement = false;
         return new OrderLifecycleEvent
         {

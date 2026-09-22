@@ -17,6 +17,7 @@ public sealed record LiveStrategyCloseStatus(
     int Position,
     int ActiveBrokerOrders,
     int QuarantinedBrokerOrders,
+    int ProtocolViolations,
     int LocalConditions,
     bool ClosePending);
 
@@ -44,7 +45,7 @@ public sealed class LiveStrategyService : IDisposable
     private long _generationSequence;
     private readonly ConcurrentDictionary<string, byte> _pendingClose = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, byte> _closeFlattenAuthorized = new(StringComparer.OrdinalIgnoreCase);
-    private readonly ConcurrentDictionary<string, long> _flattenPending = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, FlattenAttempt> _flattenPending = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, byte> _closeRetryNeeded = new(StringComparer.OrdinalIgnoreCase);
     private long _flattenToken;
     private readonly ConcurrentDictionary<string, AddReservation> _addReservations = new(StringComparer.OrdinalIgnoreCase);
@@ -126,6 +127,7 @@ public sealed class LiveStrategyService : IDisposable
             var execution = _createExecution(definition, universe, commissionPerContract);
             execution.Failed += reason => QueueRiskStop(definition.InstanceId, reservation.Generation, reason);
             execution.StateChanged += () => OnExecutionStateChanged(definition.InstanceId, execution);
+            execution.OrderLifecycleChanged += state => OnExecutionLifecycleChanged(definition.InstanceId, state);
             if (!_executions.TryAdd(definition.InstanceId, execution))
             {
                 execution.Dispose();
@@ -159,7 +161,9 @@ public sealed class LiveStrategyService : IDisposable
                 {
                     // Ownership must remain discoverable when an active live order
                     // prevents cleanup; close/retry paths still need this executor.
-                    throw new AggregateException("策略加入失敗，且實盤執行器仍有活動資源。", addError, cleanupError);
+                    throw hookError == null
+                        ? new AggregateException("策略加入失敗，且實盤執行器仍有活動資源。", addError, cleanupError)
+                        : new AggregateException("策略加入、診斷 hook 與實盤清理皆失敗。", addError, hookError, cleanupError);
                 }
                 _executions.TryRemove(definition.InstanceId, out _);
                 _dailyLossLimits.TryRemove(definition.InstanceId, out _);
@@ -208,13 +212,14 @@ public sealed class LiveStrategyService : IDisposable
     {
         WaitForAdd(instanceId);
         StrategySnapshot? snapshot = Find(instanceId);
-        if (snapshot == null) return new LiveStrategyCloseStatus(false, 0, 0, 0, 0, false);
+        if (snapshot == null) return new LiveStrategyCloseStatus(false, 0, 0, 0, 0, 0, false);
         _executions.TryGetValue(instanceId, out KgiLiveStrategyExecutionService? execution);
         return new LiveStrategyCloseStatus(
             true,
             snapshot.Position,
             execution?.ActiveBrokerOrderCount ?? 0,
             execution?.QuarantinedBrokerOrderCount ?? 0,
+            execution?.ProtocolViolationCount ?? 0,
             execution?.LocalConditionCount ?? 0,
             _pendingClose.ContainsKey(instanceId));
     }
@@ -331,7 +336,9 @@ public sealed class LiveStrategyService : IDisposable
     private void QueueRiskStop(string instanceId, long generation, string reason)
     {
         _pendingRisk[instanceId] = new PendingRisk(generation, reason);
-        TryProcessPendingRisk(instanceId, generation);
+        // A failure raised synchronously by a close/flatten submission must not
+        // re-enter EmergencyStop and submit another exit on the same call stack.
+        if (!_pendingClose.ContainsKey(instanceId)) TryProcessPendingRisk(instanceId, generation);
     }
 
     private void TryProcessPendingRisk(string instanceId, long generation)
@@ -342,6 +349,12 @@ public sealed class LiveStrategyService : IDisposable
             !_riskProcessing.TryAdd(instanceId, 0)) return;
         try
         {
+            if (_pendingClose.ContainsKey(instanceId))
+            {
+                _riskTriggered.TryAdd(instanceId, 0);
+                _pendingRisk.TryRemove(instanceId, out _);
+                return;
+            }
             if (EmergencyStop(instanceId, pending.Reason))
             {
                 _riskTriggered.TryAdd(instanceId, 0);
@@ -364,14 +377,16 @@ public sealed class LiveStrategyService : IDisposable
         if (execution.ActiveBrokerOrderCount > 0) return false;
         if (snapshot.Position != 0)
         {
+            long token = Interlocked.Increment(ref _flattenToken);
+            var attempt = new FlattenAttempt(token, $"flatten-{instanceId}-{token}");
             if (!_closeFlattenAuthorized.ContainsKey(instanceId) ||
-                !_flattenPending.TryAdd(instanceId, Interlocked.Increment(ref _flattenToken))) return false;
-            try { execution.Flatten(snapshot.Position); }
+                !_flattenPending.TryAdd(instanceId, attempt)) return false;
+            try { execution.Flatten(snapshot.Position, attempt.ClientOrderId); }
             catch
             {
-                _flattenPending.TryRemove(instanceId, out _);
+                TryRemoveFlatten(instanceId, attempt);
                 _closeRetryNeeded.TryAdd(instanceId, 0);
-                throw;
+                return false;
             }
             return false;
         }
@@ -385,11 +400,21 @@ public sealed class LiveStrategyService : IDisposable
 
     private void OnExecutionStateChanged(string instanceId, KgiLiveStrategyExecutionService execution)
     {
-        if (execution.ActiveBrokerOrderCount == 0 && _flattenPending.TryRemove(instanceId, out _))
-            _closeRetryNeeded.TryAdd(instanceId, 0);
-        else if (_pendingClose.ContainsKey(instanceId) && execution.ActiveBrokerOrderCount == 0)
+        if (_pendingClose.ContainsKey(instanceId) && execution.ActiveBrokerOrderCount == 0)
             _closeRetryNeeded.TryAdd(instanceId, 0);
     }
+
+    private void OnExecutionLifecycleChanged(string instanceId, OrderLifecycleEvent state)
+    {
+        if (state.State is not (OrderLifecycleState.Filled or OrderLifecycleState.Cancelled or OrderLifecycleState.Rejected) ||
+            !_flattenPending.TryGetValue(instanceId, out FlattenAttempt? attempt) ||
+            !string.Equals(state.ClientOrderId, attempt.ClientOrderId, StringComparison.OrdinalIgnoreCase)) return;
+        if (TryRemoveFlatten(instanceId, attempt)) _closeRetryNeeded.TryAdd(instanceId, 0);
+    }
+
+    private bool TryRemoveFlatten(string instanceId, FlattenAttempt attempt) =>
+        ((ICollection<KeyValuePair<string, FlattenAttempt>>)_flattenPending)
+            .Remove(new KeyValuePair<string, FlattenAttempt>(instanceId, attempt));
 
     public void Dispose()
     {
@@ -456,4 +481,5 @@ public sealed class LiveStrategyService : IDisposable
     }
 
     private sealed record PendingRisk(long Generation, string Reason);
+    private sealed record FlattenAttempt(long Token, string ClientOrderId);
 }

@@ -279,6 +279,32 @@ using (var startFailureHost = new StrategyHost(new FakeSource()))
         "strategy.Start 失敗時 Add 必須失敗");
     Assert(startFailureHost.GetSnapshots().Count == 0, "Start 失敗不得留下 runner");
 }
+var safeCleanupHost = new StrategyHost(new FakeSource());
+var safeCleanupExecution = new DisposeProbeExecutionService();
+AssertThrows<AggregateException>(() => safeCleanupHost.Add(
+        new ThrowingStartAndStopStrategy("start-stop-throws-safe"),
+        new ResolvedStrategyUniverse { Tradable = Product("225MC", "TSS", 5m, 10m) },
+        executionService: safeCleanupExecution),
+    "Start與Stop錯誤都必須回報，但broker安全Dispose後不得retained runner");
+Assert(safeCleanupExecution.DisposeCalls == 1 && safeCleanupHost.GetSnapshots().Count == 0,
+    "broker已安全關閉時Stop錯誤不得留下IsDisposed runner ownership");
+safeCleanupHost.Dispose();
+
+var unsafeCleanupHost = new StrategyHost(new FakeSource());
+var unsafeCleanupExecution = new DisposeProbeExecutionService { FailDispose = true };
+AssertThrows<AggregateException>(() => unsafeCleanupHost.Add(
+        new ThrowingStartAndStopStrategy("start-stop-throws-unsafe"),
+        new ResolvedStrategyUniverse { Tradable = Product("225MC", "TSU", 5m, 10m) },
+        executionService: unsafeCleanupExecution),
+    "broker無法安全Dispose時必須回報Start cleanup failure");
+Assert(unsafeCleanupHost.GetSnapshots().Single().InstanceId == "start-stop-throws-unsafe",
+    "broker仍有風險時runner必須retained供後續retry");
+unsafeCleanupExecution.FailDispose = false;
+AssertThrows<InvalidOperationException>(() => unsafeCleanupHost.Remove("start-stop-throws-unsafe"),
+    "後續安全關閉仍須向caller回報strategy.Stop診斷");
+Assert(unsafeCleanupHost.GetSnapshots().Count == 0,
+    "broker retry安全Dispose後，即使Stop報錯也必須移除runner ownership");
+unsafeCleanupHost.Dispose();
 using (var startSnapshotHost = new StrategyHost(new FakeSource()))
 {
     int healthySubscriberCalls = 0;
@@ -898,6 +924,42 @@ sealed class ThrowingStartStrategy : ISimulationStrategy
     public void Resume() { }
     public void Stop(string reason) { }
     public StrategySnapshot GetSnapshot() => new() { StrategyType = StrategyType, InstanceId = InstanceId };
+}
+
+sealed class ThrowingStartAndStopStrategy : ISimulationStrategy
+{
+    public ThrowingStartAndStopStrategy(string instanceId) => InstanceId = instanceId;
+    public string StrategyType => "ThrowingStartAndStop";
+    public string InstanceId { get; }
+    public StrategyLifecycleState State => StrategyLifecycleState.Created;
+    public event Action<PaperOrderRequest>? OrderRequested { add { } remove { } }
+    public event Action? CancelAllRequested { add { } remove { } }
+    public event Action<StrategySnapshot>? SnapshotChanged { add { } remove { } }
+    public void Start(StrategyRuntimeContext context) => throw new InvalidOperationException("start failed");
+    public void OnMarketEvent(MarketEvent marketEvent) { }
+    public void OnExecution(ExecutionEvent execution) { }
+    public void Pause(string reason) { }
+    public void Resume() { }
+    public void Stop(string reason) => throw new InvalidOperationException("stop failed");
+    public StrategySnapshot GetSnapshot() => new() { StrategyType = StrategyType, InstanceId = InstanceId };
+}
+
+sealed class DisposeProbeExecutionService : IStrategyExecutionService, IDisposable
+{
+    public bool FailDispose { get; set; }
+    public int DisposeCalls { get; private set; }
+    public event Action<ExecutionEvent>? Filled { add { } remove { } }
+    public event Action<string>? Failed { add { } remove { } }
+    public void Dispose()
+    {
+        DisposeCalls++;
+        if (FailDispose) throw new InvalidOperationException("broker dispose failed");
+    }
+    public PaperOrder Submit(PaperOrderRequest request, DateTimeOffset now) => throw new NotSupportedException();
+    public bool Cancel(string orderId) => false;
+    public int CancelAll(string strategyInstanceId) => 0;
+    public IReadOnlyList<PaperOrder> GetWorkingOrders(string strategyInstanceId) => Array.Empty<PaperOrder>();
+    public void OnMarketEvent(MarketEvent marketEvent) { }
 }
 
 sealed class ManagedProbeStrategy : ISimulationStrategy, IManagedOrderStrategy
