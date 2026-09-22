@@ -10,6 +10,8 @@ namespace KGIOptionPricing.StrategyFramework.Execution;
 /// </summary>
 public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionService, IDisposable
 {
+    private const string ProtocolReconciliationMessage =
+        "偵測到券商成交量協定異常，必須先人工核對部位；已禁止自動送單、刪單與條件觸發。";
     // Bounds memory while preserving a practical cancel/fill race window.
     // Callbacks arriving more than ten minutes after terminal state are ignored;
     // those extreme delays must be reconciled from broker order/deal reports.
@@ -54,6 +56,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
     private readonly Dictionary<int, int> _callbackThreadDepth = new();
     private int _inflightOperations;
     private readonly Dictionary<int, int> _operationThreadDepth = new();
+    private bool _protocolViolation;
 
     public event Action<ExecutionEvent>? Filled;
     public event Action<string>? Failed;
@@ -78,6 +81,14 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
     public int ProtocolViolationCount
     {
         get { lock (_sync) return _realOrders.Values.Count(x => x.ProtocolViolation); }
+    }
+    internal int ClientOrderRegistryCount
+    {
+        get { lock (_sync) return _ownedClientOrderIds.Count; }
+    }
+    internal bool ManualReconciliationRequired
+    {
+        get { lock (_sync) return _protocolViolation; }
     }
 
     public KgiLiveStrategyExecutionService(
@@ -121,7 +132,11 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         EnterOperation();
         try
         {
-        lock (_sync) PurgeExpiredTerminalsLocked(_now());
+        lock (_sync)
+        {
+            PurgeExpiredTerminalsLocked(_now());
+            ThrowIfProtocolViolationLocked();
+        }
         if (!_gateway.IsLoggedIn) throw new InvalidOperationException("交易服務尚未登入，禁止實盤送單。");
         if (!string.Equals(request.StrategyInstanceId, _instanceId, StringComparison.OrdinalIgnoreCase))
             throw new InvalidOperationException("策略實例與實盤執行器不一致。");
@@ -183,18 +198,20 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         EnterOperation();
         try
         {
-        bool removedCondition;
+        PaperOrder? removedCondition;
         string? realId;
         lock (_sync)
         {
             ThrowIfClosingLocked();
             PurgeExpiredTerminalsLocked(_now());
-            removedCondition = _conditions.Remove(orderId);
-            realId = removedCondition
+            ThrowIfProtocolViolationLocked();
+            _conditions.Remove(orderId, out removedCondition);
+            if (removedCondition != null) RetireClientOrderIdLocked(removedCondition.ClientOrderId);
+            realId = removedCondition != null
                 ? null
                 : _realOrders.FirstOrDefault(x => !x.Value.Terminal && x.Value.Order.OrderId == orderId).Key;
         }
-        if (removedCondition)
+        if (removedCondition != null)
         {
             StateChanged?.Invoke();
             return true;
@@ -217,6 +234,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         {
             ThrowIfClosingLocked();
             PurgeExpiredTerminalsLocked(_now());
+            ThrowIfProtocolViolationLocked();
             string[] matches = _realOrders
                 .Where(x => !x.Value.Terminal &&
                             string.Equals(x.Value.Order.StrategyInstanceId, strategyInstanceId, StringComparison.OrdinalIgnoreCase) &&
@@ -243,7 +261,10 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         {
             ThrowIfClosingLocked();
             PurgeExpiredTerminalsLocked(_now());
+            ThrowIfProtocolViolationLocked();
             conditionCount = _conditions.Count;
+            foreach (PaperOrder condition in _conditions.Values)
+                RetireClientOrderIdLocked(condition.ClientOrderId);
             _conditions.Clear();
             realIds = _realOrders.Where(x => !x.Value.Terminal).Select(x => x.Key).ToArray();
         }
@@ -278,6 +299,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         lock (_sync)
         {
             ThrowIfClosingLocked();
+            ThrowIfProtocolViolationLocked();
             triggered = _conditions.Values.OrderBy(x => x.CreatedAt).FirstOrDefault(order => order.Type switch
             {
                 PaperOrderType.Limit when order.Side == BuySell.Buy => marketEvent.LastPrice < order.Price,
@@ -286,7 +308,15 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
                 PaperOrderType.Stop => marketEvent.LastPrice < order.Price,
                 _ => false
             });
-            if (triggered != null) _conditions.Clear(); // Existing local OCO behavior.
+            if (triggered != null)
+            {
+                foreach (PaperOrder condition in _conditions.Values)
+                {
+                    if (!ReferenceEquals(condition, triggered))
+                        RetireClientOrderIdLocked(condition.ClientOrderId);
+                }
+                _conditions.Clear(); // Existing local OCO behavior.
+            }
         }
         if (triggered != null) SendMarket(triggered, marketEvent.LastPrice);
         }
@@ -316,6 +346,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         lock (_sync)
         {
             ThrowIfClosingLocked();
+            ThrowIfProtocolViolationLocked();
             if (!_ownedClientOrderIds.Add(clientOrderId)) return false;
             _clientOrderReservations.Add(clientOrderId);
             return true;
@@ -338,6 +369,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
 
     public void Flatten(int netPosition)
     {
+        lock (_sync) ThrowIfProtocolViolationLocked();
         if (netPosition == 0) return;
         string clientOrderId = $"flatten-{_instanceId}-{Interlocked.Increment(ref _localSequence)}";
         if (!TryReserveClientOrderId(clientOrderId))
@@ -355,6 +387,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         EnterOperation();
         try
         {
+        lock (_sync) ThrowIfProtocolViolationLocked();
         if (netPosition == 0) return;
         if (Math.Abs(netPosition) != 1)
             throw new InvalidOperationException("實盤策略平倉硬閘固定每次 1 口；非一口部位必須人工核對。");
@@ -362,6 +395,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
             throw new ArgumentException("Flatten ClientOrderId 不得空白。", nameof(clientOrderId));
         lock (_sync)
         {
+            ThrowIfProtocolViolationLocked();
             if (!_clientOrderReservations.Contains(clientOrderId))
                 throw new InvalidOperationException($"Flatten ClientOrderId 未先取得唯一保留權：{clientOrderId}");
         }
@@ -400,6 +434,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         lock (_sync)
         {
             PurgeExpiredTerminalsLocked(_now());
+            ThrowIfProtocolViolationLocked();
             if (_realOrders.Values.Any(x => string.Equals(
                     x.Order.ClientOrderId, request.ClientOrderId, StringComparison.OrdinalIgnoreCase)))
                 throw new InvalidOperationException($"ClientOrderId 已存在：{request.ClientOrderId}");
@@ -416,6 +451,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
 
         try
         {
+            lock (_sync) ThrowIfProtocolViolationLocked();
             _gateway.PlaceOrder(brokerRequest);
         }
         catch (Exception ex)
@@ -434,6 +470,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         string realId = $"STRAT-{_instanceId}-{Interlocked.Increment(ref _localSequence)}";
         lock (_sync)
         {
+            ThrowIfProtocolViolationLocked();
             _realOrders[realId] = new TrackedRealOrder
             {
                 Order = condition,
@@ -446,6 +483,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         PublishTransition(realId, OrderLifecycleState.Submitted, null, "Submitted", _now());
         try
         {
+            lock (_sync) ThrowIfProtocolViolationLocked();
             _gateway.PlaceOrder(new OrderRequest
             {
                 OrderId = realId,
@@ -473,6 +511,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         lock (_sync)
         {
             PurgeExpiredTerminalsLocked(_now());
+            ThrowIfProtocolViolationLocked();
             if (!_realOrders.TryGetValue(realId, out TrackedRealOrder? tracked) || tracked.Terminal ||
                 tracked.LifecycleState == OrderLifecycleState.CancelPending) return false;
             managed = tracked.IsManaged;
@@ -484,6 +523,10 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
 
         try
         {
+            lock (_sync)
+            {
+                ThrowIfProtocolViolationLocked();
+            }
             _gateway.CancelOrder(realId);
             if (!managed) StateChanged?.Invoke();
             return true;
@@ -516,6 +559,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
             {
                 tracked.ProtocolViolation = true;
                 tracked.AwaitingSettlement = true;
+                _protocolViolation = true;
                 if (!tracked.ProtocolViolationPublished)
                 {
                     tracked.ProtocolViolationPublished = true;
@@ -661,6 +705,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
             {
                 tracked.ProtocolViolation = true;
                 tracked.AwaitingSettlement = true;
+                _protocolViolation = true;
                 if (!tracked.ProtocolViolationPublished)
                 {
                     tracked.ProtocolViolationPublished = true;
@@ -681,11 +726,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
             {
                 // A terminal tombstone advances only in OnOrderFilled, which
                 // guarantees the execution reaches the ledger first.
-                if (tracked.Terminal)
-                {
-                    return;
-                }
-                else
+                if (!tracked.Terminal)
                 switch (brokerOrder.Status)
                 {
                     case OrderStatus.Accepted:
@@ -762,6 +803,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         {
             tracked.ProtocolViolation = true;
             tracked.AwaitingSettlement = true;
+            _protocolViolation = true;
         }
         int filled = Math.Clamp(reportedFilled, 0, tracked.Order.Quantity);
         int remaining = brokerOrder == null
@@ -877,7 +919,23 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
                         now - x.Value.TerminalAt.Value > TerminalRetention)
             .Select(x => x.Key)
             .ToArray();
-        foreach (string realId in expired) _realOrders.Remove(realId);
+        foreach (string realId in expired)
+        {
+            if (_realOrders.Remove(realId, out TrackedRealOrder? tracked))
+                RetireClientOrderIdLocked(tracked.Order.ClientOrderId);
+        }
+    }
+
+    private void RetireClientOrderIdLocked(string clientOrderId)
+    {
+        if (string.IsNullOrWhiteSpace(clientOrderId)) return;
+        _clientOrderReservations.Remove(clientOrderId);
+        _ownedClientOrderIds.Remove(clientOrderId);
+    }
+
+    private void ThrowIfProtocolViolationLocked()
+    {
+        if (_protocolViolation) throw new InvalidOperationException(ProtocolReconciliationMessage);
     }
 
     public void Dispose() => DisposeIfSafe(() => true);

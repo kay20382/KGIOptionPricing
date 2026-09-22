@@ -100,7 +100,12 @@ public sealed class StrategyInstanceRunner : IDisposable
             // Mark open positions from an actual last-traded price, never a half-tick midpoint.
             if (marketEvent.LastPrice > 0m)
                 _ledger.ApplyMark(marketEvent.Symbol, marketEvent.LastPrice);
-            _broker.OnMarketEvent(marketEvent);
+            try { _broker.OnMarketEvent(marketEvent); }
+            catch (InvalidOperationException) when (RequiresManualBrokerReconciliation())
+            {
+                // Keep routing prices to the paused strategy for visibility;
+                // the execution service will reject any resulting auto order.
+            }
             if (_paused)
             {
                 // Pausing blocks entries, but an open position still needs market events
@@ -176,17 +181,35 @@ public sealed class StrategyInstanceRunner : IDisposable
             _broker.CancelAll(_strategy.InstanceId);
     }
 
-    private void OnOrderRequested(PaperOrderRequest request) =>
-        _broker.Submit(request, _clock.Now);
+    private void OnOrderRequested(PaperOrderRequest request)
+    {
+        try { _broker.Submit(request, _clock.Now); }
+        catch (InvalidOperationException) when (RequiresManualBrokerReconciliation())
+        {
+            // The execution service already published the protocol failure.
+            // Preserve the strategy so Live can pause it for manual recovery.
+        }
+    }
 
-    private void OnCancelAllRequested() => _broker.CancelAll(_strategy.InstanceId);
+    private void OnCancelAllRequested()
+    {
+        try { _broker.CancelAll(_strategy.InstanceId); }
+        catch (InvalidOperationException) when (RequiresManualBrokerReconciliation()) { }
+    }
 
     private void OnStrategySnapshotChanged(StrategySnapshot snapshot) =>
         SnapshotChanged?.Invoke(WithPnl(snapshot));
 
     private void OnCancelOrderRequested(string clientOrderId)
     {
-        if (_managedBroker?.CancelByClientOrderId(_strategy.InstanceId, clientOrderId) != false) return;
+        try
+        {
+            if (_managedBroker?.CancelByClientOrderId(_strategy.InstanceId, clientOrderId) != false) return;
+        }
+        catch (InvalidOperationException) when (RequiresManualBrokerReconciliation())
+        {
+            return;
+        }
         _managedStrategy?.OnOrderLifecycle(new OrderLifecycleEvent
         {
             Timestamp = _clock.Now,
@@ -197,6 +220,9 @@ public sealed class StrategyInstanceRunner : IDisposable
             ReasonCode = "CancelRequestNotRouted"
         });
     }
+
+    private bool RequiresManualBrokerReconciliation() =>
+        _broker is KgiLiveStrategyExecutionService liveBroker && liveBroker.ManualReconciliationRequired;
 
     private void OnOrderLifecycleChanged(OrderLifecycleEvent orderEvent)
     {

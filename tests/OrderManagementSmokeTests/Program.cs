@@ -3,6 +3,7 @@ using KGIOptionPricing;
 using KGIOptionPricing.OrderManagement.Core;
 using KGIOptionPricing.OrderManagement.Gateway;
 using KGIOptionPricing.OrderManagement.Storage;
+using KGIOptionPricing.Strategies.PeriodicQueueCycle;
 using KGIOptionPricing.StrategyFramework;
 using KGIOptionPricing.StrategyFramework.Execution;
 
@@ -651,6 +652,72 @@ Assert(legacyOverfillExecutions.Sum(x => x.Quantity) == 1 &&
 AssertThrows<InvalidOperationException>(legacyOverfillService.Dispose,
     "non-managed overfill不得移除real order或自動cleanup");
 
+// A normal terminal followed by a late overfill state report must still notify
+// Live exactly once, pause the strategy, and engage the executor hard gate.
+var lateProtocolHost = new StrategyHost(new FakeHostMarketSource());
+var lateProtocolGateway = new FakeLiveStrategyOrderGateway();
+var lateProtocolUniverse = new ResolvedStrategyUniverse
+{
+    Tradable = new ResolvedProduct { ProductId = "225MC", Symbol = "225MC", TickSize = 5m, ContractMultiplier = 10m }
+};
+var lateProtocolDefinition = new StrategyDefinition
+{
+    StrategyType = "HostManagedProbe", InstanceId = "late-protocol",
+    Universe = new StrategyUniverse { Tradable = new ProductSelection("225MC") }
+};
+var lateProtocolLive = new LiveStrategyService(
+    lateProtocolHost, () => true, () => "TEST", _ => lateProtocolUniverse,
+    definition => new HostManagedProbeStrategy(definition.InstanceId, "225MC"),
+    (definition, universe, commission) => CreateLiveService(lateProtocolGateway, definition.InstanceId),
+    enableHeartbeat: false);
+lateProtocolLive.Add(lateProtocolDefinition, 36m, 1000m);
+KgiLiveStrategyExecutionService lateProtocolExecution = GetLiveExecution(lateProtocolLive, "late-protocol");
+int lateProtocolFailures = 0;
+lateProtocolExecution.Failed += _ => lateProtocolFailures++;
+PaperOrder lateProtocolOrder = lateProtocolExecution.Submit(
+    liveBuy with { StrategyInstanceId = "late-protocol", ClientOrderId = "late-protocol-entry" },
+    DateTimeOffset.UtcNow);
+PaperOrder lateProtocolPeer = lateProtocolExecution.Submit(
+    liveBuy with { StrategyInstanceId = "late-protocol", ClientOrderId = "late-protocol-peer" },
+    DateTimeOffset.UtcNow);
+PaperOrder lateProtocolCondition = lateProtocolExecution.Submit(
+    liveBuy with
+    {
+        StrategyInstanceId = "late-protocol", ClientOrderId = "late-protocol-condition",
+        Type = PaperOrderType.Limit, Price = 65010m
+    }, DateTimeOffset.UtcNow);
+lateProtocolGateway.EmitFill(lateProtocolOrder.OrderId, 1, 0, OrderStatus.Filled, 1, 65000d);
+lateProtocolGateway.EmitState(lateProtocolOrder.OrderId, OrderStatus.Filled, 2, 0, "late cumulative overfill");
+lateProtocolGateway.EmitState(lateProtocolOrder.OrderId, OrderStatus.Filled, 2, 0, "duplicate overfill");
+Assert(lateProtocolLive.GetCloseStatus("late-protocol").ManualReconciliationRequired &&
+       lateProtocolLive.GetSnapshots().Single().State == StrategyLifecycleState.Suspended &&
+       lateProtocolFailures == 1,
+    "terminal後late overfill必須發布一次failure/state給Live並Pause策略");
+AssertThrows<InvalidOperationException>(() => lateProtocolExecution.Submit(
+        liveBuy with { StrategyInstanceId = "late-protocol", ClientOrderId = "blocked-after-protocol" },
+        DateTimeOffset.UtcNow),
+    "protocol flag後新Submit必須由executor hard gate拒絕");
+int lateProtocolPlaces = lateProtocolGateway.PlaceOrderCount;
+int lateProtocolCancels = lateProtocolGateway.CancelOrderCount;
+AssertThrows<InvalidOperationException>(() => lateProtocolExecution.Cancel(lateProtocolCondition.OrderId),
+    "protocol flag後Cancel必須回報人工核對錯誤");
+AssertThrows<InvalidOperationException>(() => lateProtocolExecution.CancelByClientOrderId(
+        "late-protocol", lateProtocolPeer.ClientOrderId),
+    "protocol flag後CancelByClientOrderId必須回報人工核對錯誤");
+AssertThrows<InvalidOperationException>(() => lateProtocolExecution.CancelAll("late-protocol"),
+    "protocol flag後CancelAll必須回報人工核對錯誤");
+AssertThrows<InvalidOperationException>(() => lateProtocolExecution.Flatten(1),
+    "protocol flag後Flatten必須回報人工核對錯誤");
+AssertThrows<InvalidOperationException>(() => lateProtocolExecution.OnMarketEvent(new MarketEvent
+    {
+        Sequence = 1, Timestamp = DateTimeOffset.UtcNow, Symbol = "225MC", ProductId = "225MC",
+        Kind = MarketEventKind.Trade, LastPrice = 65000m
+    }),
+    "protocol flag後OnMarketEvent條件觸發必須回報人工核對錯誤");
+Assert(lateProtocolGateway.PlaceOrderCount == lateProtocolPlaces &&
+       lateProtocolGateway.CancelOrderCount == lateProtocolCancels,
+    "protocol flag後條件單觸發不得觸及gateway");
+
 // Dispose 必須 fail closed：有 active broker order 時不可清除追蹤或解除 callback。
 var disposeGateway = new FakeLiveStrategyOrderGateway();
 var disposeLifecycle = new List<OrderLifecycleEvent>();
@@ -952,6 +1019,59 @@ Assert(overfillLive.EmergencyStop("live-overfill", "protocol reconciliation") &&
     "protocol violation 必須優先阻斷Cancel/Flatten，自動close不可宣稱完成");
 AssertThrows<InvalidOperationException>(overfillLive.Dispose,
     "overfill retained runner 必須fail closed");
+
+// Real PeriodicQueueCycle integration: once a late overfill is observed, its
+// fill callback, Pause callback, heartbeat and subsequent market events must
+// all be unable to reach PlaceOrder/CancelOrder again.
+DateTimeOffset periodicProtocolStart = new(2026, 9, 22, 1, 0, 0, TimeSpan.Zero);
+var periodicProtocolClock = new MutableLiveClock(periodicProtocolStart);
+var periodicProtocolSource = new FakeHostMarketSource();
+var periodicProtocolHost = new StrategyHost(periodicProtocolSource, periodicProtocolClock);
+var periodicProtocolGateway = new FakeLiveStrategyOrderGateway();
+var periodicProtocolDefinition = new StrategyDefinition
+{
+    StrategyType = PeriodicQueueCycleFactory.TypeName,
+    InstanceId = "periodic-protocol",
+    Universe = atomicDefinition.Universe,
+    Parameters = new Dictionary<string, string>
+    {
+        ["DirectionWindowSeconds"] = "2", ["ObiConfirmSeconds"] = "1",
+        ["MinSideDepth"] = "1", ["MinNearDepth"] = "1", ["MinDepthRatio"] = "0",
+        ["MaxSpreadTicks"] = "2", ["MaxVolatilityTicks"] = "100", ["MaxChaseTicks"] = "20",
+        ["TrendInitialAheadA"] = "5", ["TrendRepriceThresholdB"] = "100000", ["TrendRepriceTargetC"] = "1",
+        ["OppositeInitialAheadA"] = "20", ["OppositeRepriceThresholdB"] = "100000", ["OppositeRepriceTargetC"] = "1"
+    }
+};
+var periodicProtocolLive = new LiveStrategyService(
+    periodicProtocolHost, () => true, () => "TEST", _ => atomicUniverse,
+    definition => new PeriodicQueueCycleFactory().Create(definition),
+    (definition, universe, commission) => CreateLiveService(periodicProtocolGateway, definition.InstanceId),
+    enableHeartbeat: false);
+periodicProtocolLive.Add(periodicProtocolDefinition, 36m, 1000m);
+periodicProtocolSource.Emit(HealthyBook("225MC", 65000m, 1, periodicProtocolStart));
+periodicProtocolClock.Now = periodicProtocolStart.AddSeconds(1);
+periodicProtocolSource.Emit(HealthyBook("225MC", 65010m, 2, periodicProtocolClock.Now));
+Assert(periodicProtocolGateway.PlaceOrderCount == 2,
+    "真正PeriodicQueueCycle前置必須同時送出雙邊完成單");
+string periodicFilledOrderId = periodicProtocolGateway.LastOrderId;
+periodicProtocolGateway.EmitFill(periodicFilledOrderId, 1, 0, OrderStatus.Filled, 1, 65015d);
+periodicProtocolGateway.EmitState(periodicFilledOrderId, OrderStatus.Filled, 2, 0,
+    "late cumulative overfill");
+int periodicPlacesAfterViolation = periodicProtocolGateway.PlaceOrderCount;
+int periodicCancelsAfterViolation = periodicProtocolGateway.CancelOrderCount;
+periodicProtocolClock.Now = periodicProtocolStart.AddSeconds(40);
+periodicProtocolLive.Pulse(periodicProtocolClock.Now);
+periodicProtocolSource.Emit(HealthyBook("225MC", 64950m, 3, periodicProtocolClock.Now));
+LiveStrategyCloseStatus periodicProtocolStatus = periodicProtocolLive.GetCloseStatus("periodic-protocol");
+StrategySnapshot periodicProtocolSnapshot = periodicProtocolLive.GetSnapshots().Single();
+Assert(periodicProtocolStatus.ManualReconciliationRequired &&
+       periodicProtocolSnapshot.State == StrategyLifecycleState.Suspended &&
+       periodicProtocolGateway.PlaceOrderCount == periodicPlacesAfterViolation &&
+       periodicProtocolGateway.CancelOrderCount == periodicCancelsAfterViolation,
+    $"Periodic late violation後Pause/Pulse/market皆不得旁路executor hard gate送單或刪單：" +
+    $"manual={periodicProtocolStatus.ManualReconciliationRequired}, state={periodicProtocolSnapshot.State}, " +
+    $"place={periodicProtocolGateway.PlaceOrderCount}/{periodicPlacesAfterViolation}, " +
+    $"cancel={periodicProtocolGateway.CancelOrderCount}/{periodicCancelsAfterViolation}");
 
 // The flatten token is the ownership gate: while the winning caller is still
 // inside the gateway, a concurrent close attempt must not submit a second exit.
@@ -1301,6 +1421,49 @@ raceGateway.EmitFill(cancelledRace.OrderId, 1, 0, OrderStatus.Filled, 1, 65000d)
 raceGateway.EmitFill(pendingRace.OrderId, 1, 0, OrderStatus.Filled, 1, 65000d);
 raceService.Dispose();
 
+// ClientOrderId ownership must retire with the exact safe resource. Fully
+// reconciled tombstones and unsent local conditions may release their ids;
+// quarantined broker orders must retain them indefinitely.
+DateTimeOffset registryNow = new(2026, 9, 22, 0, 0, 0, TimeSpan.Zero);
+var registryGateway = new FakeLiveStrategyOrderGateway();
+var registryService = CreateLiveService(registryGateway, "registry-live", () => registryNow);
+PaperOrder reusableFilled = registryService.Submit(
+    liveBuy with { StrategyInstanceId = "registry-live", ClientOrderId = "safe-reuse" }, registryNow);
+registryGateway.EmitFill(reusableFilled.OrderId, 1, 0, OrderStatus.Filled, 1, 65000d);
+Assert(ClientOrderRegistryCount(registryService) == 1,
+    "safe filled tombstone retention期內仍須保留ClientOrderId ownership");
+registryNow = registryNow.AddMinutes(11);
+Assert(registryService.ActiveBrokerOrderCount == 0 && ClientOrderRegistryCount(registryService) == 0,
+    "safe fully-filled tombstone purge時應同步退休ClientOrderId");
+PaperOrder reusedFilled = registryService.Submit(
+    liveBuy with { StrategyInstanceId = "registry-live", ClientOrderId = "safe-reuse" }, registryNow);
+registryGateway.EmitFill(reusedFilled.OrderId, 1, 0, OrderStatus.Filled, 1, 65000d);
+
+PaperOrder quarantinedId = registryService.Submit(
+    liveBuy with { StrategyInstanceId = "registry-live", ClientOrderId = "quarantine-id" }, registryNow);
+registryGateway.EmitState(quarantinedId.OrderId, OrderStatus.Cancelled, 0, 0);
+registryNow = registryNow.AddMinutes(11);
+_ = registryService.ActiveBrokerOrderCount;
+AssertThrows<InvalidOperationException>(() => registryService.Submit(
+        liveBuy with { StrategyInstanceId = "registry-live", ClientOrderId = "quarantine-id" }, registryNow),
+    "Cancelled quarantine的ClientOrderId不得退休或重用");
+
+PaperOrder localCondition = registryService.Submit(
+    liveBuy with
+    {
+        StrategyInstanceId = "registry-live", ClientOrderId = "local-reuse",
+        Type = PaperOrderType.Limit
+    }, registryNow);
+Assert(registryService.Cancel(localCondition.OrderId), "local condition前置必須可取消");
+PaperOrder reusedCondition = registryService.Submit(
+    liveBuy with
+    {
+        StrategyInstanceId = "registry-live", ClientOrderId = "local-reuse",
+        Type = PaperOrderType.Stop
+    }, registryNow);
+Assert(registryService.Cancel(reusedCondition.OrderId),
+    "未送broker的local condition取消後必須釋放ClientOrderId供重用");
+
 // Cancelled tombstone 沒有 definitive settlement 時不可因時間經過而猜測安全。
 DateTimeOffset retentionNow = new(2026, 9, 22, 1, 0, 0, TimeSpan.Zero);
 var retentionGateway = new FakeLiveStrategyOrderGateway();
@@ -1361,6 +1524,25 @@ static KgiLiveStrategyExecutionService GetLiveExecution(LiveStrategyService serv
     var map = (System.Collections.Concurrent.ConcurrentDictionary<string, KgiLiveStrategyExecutionService>)field.GetValue(service)!;
     return map[instanceId];
 }
+
+static int ClientOrderRegistryCount(KgiLiveStrategyExecutionService service) =>
+    (int)(typeof(KgiLiveStrategyExecutionService)
+        .GetProperty("ClientOrderRegistryCount", BindingFlags.Instance | BindingFlags.NonPublic)
+        ?.GetValue(service) ?? throw new InvalidOperationException("ClientOrderId registry observable missing"));
+
+static MarketEvent HealthyBook(string symbol, decimal bestBid, long sequence, DateTimeOffset timestamp) => new()
+{
+    Sequence = sequence,
+    Timestamp = timestamp,
+    Symbol = symbol,
+    ProductId = symbol,
+    Kind = MarketEventKind.Book,
+    LastPrice = bestBid,
+    BidPrices = Enumerable.Range(0, 10).Select(i => bestBid - i * 5m).ToArray(),
+    AskPrices = Enumerable.Range(0, 10).Select(i => bestBid + 5m + i * 5m).ToArray(),
+    BidQuantities = Enumerable.Repeat(20, 10).ToArray(),
+    AskQuantities = Enumerable.Repeat(10, 10).ToArray()
+};
 
 static InstrumentKey ForeignInstrument() => new()
 {
@@ -1471,6 +1653,7 @@ sealed class FakeLiveStrategyOrderGateway : ILiveStrategyOrderGateway
     public ManualResetEventSlim ReleasePlaceOrder { get; } = new(false);
     public string LastOrderId { get; private set; } = string.Empty;
     public int PlaceOrderCount { get; private set; }
+    public int CancelOrderCount { get; private set; }
     public Queue<FakePlaceOutcome> PlaceOutcomes { get; } = new();
 
     public event Action<OrderInfo>? OrderStateChanged;
@@ -1521,6 +1704,7 @@ sealed class FakeLiveStrategyOrderGateway : ILiveStrategyOrderGateway
 
     public void CancelOrder(string orderId)
     {
+        CancelOrderCount++;
         if (!_orders.TryGetValue(orderId, out OrderInfo? order)) return;
         order.Status = OrderStatus.CancelPending;
         OrderStateChanged?.Invoke(order);
@@ -1560,6 +1744,13 @@ sealed class FakeLiveStrategyOrderGateway : ILiveStrategyOrderGateway
 
     public void EmitOrderFailed(string orderId, string reason) => OrderFailed?.Invoke(_orders[orderId], reason);
     public void EmitCancelFailed(string orderId, string reason) => CancelFailed?.Invoke(_orders[orderId], reason);
+}
+
+sealed class MutableLiveClock : IEventDrivenStrategyClock
+{
+    public MutableLiveClock(DateTimeOffset now) => Now = now;
+    public DateTimeOffset Now { get; set; }
+    public void Advance(DateTimeOffset timestamp) => Now = timestamp;
 }
 
 enum FakePlaceOutcome { None, Rejected, Cancelled, Throw }
