@@ -59,6 +59,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
     private readonly Action? _beforeBrokerMutationCommit;
     private readonly Action? _afterBrokerMutationCommit;
     private readonly Action? _afterBrokerMutationTransition;
+    private readonly Action? _beforeLocalConditionCommit;
     private readonly object _brokerMutationSync = new();
     private readonly Dictionary<long, BrokerMutationLease> _brokerMutationLeases = new();
     private readonly Dictionary<string, PaperOrder> _conditions = new(StringComparer.OrdinalIgnoreCase);
@@ -134,7 +135,8 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         Action? beforeSubmitValidation = null,
         Action? beforeBrokerMutationCommit = null,
         Action? afterBrokerMutationCommit = null,
-        Action? afterBrokerMutationTransition = null)
+        Action? afterBrokerMutationTransition = null,
+        Action? beforeLocalConditionCommit = null)
     {
         _gateway = gateway ?? throw new ArgumentNullException(nameof(gateway));
         _instanceId = instanceId;
@@ -147,6 +149,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         _beforeBrokerMutationCommit = beforeBrokerMutationCommit;
         _afterBrokerMutationCommit = afterBrokerMutationCommit;
         _afterBrokerMutationTransition = afterBrokerMutationTransition;
+        _beforeLocalConditionCommit = beforeLocalConditionCommit;
         _instrument = LiveStrategyOrderMapper.ToInstrument(contract);
         _gateway.OrderFilled += OnOrderFilled;
         _gateway.OrderFailed += OnOrderFailed;
@@ -203,8 +206,10 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
                 SendMarket(order, request.Price);
             else
             {
+                _beforeLocalConditionCommit?.Invoke();
                 lock (_sync)
                 {
+                    ThrowIfProtocolViolationLocked();
                     _conditions[order.OrderId] = order;
                     CommitClientOrderReservationLocked(order.ClientOrderId);
                 }

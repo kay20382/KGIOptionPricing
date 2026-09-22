@@ -894,6 +894,60 @@ Exception invalidQuantityError = CaptureTaskException(invalidQuantityRequest,
 Assert(invalidQuantityError is InvalidOperationException and not BrokerReconciliationRequiredException,
     "並行protocol latch不得讓Runner吞掉已選定的quantity InvalidOperationException");
 
+// Local Limit/Stop submission must recheck the protocol gate atomically with
+// condition registration and ClientOrderId commit. Passing the initial check
+// is not authority to publish a condition after a concurrent latch.
+foreach (PaperOrderType localType in new[] { PaperOrderType.Limit, PaperOrderType.Stop })
+{
+    using var localValidationEntered = new ManualResetEventSlim(false);
+    using var releaseLocalValidation = new ManualResetEventSlim(false);
+    bool blockLocalValidation = false;
+    string localName = localType.ToString().ToLowerInvariant();
+    var localRaceGateway = new FakeLiveStrategyOrderGateway();
+    var localRaceService = CreateLiveService(localRaceGateway, $"local-race-{localName}",
+        beforeLocalConditionCommit: () =>
+        {
+            if (!blockLocalValidation) return;
+            localValidationEntered.Set();
+            releaseLocalValidation.Wait();
+        });
+    PaperOrder localRaceSeed = localRaceService.Submit(liveBuy with
+    {
+        StrategyInstanceId = $"local-race-{localName}", ClientOrderId = $"local-race-seed-{localName}"
+    }, DateTimeOffset.UtcNow);
+    localRaceGateway.EmitFill(localRaceSeed.OrderId, 1, 0, OrderStatus.Filled, 1, 65000d);
+    int registryBeforeLocalRace = ClientOrderRegistryCount(localRaceService);
+    blockLocalValidation = true;
+    Task<PaperOrder> localRaceSubmit = Task.Factory.StartNew(() => localRaceService.Submit(liveBuy with
+        {
+            StrategyInstanceId = $"local-race-{localName}",
+            ClientOrderId = $"local-race-target-{localName}",
+            Type = localType,
+            Price = localType == PaperOrderType.Limit ? 65010m : 64990m
+        }, DateTimeOffset.UtcNow),
+        CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+    Assert(localValidationEntered.Wait(TimeSpan.FromSeconds(5)),
+        $"{localType} Submit必須停在初始gate check後");
+    localRaceGateway.EmitState(localRaceSeed.OrderId, OrderStatus.Filled, 2, 0,
+        $"latch during {localType} validation");
+    releaseLocalValidation.Set();
+    Exception localRaceError = CaptureTaskException(localRaceSubmit,
+        $"{localType} local submit未在期限內結束");
+    Assert(localRaceError is BrokerReconciliationRequiredException &&
+           localRaceService.LocalConditionCount == 0 &&
+           ClientOrderRegistryCount(localRaceService) == registryBeforeLocalRace,
+        $"{localType} concurrent latch必須原子中止，不得留condition或owned ClientOrderId");
+    int localRacePlaces = localRaceGateway.PlaceOrderCount;
+    AssertThrows<BrokerReconciliationRequiredException>(() => localRaceService.OnMarketEvent(new MarketEvent
+        {
+            Sequence = 1, Timestamp = DateTimeOffset.UtcNow, Symbol = "225MC", ProductId = "225MC",
+            Kind = MarketEventKind.Trade, LastPrice = 65000m
+        }),
+        $"{localType} latch後market trigger必須回報人工核對");
+    Assert(localRaceGateway.PlaceOrderCount == localRacePlaces,
+        $"{localType} concurrent latch後不得由market觸發gateway");
+}
+
 // Dispose 必須 fail closed：有 active broker order 時不可清除追蹤或解除 callback。
 var disposeGateway = new FakeLiveStrategyOrderGateway();
 var disposeLifecycle = new List<OrderLifecycleEvent>();
@@ -1683,7 +1737,8 @@ static KgiLiveStrategyExecutionService CreateLiveService(
     Action? beforeSubmitValidation = null,
     Action? beforeBrokerMutationCommit = null,
     Action? afterBrokerMutationCommit = null,
-    Action? afterBrokerMutationTransition = null) => new(
+    Action? afterBrokerMutationTransition = null,
+    Action? beforeLocalConditionCommit = null) => new(
         gateway,
         instanceId,
         new ResolvedProduct { ProductId = "225MC", Symbol = "225MC", TickSize = 5m, ContractMultiplier = 10m },
@@ -1699,7 +1754,8 @@ static KgiLiveStrategyExecutionService CreateLiveService(
         beforeSubmitValidation,
         beforeBrokerMutationCommit,
         afterBrokerMutationCommit,
-        afterBrokerMutationTransition);
+        afterBrokerMutationTransition,
+        beforeLocalConditionCommit);
 
 static KgiLiveStrategyExecutionService GetLiveExecution(LiveStrategyService service, string instanceId)
 {
