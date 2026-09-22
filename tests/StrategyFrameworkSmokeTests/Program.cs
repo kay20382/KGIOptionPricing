@@ -802,6 +802,41 @@ using (var writer = new MarketDataArchiveWriter(archiveRoot, "run"))
     writer.Record(Book("MC", "225MC", 100m, 102m, 2, t0));
     eventPath = writer.EventFilePath;
 }
+
+// A full archive queue must apply backpressure rather than discard raw market events.
+string archiveBackpressureRoot = Path.Combine(Path.GetTempPath(), "KgiStrategyArchiveBackpressure", Guid.NewGuid().ToString("N"));
+try
+{
+    using var enteredArchiveWrite = new ManualResetEventSlim(false);
+    using var releaseArchiveWrite = new ManualResetEventSlim(false);
+    using var archiveWriter = new MarketDataArchiveWriter(
+        archiveBackpressureRoot,
+        "lossless",
+        capacity: 1,
+        beforeWrite: () =>
+        {
+            enteredArchiveWrite.Set();
+            releaseArchiveWrite.Wait();
+        });
+    archiveWriter.Record(Trade("LOSSLESS", "LOSSLESS", 100m, 1, t0));
+    Assert(enteredArchiveWrite.Wait(TimeSpan.FromSeconds(5)), "Writer must begin the first blocked archive write.");
+    archiveWriter.Record(Trade("LOSSLESS", "LOSSLESS", 101m, 1, t0.AddSeconds(1)));
+    Task thirdRecord = Task.Run(() => archiveWriter.Record(Trade("LOSSLESS", "LOSSLESS", 102m, 1, t0.AddSeconds(2))));
+    Assert(!thirdRecord.Wait(TimeSpan.FromMilliseconds(100)), "A full archive queue must backpressure the producer instead of dropping the third event.");
+    releaseArchiveWrite.Set();
+    Assert(thirdRecord.Wait(TimeSpan.FromSeconds(5)), "Backpressured archive record must complete after the writer drains.");
+    ArchiveWriterSnapshot losslessSnapshot = archiveWriter.CaptureBarrier();
+    using var losslessStream = new FileStream(losslessSnapshot.EventFilePath, FileMode.Open, FileAccess.Read,
+        FileShare.ReadWrite | FileShare.Delete);
+    using var losslessReader = new StreamReader(losslessStream);
+    int archivedEvents = 0;
+    while (losslessReader.ReadLine() != null) archivedEvents++;
+    Assert(archivedEvents == 3, "Lossless archive must persist every queued market event.");
+}
+finally
+{
+    if (Directory.Exists(archiveBackpressureRoot)) Directory.Delete(archiveBackpressureRoot, true);
+}
 var replayed = new List<MarketEvent>();
 using (var replay = new ArchiveReplayMarketDataSource(eventPath))
 {

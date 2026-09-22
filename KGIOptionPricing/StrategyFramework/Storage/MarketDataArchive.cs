@@ -81,32 +81,49 @@ public static class MarketDataArchiveCodec
 public sealed class MarketDataArchiveWriter : IDisposable
 {
     private sealed record BarrierRequest(TaskCompletionSource<ArchiveWriterSnapshot> Completion);
-    private readonly Channel<object> _channel = Channel.CreateBounded<object>(
-        new BoundedChannelOptions(200000) { SingleReader = true, FullMode = BoundedChannelFullMode.Wait });
+    private readonly Channel<object> _channel;
     private readonly JsonSerializerOptions _json = new()
     {
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
         Converters = { new JsonStringEnumConverter() }
     };
     private readonly Task _writer;
+    private readonly Action? _beforeWrite;
     private long _written;
-    private long _dropped;
     private bool _disposed;
 
     public string DirectoryPath { get; }
     public string EventFilePath { get; }
 
-    public MarketDataArchiveWriter(string rootDirectory, string runId)
+    public MarketDataArchiveWriter(
+        string rootDirectory,
+        string runId,
+        int capacity = 200000,
+        Action? beforeWrite = null)
     {
+        if (capacity <= 0) throw new ArgumentOutOfRangeException(nameof(capacity));
         DirectoryPath = Path.Combine(Path.GetFullPath(rootDirectory), DateTime.Now.ToString("yyyyMMdd"), runId);
         Directory.CreateDirectory(DirectoryPath);
         EventFilePath = Path.Combine(DirectoryPath, "market-events.jsonl");
+        _channel = Channel.CreateBounded<object>(
+            new BoundedChannelOptions(capacity) { SingleReader = true, FullMode = BoundedChannelFullMode.Wait });
+        _beforeWrite = beforeWrite;
         _writer = Task.Run(WriteLoopAsync);
     }
 
     public void Record(MarketEvent marketEvent)
     {
-        if (_disposed || !_channel.Writer.TryWrite(marketEvent)) Interlocked.Increment(ref _dropped);
+        if (_disposed) return;
+        try
+        {
+            // Raw research archives are authoritative. A bounded queue deliberately
+            // backpressures the source instead of dropping market events.
+            _channel.Writer.WriteAsync(marketEvent).AsTask().GetAwaiter().GetResult();
+        }
+        catch (ChannelClosedException)
+        {
+            if (!_disposed) throw;
+        }
     }
 
     public ArchiveWriterSnapshot CaptureBarrier()
@@ -126,6 +143,7 @@ public sealed class MarketDataArchiveWriter : IDisposable
         {
             if (item is MarketEvent marketEvent)
             {
+                _beforeWrite?.Invoke();
                 await writer.WriteLineAsync(JsonSerializer.Serialize(marketEvent, _json));
                 Interlocked.Increment(ref _written);
             }
@@ -159,8 +177,8 @@ public sealed class MarketDataArchiveWriter : IDisposable
             createdAt = DateTimeOffset.Now,
             eventFile = Path.GetFileName(EventFilePath),
             written = Interlocked.Read(ref _written),
-            dropped = Interlocked.Read(ref _dropped),
-            complete = Interlocked.Read(ref _dropped) == 0
+            dropped = 0,
+            complete = true
         };
         File.WriteAllText(Path.Combine(DirectoryPath, "manifest.json"),
             JsonSerializer.Serialize(manifest, new JsonSerializerOptions { WriteIndented = true }), new UTF8Encoding(false));
