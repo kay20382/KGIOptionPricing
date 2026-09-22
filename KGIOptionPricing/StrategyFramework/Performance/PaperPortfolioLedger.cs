@@ -19,6 +19,7 @@ public sealed class PaperPortfolioLedger : IStrategyPerformanceView
         public decimal Realized;
         public decimal Costs;
         public decimal Multiplier = 1m;
+        public int CompletedTrades;
     }
 
     private readonly object _sync = new();
@@ -58,6 +59,8 @@ public sealed class PaperPortfolioLedger : IStrategyPerformanceView
                 position.Realized += points * closingQuantity * position.Multiplier;
                 int newQuantity = oldQuantity + signed;
                 position.Quantity = newQuantity;
+                if (newQuantity == 0 || Math.Sign(newQuantity) != Math.Sign(oldQuantity))
+                    position.CompletedTrades++;
                 if (newQuantity == 0)
                     position.AveragePrice = 0m;
                 else if (Math.Sign(newQuantity) != Math.Sign(oldQuantity))
@@ -143,7 +146,8 @@ public sealed class PaperPortfolioLedger : IStrategyPerformanceView
             MarkPrice = position.MarkPrice,
             RealizedPnl = position.Realized,
             UnrealizedPnl = unrealized,
-            Costs = position.Costs
+            Costs = position.Costs,
+            CompletedTrades = position.CompletedTrades
         };
     }
 }

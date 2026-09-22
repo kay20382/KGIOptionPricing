@@ -13,6 +13,7 @@ using KGIOptionPricing.Strategies.MeanReversionScalper;
 using KGIOptionPricing.Strategies.MiniLeadMicro;
 using KGIOptionPricing.Strategies.NikkeiMicrostructureAlpha;
 using KGIOptionPricing.Strategies.OrderBookTrend;
+using KGIOptionPricing.Strategies.PeriodicQueueCycle;
 using KGIOptionPricing.Strategies.WaveletScalper;
 using KGIOptionPricing.StrategyFramework.MarketData;
 using KGIOptionPricing.StrategyFramework.Storage;
@@ -24,6 +25,11 @@ public sealed class StrategyRunRecorderSet : IDisposable
     private readonly object _sync = new();
     private readonly Dictionary<string, SimulationRunRecorder> _recorders =
         new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, Func<DateTimeOffset, RunManifest>> _manifestFinalizers =
+        new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _reservations = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, List<Action<SimulationRunRecorder>>> _pendingRecords =
+        new(StringComparer.OrdinalIgnoreCase);
     private bool _disposed;
 
     public void Add(string instanceId, SimulationRunRecorder recorder)
@@ -33,15 +39,73 @@ public sealed class StrategyRunRecorderSet : IDisposable
         lock (_sync)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
-            if (!_recorders.TryAdd(instanceId, recorder))
+            if (_reservations.Contains(instanceId) || !_recorders.TryAdd(instanceId, recorder))
                 throw new InvalidOperationException($"Recorder 已存在：{instanceId}");
         }
     }
 
-    public void Record(StrategySnapshot value) { lock (_sync) if (_recorders.TryGetValue(value.InstanceId, out SimulationRunRecorder? recorder)) recorder.Record(value); }
-    public void Record(ExecutionEvent value) { lock (_sync) if (_recorders.TryGetValue(value.StrategyInstanceId, out SimulationRunRecorder? recorder)) recorder.Record(value); }
-    public void Record(OrderLifecycleEvent value) { lock (_sync) if (_recorders.TryGetValue(value.StrategyInstanceId, out SimulationRunRecorder? recorder)) recorder.Record(value); }
-    public void Record(StrategyDecisionObservation value) { lock (_sync) if (_recorders.TryGetValue(value.StrategyInstanceId, out SimulationRunRecorder? recorder)) recorder.Record(value); }
+    public bool TryReserve(string instanceId)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(instanceId);
+        lock (_sync)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (_recorders.ContainsKey(instanceId) || !_reservations.Add(instanceId)) return false;
+            _pendingRecords[instanceId] = new List<Action<SimulationRunRecorder>>();
+            return true;
+        }
+    }
+
+    public void CommitReservation(string instanceId, SimulationRunRecorder recorder,
+        Func<DateTimeOffset, RunManifest>? manifestFinalizer = null)
+    {
+        ArgumentNullException.ThrowIfNull(recorder);
+        lock (_sync)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (!_reservations.Remove(instanceId))
+                throw new InvalidOperationException($"Recorder reservation 不存在：{instanceId}");
+            if (!_recorders.TryAdd(instanceId, recorder))
+                throw new InvalidOperationException($"Recorder 已存在：{instanceId}");
+            try
+            {
+                if (manifestFinalizer != null) _manifestFinalizers[instanceId] = manifestFinalizer;
+                if (_pendingRecords.Remove(instanceId, out List<Action<SimulationRunRecorder>>? pending))
+                    foreach (Action<SimulationRunRecorder> record in pending) record(recorder);
+            }
+            catch
+            {
+                _recorders.Remove(instanceId);
+                _manifestFinalizers.Remove(instanceId);
+                _pendingRecords.Remove(instanceId);
+                throw;
+            }
+        }
+    }
+
+    public void ReleaseReservation(string instanceId)
+    {
+        lock (_sync)
+        {
+            _reservations.Remove(instanceId);
+            _pendingRecords.Remove(instanceId);
+        }
+    }
+
+    public void Record(StrategySnapshot value) => Route(value.InstanceId, recorder => recorder.Record(value));
+    public void Record(ExecutionEvent value) => Route(value.StrategyInstanceId, recorder => recorder.Record(value));
+    public void Record(OrderLifecycleEvent value) => Route(value.StrategyInstanceId, recorder => recorder.Record(value));
+    public void Record(StrategyDecisionObservation value) => Route(value.StrategyInstanceId, recorder => recorder.Record(value));
+
+    private void Route(string instanceId, Action<SimulationRunRecorder> write)
+    {
+        lock (_sync)
+        {
+            if (_recorders.TryGetValue(instanceId, out SimulationRunRecorder? recorder)) write(recorder);
+            else if (_pendingRecords.TryGetValue(instanceId, out List<Action<SimulationRunRecorder>>? pending))
+                pending.Add(write);
+        }
+    }
 
     public void RemoveAndFinalize(string instanceId, DateTimeOffset endedAt) =>
         RemoveCore(instanceId, endedAt, deleteDirectory: false);
@@ -52,11 +116,16 @@ public sealed class StrategyRunRecorderSet : IDisposable
     private void RemoveCore(string instanceId, DateTimeOffset? endedAt, bool deleteDirectory)
     {
         SimulationRunRecorder? recorder;
+        Func<DateTimeOffset, RunManifest>? manifestFinalizer;
         lock (_sync)
         {
             if (!_recorders.Remove(instanceId, out recorder)) return;
+            _manifestFinalizers.Remove(instanceId, out manifestFinalizer);
         }
         List<Exception>? errors = null;
+        if (endedAt.HasValue && manifestFinalizer != null)
+            try { recorder.FinalizeManifest(manifestFinalizer(endedAt.Value)); }
+            catch (Exception exception) { (errors ??= new()).Add(exception); }
         if (endedAt.HasValue)
             try { recorder.FinalizeSummary(endedAt.Value); } catch (Exception exception) { (errors ??= new()).Add(exception); }
         try { recorder.Dispose(); } catch (Exception exception) { (errors ??= new()).Add(exception); }
@@ -69,17 +138,26 @@ public sealed class StrategyRunRecorderSet : IDisposable
     public void Dispose()
     {
         KeyValuePair<string, SimulationRunRecorder>[] entries;
+        Dictionary<string, Func<DateTimeOffset, RunManifest>> finalizers;
         lock (_sync)
         {
             if (_disposed) return;
             _disposed = true;
             entries = _recorders.ToArray();
+            finalizers = new Dictionary<string, Func<DateTimeOffset, RunManifest>>(_manifestFinalizers,
+                StringComparer.OrdinalIgnoreCase);
             _recorders.Clear();
+            _manifestFinalizers.Clear();
+            _reservations.Clear();
+            _pendingRecords.Clear();
         }
         List<Exception>? errors = null;
         foreach (KeyValuePair<string, SimulationRunRecorder> entry in entries)
         {
-            try { entry.Value.FinalizeSummary(DateTimeOffset.UtcNow); } catch (Exception exception) { (errors ??= new()).Add(exception); }
+            DateTimeOffset endedAt = DateTimeOffset.UtcNow;
+            if (finalizers.TryGetValue(entry.Key, out Func<DateTimeOffset, RunManifest>? finalizer))
+                try { entry.Value.FinalizeManifest(finalizer(endedAt)); } catch (Exception exception) { (errors ??= new()).Add(exception); }
+            try { entry.Value.FinalizeSummary(endedAt); } catch (Exception exception) { (errors ??= new()).Add(exception); }
             try { entry.Value.Dispose(); } catch (Exception exception) { (errors ??= new()).Add(exception); }
         }
         if (errors is { Count: > 0 }) throw new AggregateException("一或多個 recorder 無法完整釋放。", errors);
@@ -88,6 +166,10 @@ public sealed class StrategyRunRecorderSet : IDisposable
 
 public sealed class StrategySimulationService : IDisposable
 {
+    private sealed record ParameterResolution(
+        IReadOnlyDictionary<string, string> Raw,
+        IReadOnlyDictionary<string, string> Effective,
+        string? UnavailableReason);
     private readonly StrategyRegistry _registry = new();
     private readonly StrategyProductResolver _resolver = new();
     private readonly StrategyHost _liveHost;
@@ -97,6 +179,7 @@ public sealed class StrategySimulationService : IDisposable
     private readonly StrategyRunRecorderSet _liveRecorders = new();
     private readonly string _root;
     private bool _disposed;
+    private int _activeAdds;
 
     public event Action<StrategySnapshot>? SnapshotChanged;
     public event Action<ExecutionEvent>? ExecutionOccurred;
@@ -116,6 +199,7 @@ public sealed class StrategySimulationService : IDisposable
         _registry.Register(new NikkeiMicrostructureAlphaFactory());
         _registry.Register(new MiniLeadMicroFactory());
         _registry.Register(new OrderBookTrendFactory());
+        _registry.Register(new PeriodicQueueCycleFactory());
         _liveHost.SnapshotChanged += OnSnapshot;
         _liveHost.ExecutionOccurred += OnExecution;
         _liveHost.OrderLifecycleOccurred += _liveRecorders.Record;
@@ -125,19 +209,28 @@ public sealed class StrategySimulationService : IDisposable
 
     public StrategyInstanceRunner AddLive(StrategyDefinition definition, decimal commissionPerContract)
     {
-        EnsureUnique(definition.InstanceId, _liveHost.GetSnapshots());
-        ResolvedStrategyUniverse universe = _resolver.Resolve(definition.Universe);
-        ISimulationStrategy strategy = _registry.Get(definition.StrategyType).Create(definition);
-        string runId = $"live-{DateTime.Now:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}";
-        string output = Path.Combine(_root, "StrategyRuns", runId);
-        var recorder = new SimulationRunRecorder(output);
-        _liveRecorders.Add(definition.InstanceId, recorder);
+        BeginAdd(definition.InstanceId);
+        SimulationRunRecorder? recorder = null;
+        string? output = null;
         try
         {
+            ResolvedStrategyUniverse universe = _resolver.Resolve(definition.Universe);
+            ISimulationStrategy strategy = _registry.Get(definition.StrategyType).Create(definition);
             StrategyInstanceRunner runner = _liveHost.Add(strategy, universe, commissionPerContract);
-            recorder.RecordManifest(CreateManifest(runId, StrategyRunMode.LiveShadow,
-                definition, EffectiveParameters(runner.GetSnapshot(), definition), universe,
-                commissionPerContract, LiveArchivePath));
+            string runId = $"live-{DateTime.Now:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}";
+            output = Path.Combine(_root, "StrategyRuns", runId);
+            recorder = new SimulationRunRecorder(output);
+            DateTimeOffset startedAt = DateTimeOffset.UtcNow;
+            ParameterResolution parameters = ResolveParameters(runner.GetSnapshot(), definition);
+            RunManifest prepared = CreateManifest(runId, StrategyRunMode.LiveShadow,
+                definition, parameters, universe, commissionPerContract, LiveArchivePath, startedAt, null,
+                includeInputIdentity: false);
+            recorder.PrepareManifest(prepared);
+            _liveRecorders.CommitReservation(definition.InstanceId, recorder, endedAt =>
+                CreateManifest(runId, StrategyRunMode.LiveShadow, definition, parameters, universe,
+                    commissionPerContract, LiveArchivePath, startedAt, endedAt, includeInputIdentity: true));
+            recorder = null;
+            _liveRecorders.Record(runner.GetSnapshot());
             return runner;
         }
         catch (Exception addError)
@@ -160,12 +253,21 @@ public sealed class StrategySimulationService : IDisposable
             }
             if (!retainedRunner)
             {
-                try { _liveRecorders.Discard(definition.InstanceId, deleteDirectory: true); }
+                try
+                {
+                    if (recorder != null)
+                    {
+                        recorder.Dispose();
+                        if (output != null && Directory.Exists(output)) Directory.Delete(output, true);
+                    }
+                    else _liveRecorders.Discard(definition.InstanceId, deleteDirectory: true);
+                }
                 catch (Exception recorderError) { errors.Add(recorderError); }
             }
             if (errors.Count == 1) ExceptionDispatchInfo.Capture(addError).Throw();
             throw new AggregateException("策略新增失敗，cleanup 亦發生錯誤。", errors);
         }
+        finally { EndAdd(definition.InstanceId); }
     }
 
     public bool Stop(string instanceId) => _liveHost.Stop(instanceId);
@@ -173,9 +275,21 @@ public sealed class StrategySimulationService : IDisposable
     public bool Resume(string instanceId) => _liveHost.Resume(instanceId);
     public bool Remove(string instanceId)
     {
-        if (!_liveHost.Remove(instanceId)) return false;
-        _liveRecorders.RemoveAndFinalize(instanceId, DateTimeOffset.UtcNow);
-        return true;
+        bool removed = false;
+        Exception? hostError = null;
+        try { removed = _liveHost.Remove(instanceId); }
+        catch (Exception exception) { hostError = exception; }
+        bool retained = HostContains(instanceId);
+        Exception? recorderError = null;
+        if (!retained)
+        {
+            try { _liveRecorders.RemoveAndFinalize(instanceId, DateTimeOffset.UtcNow); }
+            catch (Exception exception) { recorderError = exception; }
+        }
+        if (hostError != null || recorderError != null)
+            throw new AggregateException("策略移除不完整。",
+                new[] { hostError, recorderError }.Where(error => error != null).Cast<Exception>());
+        return removed;
     }
     public void StopAll() => _liveHost.StopAll();
     public IReadOnlyList<StrategySnapshot> GetSnapshots() => _liveHost.GetSnapshots();
@@ -199,12 +313,18 @@ public sealed class StrategySimulationService : IDisposable
         host.DecisionObserved += recorder.Record;
         StrategyInstanceRunner runner = host.Add(
             _registry.Get(definition.StrategyType).Create(definition), universe, commissionPerContract);
-        recorder.RecordManifest(CreateManifest(runId, StrategyRunMode.HistoricalReplay,
-            definition, EffectiveParameters(runner.GetSnapshot(), definition), universe,
-            commissionPerContract, eventFilePath));
+        DateTimeOffset startedAt = DateTimeOffset.UtcNow;
+        ParameterResolution parameters = ResolveParameters(runner.GetSnapshot(), definition);
+        recorder.PrepareManifest(CreateManifest(runId, StrategyRunMode.HistoricalReplay,
+            definition, parameters, universe, commissionPerContract, eventFilePath, startedAt, null,
+            includeInputIdentity: true));
         await source.ReplayAsync(speed, cancellationToken);
         host.StopAll("歷史重播完成");
-        recorder.FinalizeSummary(DateTimeOffset.UtcNow);
+        DateTimeOffset endedAt = DateTimeOffset.UtcNow;
+        recorder.FinalizeManifest(CreateManifest(runId, StrategyRunMode.HistoricalReplay,
+            definition, parameters, universe, commissionPerContract, eventFilePath, startedAt, endedAt,
+            includeInputIdentity: true));
+        recorder.FinalizeSummary(endedAt);
         return output;
     }
 
@@ -220,30 +340,64 @@ public sealed class StrategySimulationService : IDisposable
         ExecutionOccurred?.Invoke(execution);
     }
 
-    private static void EnsureUnique(string instanceId, IReadOnlyList<StrategySnapshot> snapshots)
+    private void BeginAdd(string instanceId)
     {
-        if (snapshots.Any(x => string.Equals(x.InstanceId, instanceId, StringComparison.OrdinalIgnoreCase)))
-            throw new InvalidOperationException($"策略實例識別碼已存在：{instanceId}");
+        lock (_disposeSync)
+        {
+            if (_disposed || _disposeAttempt != null) throw new ObjectDisposedException(nameof(StrategySimulationService));
+            if (!_liveRecorders.TryReserve(instanceId))
+                throw new InvalidOperationException($"策略實例識別碼已存在：{instanceId}");
+            _activeAdds++;
+        }
+    }
+
+    private void EndAdd(string instanceId)
+    {
+        _liveRecorders.ReleaseReservation(instanceId);
+        lock (_disposeSync)
+        {
+            _activeAdds--;
+            Monitor.PulseAll(_disposeSync);
+        }
+    }
+
+    private bool HostContains(string instanceId)
+    {
+        try
+        {
+            return _liveHost.GetSnapshots().Any(snapshot =>
+                string.Equals(snapshot.InstanceId, instanceId, StringComparison.OrdinalIgnoreCase));
+        }
+        catch (ObjectDisposedException) { return false; }
     }
 
     private static RunManifest CreateManifest(
         string runId,
         StrategyRunMode mode,
         StrategyDefinition definition,
-        IReadOnlyDictionary<string, string> effectiveParameters,
+        ParameterResolution parameterResolution,
         ResolvedStrategyUniverse universe,
         decimal commissionPerContract,
-        string inputPath)
+        string inputPath,
+        DateTimeOffset startedAt,
+        DateTimeOffset? endedAt,
+        bool includeInputIdentity)
     {
         var parameters = new SortedDictionary<string, string>(StringComparer.Ordinal);
-        foreach (KeyValuePair<string, string> parameter in effectiveParameters)
+        foreach (KeyValuePair<string, string> parameter in parameterResolution.Effective)
             parameters[parameter.Key] = parameter.Value;
-        string normalized = JsonSerializer.Serialize(parameters);
-        string parameterHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(normalized)));
+        var raw = new SortedDictionary<string, string>(StringComparer.Ordinal);
+        foreach (KeyValuePair<string, string> parameter in parameterResolution.Raw)
+            raw[parameter.Key] = parameter.Value;
+        string normalized = parameters.Count > 0 ? JsonSerializer.Serialize(parameters) : string.Empty;
+        string parameterHash = parameters.Count > 0
+            ? Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(normalized))) : string.Empty;
         string absoluteInput = Path.GetFullPath(inputPath);
         var missing = new List<string>();
-        InputArchiveIdentity input = BuildInputIdentity(absoluteInput);
-        missing.AddRange(input.MissingFields);
+        InputArchiveIdentity? input = includeInputIdentity ? BuildInputIdentity(absoluteInput) : null;
+        if (input != null) missing.AddRange(input.MissingFields);
+        else missing.Add("InputArchiveFinalizedAtRunEnd");
+        if (parameterResolution.UnavailableReason != null) missing.Add("EffectiveParameters");
 
         return new RunManifest
         {
@@ -253,8 +407,11 @@ public sealed class StrategySimulationService : IDisposable
             CodeVersion = typeof(StrategySimulationService).Assembly.GetName().Version?.ToString(),
             FrameworkVersion = typeof(StrategyHost).Assembly.GetName().Version?.ToString() ?? string.Empty,
             Mode = mode,
-            StartedAt = DateTimeOffset.UtcNow,
+            StartedAt = startedAt,
+            EndedAt = endedAt,
+            RawParameters = raw,
             EffectiveParameters = parameters,
+            EffectiveParametersUnavailableReason = parameterResolution.UnavailableReason,
             NormalizedParameters = normalized,
             ParameterSha256 = parameterHash,
             InputArchive = input,
@@ -326,20 +483,26 @@ public sealed class StrategySimulationService : IDisposable
         };
     }
 
-    private static IReadOnlyDictionary<string, string> EffectiveParameters(
+    private static ParameterResolution ResolveParameters(
         StrategySnapshot snapshot,
         StrategyDefinition definition)
     {
+        var raw = new SortedDictionary<string, string>(StringComparer.Ordinal);
+        foreach (KeyValuePair<string, string> parameter in definition.Parameters)
+            raw[parameter.Key] = parameter.Value;
+        if (!string.Equals(definition.StrategyType, PeriodicQueueCycleFactory.TypeName,
+                StringComparison.Ordinal))
+            return new ParameterResolution(raw, new Dictionary<string, string>(),
+                "TypedEffectiveParameterResolverNotImplemented");
         var effective = new SortedDictionary<string, string>(StringComparer.Ordinal);
         foreach (string item in snapshot.ParameterSummary.Split(';', StringSplitOptions.RemoveEmptyEntries))
         {
             int separator = item.IndexOf('=');
             if (separator > 0) effective[item[..separator]] = item[(separator + 1)..];
         }
-        if (effective.Count == 0)
-            foreach (KeyValuePair<string, string> parameter in definition.Parameters)
-                effective[parameter.Key] = parameter.Value;
-        return effective;
+        return effective.Count > 0
+            ? new ParameterResolution(raw, effective, null)
+            : new ParameterResolution(raw, effective, "ResolvedParameterSummaryUnavailable");
     }
 
     private ResolvedStrategyUniverse ResolveArchiveUniverse(string eventFilePath, StrategyUniverse requested)
@@ -396,6 +559,8 @@ public sealed class StrategySimulationService : IDisposable
             else { attempt = _disposeAttempt = new DisposeAttempt(Environment.CurrentManagedThreadId); owner = true; }
         }
         if (!owner) { attempt.Completed.Wait(); if (attempt.Error != null) ExceptionDispatchInfo.Capture(attempt.Error).Throw(); return; }
+        lock (_disposeSync)
+            while (_activeAdds > 0) Monitor.Wait(_disposeSync);
         bool timerDrained = false;
         try
         {

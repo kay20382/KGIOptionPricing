@@ -134,8 +134,8 @@ public sealed record OrderLifecycleEvent
     public string OrderId { get; init; } = string.Empty;
     public string BrokerOrderId { get; init; } = string.Empty;
     public string Symbol { get; init; } = string.Empty;
-    public BuySell Side { get; init; }
-    public PaperOrderRole Role { get; init; }
+    public BuySell? Side { get; init; }
+    public PaperOrderRole? Role { get; init; }
     public long TriggerMarketSequence { get; init; }
     public OrderLifecycleState PreviousState { get; init; }
     public OrderLifecycleState State { get; init; }
@@ -156,6 +156,7 @@ public sealed record PositionSnapshot
     public decimal RealizedPnl { get; init; }
     public decimal UnrealizedPnl { get; init; }
     public decimal Costs { get; init; }
+    public int CompletedTrades { get; init; }
     public decimal NetPnl => RealizedPnl + UnrealizedPnl - Costs;
 }
 

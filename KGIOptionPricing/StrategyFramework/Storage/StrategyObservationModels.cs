@@ -38,6 +38,8 @@ public sealed record StrategyDecisionObservation
     public bool? RequiredProductsPresent { get; init; }
     public IReadOnlyList<string> DataQualityFlags { get; init; } = Array.Empty<string>();
     public string? UnavailableReasonCode { get; init; }
+    public IReadOnlyDictionary<string, string> UnavailableReasons { get; init; } =
+        new Dictionary<string, string>();
 }
 
 public interface IStrategyDecisionSource
@@ -71,8 +73,12 @@ public sealed record RunManifest
     public string? CodeVersion { get; init; }
     public StrategyRunMode Mode { get; init; }
     public DateTimeOffset StartedAt { get; init; }
+    public DateTimeOffset? EndedAt { get; init; }
+    public IReadOnlyDictionary<string, string> RawParameters { get; init; } =
+        new Dictionary<string, string>();
     public IReadOnlyDictionary<string, string> EffectiveParameters { get; init; } =
         new Dictionary<string, string>();
+    public string? EffectiveParametersUnavailableReason { get; init; }
     public string NormalizedParameters { get; init; } = string.Empty;
     public string ParameterSha256 { get; init; } = string.Empty;
     public InputArchiveIdentity? InputArchive { get; init; }
@@ -93,8 +99,8 @@ public sealed record OrderLifecycleObservation
     public string OrderId { get; init; } = string.Empty;
     public string BrokerOrderId { get; init; } = string.Empty;
     public string Symbol { get; init; } = string.Empty;
-    public KGIOptionPricing.OrderManagement.Core.BuySell Side { get; init; }
-    public PaperOrderRole Role { get; init; }
+    public KGIOptionPricing.OrderManagement.Core.BuySell? Side { get; init; }
+    public PaperOrderRole? Role { get; init; }
     public int Generation { get; init; }
     public long TriggerMarketSequence { get; init; }
     public OrderLifecycleState PreviousState { get; init; }
@@ -154,7 +160,7 @@ public sealed record RunSummary
     public long CancelledOrders { get; init; }
     public long RejectedOrders { get; init; }
     public long Fills { get; init; }
-    public long CompletedTrades { get; init; }
+    public long? CompletedTrades { get; init; }
     public long BothLegFilledCycles { get; init; }
     public long OneLegFilledCycles { get; init; }
     public long StopLossExits { get; init; }

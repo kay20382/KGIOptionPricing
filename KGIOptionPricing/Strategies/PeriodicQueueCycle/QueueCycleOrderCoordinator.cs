@@ -81,7 +81,6 @@ internal sealed class QueueCycleOrderCoordinator
     internal bool EntryOrdersTerminal => !IsOutstanding(_buy) && !IsOutstanding(_sell) &&
         !HasUnreconciledFill(_buy) && !HasUnreconciledFill(_sell);
     internal bool HasBothEntryFills => _buy?.HasFill == true && _sell?.HasFill == true;
-    internal bool HasAnyEntryFill => _buy?.HasFill == true || _sell?.HasFill == true;
     internal string CycleSummary =>
         $"Cycle={_buy?.CycleId ?? "none"};Direction={FrozenDirection};" +
         $"Buy={LegSummary(_buy)};Sell={LegSummary(_sell)};" +

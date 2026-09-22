@@ -282,7 +282,8 @@ public sealed class StrategyInstanceRunner : IDisposable
             RealizedPnl = position.RealizedPnl,
             UnrealizedPnl = position.UnrealizedPnl,
             NetPnl = position.NetPnl,
-            CommissionPerContract = _commissionPerContract
+            CommissionPerContract = _commissionPerContract,
+            CompletedTrades = position.CompletedTrades
         };
     }
 

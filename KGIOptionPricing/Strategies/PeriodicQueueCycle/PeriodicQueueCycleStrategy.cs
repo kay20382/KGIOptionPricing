@@ -28,7 +28,8 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
     private int _pendingCooldownSeconds;
     private bool _exitRequested;
     private decimal _fixedStopPrice;
-    private int _completedTrades;
+    private string _activeCandidateId = string.Empty;
+    private bool _acceptDecisionPending;
 
     internal PeriodicQueueCycleStrategy(
         StrategyDefinition definition,
@@ -87,6 +88,7 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
             _cooldownUntil = null;
             _coordinator.ResetAfterCooldown();
             _directionWindow = new DirectionWindow(_context.Universe.Tradable.TickSize, _parameters);
+            _activeCandidateId = string.Empty;
             State = _paused ? StrategyLifecycleState.Suspended : StrategyLifecycleState.WarmingUp;
             _reason = "WarmupIncomplete";
         }
@@ -172,8 +174,11 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
 
         State = StrategyLifecycleState.Ready;
         _reason = _lastAssessment.PrimaryReasonCode;
-        Publish();
-        if (_lastAssessment.Direction == CycleDirection.Neutral) return;
+        if (_lastAssessment.Direction == CycleDirection.Neutral)
+        {
+            Publish();
+            return;
+        }
         if (Position().NetQuantity != 0)
         {
             State = StrategyLifecycleState.Suspended;
@@ -190,6 +195,8 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
         {
             State = _coordinator.IsFaulted ? StrategyLifecycleState.Faulted : StrategyLifecycleState.Running;
             _reason = _coordinator.ReasonCode;
+            _activeCandidateId = $"{InstanceId}-{_coordinator.CurrentCycleId}-candidate";
+            _acceptDecisionPending = true;
         }
         else
         {
@@ -377,7 +384,6 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
             UnrealizedPnl = position.UnrealizedPnl,
             NetPnl = position.NetPnl,
             CommissionPerContract = _parameters.CommissionPerContract,
-            CompletedTrades = _completedTrades,
             UpdatedAt = _context?.Clock.Now ?? DateTimeOffset.Now
         };
     }
@@ -399,10 +405,18 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
         if (_context is null) return;
         DirectionAssessment? assessment = _lastAssessment;
         string primaryReason = StableReason(_reason);
+        if (!_acceptDecisionPending && primaryReason == "SignalAccepted")
+        {
+            primaryReason = _coordinator?.Phase switch
+            {
+                QueueCyclePhase.WorkingBoth => "WorkingBoth",
+                QueueCyclePhase.WorkingOneLeg => "OneLegFilled",
+                _ => primaryReason
+            };
+        }
         StrategyDecision decision = primaryReason switch
         {
             "WarmupIncomplete" => StrategyDecision.Warmup,
-            "SignalAccepted" when _coordinator?.Phase is QueueCyclePhase.WorkingBoth or QueueCyclePhase.WorkingOneLeg => StrategyDecision.Accept,
             "NeutralDirection" or "StaleQuote" or "InvalidBook" or "InsufficientSideDepth" or
                 "InsufficientNearDepth" or "DepthImbalance" or "SpreadTooWide" or "VolatilityTooHigh" => StrategyDecision.Reject,
             "FixedStopLoss" or "OneLegTimeout" or "MarketDataRecoveryTimeout" or
@@ -411,8 +425,7 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
             _ when State is StrategyLifecycleState.Stopped or StrategyLifecycleState.Faulted => StrategyDecision.Halt,
             _ => StrategyDecision.Hold
         };
-        if (assessment?.PrimaryReasonCode == "SignalAccepted" &&
-            State is StrategyLifecycleState.Ready or StrategyLifecycleState.Running)
+        if (_acceptDecisionPending)
         {
             decision = StrategyDecision.Accept;
             primaryReason = "SignalAccepted";
@@ -424,7 +437,9 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
         string cycleId = _coordinator?.CurrentCycleId ?? string.Empty;
         if (cycleId.Length == 0 && decision == StrategyDecision.Accept && _coordinator is not null)
             cycleId = $"cycle-{_coordinator.CycleNumber + 1}";
-        string candidateId = _lastBook is null ? string.Empty : $"{InstanceId}-signal-{_lastBook.Sequence}";
+        string candidateId = _activeCandidateId.Length > 0
+            ? _activeCandidateId
+            : _lastBook is null ? string.Empty : $"{InstanceId}-evaluation-{_lastBook.Sequence}";
         var features = new Dictionary<string, decimal?>
         {
             ["netMoveTicks"] = assessment?.NetMoveTicks,
@@ -441,6 +456,14 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
             threshold.Passed)).ToArray() ?? Array.Empty<ThresholdObservation>();
         IReadOnlyList<string> secondary = assessment?.OtherFailedReasonCodes ?? Array.Empty<string>();
         bool healthFailure = IsHealthFailure(primaryReason);
+        var unavailable = new Dictionary<string, string>();
+        if (_lastBook is null)
+        {
+            unavailable["requiredProductsPresent"] = "NoBookData";
+            unavailable["quoteAgeSeconds"] = "NoBookData";
+            unavailable["spreadTicks"] = "NoBookData";
+        }
+        unavailable["crossProductReceiveSkewSeconds"] = "NotApplicableSingleProduct";
         DecisionObserved?.Invoke(new StrategyDecisionObservation
         {
             Sequence = _lastBook?.Sequence ?? 0L,
@@ -459,10 +482,12 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
             SecondaryReasonCodes = secondary,
             QuoteAgeSeconds = quoteAge,
             SpreadTicks = assessment?.SpreadTicks,
-            RequiredProductsPresent = true,
+            RequiredProductsPresent = _lastBook is null ? null : true,
             DataQualityFlags = healthFailure ? new[] { primaryReason } : Array.Empty<string>(),
-            UnavailableReasonCode = _lastBook is null ? "MarketBookNotObserved" : null
+            UnavailableReasonCode = _lastBook is null ? "NoBookData" : null,
+            UnavailableReasons = unavailable
         });
+        _acceptDecisionPending = false;
     }
 
     private static string ThresholdUnit(string name) => name switch
@@ -588,7 +613,6 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
     private void EnterCooldown(int seconds)
     {
         if (_coordinator is null || _context is null || _cooldownUntil.HasValue) return;
-        if (_coordinator.HasAnyEntryFill && Position().NetQuantity == 0) _completedTrades++;
         _coordinator.EnterCooldown();
         _cooldownUntil = _context.Clock.Now.AddSeconds(seconds);
         _oneLegStartedAt = null;

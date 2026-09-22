@@ -569,7 +569,8 @@ ledger.RegisterProduct("ledger", product);
 ledger.ApplyExecution(new ExecutionEvent { StrategyInstanceId = "ledger", Symbol = "MC", Side = BuySell.Buy, Price = 100m, Quantity = 1, Commission = 2m });
 ledger.ApplyExecution(new ExecutionEvent { StrategyInstanceId = "ledger", Symbol = "MC", Side = BuySell.Sell, Price = 120m, Quantity = 1, Commission = 2m });
 PositionSnapshot ledgerPosition = ledger.GetPosition("ledger", "MC");
-Assert(ledgerPosition.NetQuantity == 0 && ledgerPosition.RealizedPnl == 200m && ledgerPosition.Costs == 4m && ledgerPosition.NetPnl == 196m,
+Assert(ledgerPosition.NetQuantity == 0 && ledgerPosition.RealizedPnl == 200m && ledgerPosition.Costs == 4m &&
+       ledgerPosition.NetPnl == 196m && ledgerPosition.CompletedTrades == 1,
     "共用帳本損益計算錯誤");
 
 // Causal Haar-MODWT scalper: a negative D1 deviation with bid-side OBI must request a paper market buy.
@@ -864,6 +865,15 @@ try
             Sequence = 103, Timestamp = observedAt.AddSeconds(2), State = StrategyLifecycleState.Running,
             Decision = StrategyDecision.Hold, PrimaryReasonCode = "WorkingBoth"
         });
+        recorder.Record(accepted with { Sequence = 104, Timestamp = observedAt.AddSeconds(31) });
+        var timeoutDecision = accepted with
+        {
+            Sequence = 105, Timestamp = observedAt.AddSeconds(40), Decision = StrategyDecision.Exit,
+            State = StrategyLifecycleState.Running, PrimaryReasonCode = "OneLegTimeout",
+            Thresholds = Array.Empty<ThresholdObservation>()
+        };
+        recorder.Record(timeoutDecision);
+        recorder.Record(timeoutDecision with { Sequence = 106, Timestamp = observedAt.AddSeconds(80) });
 
         recorder.Record(Lifecycle("observe-1-cycle-1-buy-g1", "SIM-1", OrderLifecycleState.Submitted,
             OrderLifecycleState.Submitted, 100m, observedAt.AddMilliseconds(10)));
@@ -880,9 +890,13 @@ try
         recorder.Record(new StrategySnapshot
         {
             StrategyType = "PeriodicQueueCycle", InstanceId = "observe-1", State = StrategyLifecycleState.Ready,
-            Reason = "CycleCompleted", RealizedPnl = 100m, NetPnl = 28m, CompletedTrades = 1,
+            Reason = "CycleCompleted", RealizedPnl = 100m, NetPnl = 28m, CompletedTrades = 2,
             UpdatedAt = observedAt.AddSeconds(3)
         });
+        AssertThrows<ArgumentException>(() => recorder.Record(new ParameterExperimentRecord
+        {
+            ExperimentId = "invalid-empty", Status = ParameterExperimentStatus.Valid
+        }), "Valid parameter experiment 缺少可重現必要欄位時必須拒絕");
         recorder.Record(new ParameterExperimentRecord
         {
             ExperimentId = "experiment-1", BaselineRunId = "baseline-1", CandidateRunId = "run-observation-1",
@@ -894,7 +908,7 @@ try
             },
             ProductMapping = new Dictionary<string, string> { ["225MC"] = "MCM6" },
             ExecutionAssumptions = new Dictionary<string, string> { ["fillModel"] = "strict-cross" },
-            DataSplitId = "out-of-sample-1", PrimaryObjective = "netPnl",
+            InputArchiveSha256 = "ARCHIVE-HASH", DataSplitId = "out-of-sample-1", PrimaryObjective = "netPnl",
             SecondaryObjectives = new[] { "drawdown" },
             GuardrailValues = new Dictionary<string, decimal?> { ["minimumCompletedTrades"] = 1m },
             Results = new Dictionary<string, decimal?> { ["completedTrades"] = 1m },
@@ -916,8 +930,8 @@ try
            executionsCsv.Contains("\"cycle-1-buy-g1\"", StringComparison.Ordinal),
         "executions.csv 必須以 InvariantCulture 保留兩筆成交及 clientOrderId");
     string[] decisionLines = File.ReadAllLines(Path.Combine(observationDirectory, "strategy-decisions.jsonl"));
-    Assert(decisionLines.Length == 3,
-        "只可壓縮完全相同的決策心跳；觀測值、狀態或原因變更必須保留");
+    Assert(decisionLines.Length == 6,
+        "完全相同的決策只在心跳間隔內壓縮；跨間隔心跳可留存");
     using (JsonDocument decisionDocument = JsonDocument.Parse(decisionLines[0]))
     {
         JsonElement decision = decisionDocument.RootElement;
@@ -952,23 +966,73 @@ try
                summary.GetProperty("submittedOrders").GetInt64() == 2 &&
                summary.GetProperty("cancelledOrders").GetInt64() == 1 &&
                summary.GetProperty("fills").GetInt64() == 2 &&
-               summary.GetProperty("completedTrades").GetInt64() == 1 &&
+               summary.GetProperty("completedTrades").GetInt64() == 2 &&
+               summary.GetProperty("oneLegTimeouts").GetInt64() == 1 &&
                summary.GetProperty("grossPnl").GetDecimal() == 100m &&
                summary.GetProperty("executionCosts").GetDecimal() == 72m &&
                summary.GetProperty("netPnl").GetDecimal() == 28m &&
+               summary.GetProperty("winRate").GetDecimal() == 100m &&
+               summary.GetProperty("averageWinningPoints").GetDecimal() == 2.8m &&
+               summary.GetProperty("averageLosingPoints").ValueKind == JsonValueKind.Null &&
+               summary.GetProperty("holdingSeconds").GetDecimal() == 1m &&
                summary.GetProperty("fillRate").GetDecimal() == 1m &&
                summary.GetProperty("cancellationRate").GetDecimal() == 0.5m &&
                summary.GetProperty("adverseSlippageStress").GetProperty("1").GetDecimal() == -72m &&
+               summary.GetProperty("primaryReasonCounts").GetProperty("SignalAccepted").GetInt64() == 1 &&
+               summary.GetProperty("thresholdFunnel").GetProperty("MinMoveTicks").GetProperty("evaluated").GetInt64() == 1 &&
                summary.GetProperty("mfePoints").ValueKind == JsonValueKind.Null &&
                summary.GetProperty("marketEvents").ValueKind == JsonValueKind.Null &&
-               summary.GetProperty("unavailableReasons").GetProperty("mfePoints").GetString() == "ExecutableBookPathNotObserved" &&
-               summary.GetProperty("unavailableReasons").GetProperty("marketEvents").GetString() == "MarketEventsNotObserved",
+               summary.GetProperty("unavailableReasons").GetProperty("mfePoints").GetString() == "NoMarkToMarketPath" &&
+               summary.GetProperty("unavailableReasons").GetProperty("marketEvents").GetString() == "MarketEventsNotObserved" &&
+               !summary.GetProperty("unavailableReasons").TryGetProperty("grossPnl", out _) &&
+               !summary.GetProperty("unavailableReasons").TryGetProperty("netPnl", out _) &&
+               !summary.GetProperty("unavailableReasons").TryGetProperty("executionCosts", out _),
             "run summary 必須彙總漏斗與交易，無法取得的指標使用 null 及穩定原因碼");
     }
 }
 finally
 {
     Directory.Delete(observationDirectory, recursive: true);
+}
+
+string deferredManifestDirectory = Path.Combine(Path.GetTempPath(), "kgi-deferred-manifest-" + Guid.NewGuid().ToString("N"));
+try
+{
+    DateTimeOffset started = new(2026, 9, 22, 3, 0, 0, TimeSpan.Zero);
+    DateTimeOffset ended = started.AddMinutes(1);
+    using var deferredRecorder = new SimulationRunRecorder(deferredManifestDirectory);
+    var deferred = new RunManifest
+    {
+        RunId = "live-final", StrategyType = "PeriodicQueueCycle", InstanceId = "live-final",
+        Mode = StrategyRunMode.LiveShadow, StartedAt = started,
+        RawParameters = new Dictionary<string, string> { ["MinMoveTicks"] = "2" },
+        EffectiveParameters = new Dictionary<string, string> { ["MinMoveTicks"] = "2" }
+    };
+    deferredRecorder.PrepareManifest(deferred);
+    Assert(!File.Exists(Path.Combine(deferredManifestDirectory, "run-manifest.json")),
+        "live archive 尚在寫入時不得把 partial identity 寫成權威 manifest");
+    deferredRecorder.FinalizeManifest(deferred with { EndedAt = ended });
+    deferredRecorder.Record(new OrderLifecycleEvent
+    {
+        Timestamp = ended, StrategyInstanceId = "live-final", ClientOrderId = "cancel-unrouted",
+        PreviousState = OrderLifecycleState.Working, State = OrderLifecycleState.CancelPending,
+        ReasonCode = "CancelRequestNotRouted"
+    });
+    deferredRecorder.Dispose();
+    using JsonDocument finalizedManifest = JsonDocument.Parse(
+        File.ReadAllText(Path.Combine(deferredManifestDirectory, "run-manifest.json")));
+    Assert(finalizedManifest.RootElement.GetProperty("endedAt").GetDateTimeOffset() == ended,
+        "live manifest 必須在 finalize 後原子寫入正確 EndedAt");
+    using JsonDocument unknownLifecycle = JsonDocument.Parse(
+        File.ReadLines(Path.Combine(deferredManifestDirectory, "order-lifecycle.jsonl")).Single());
+    Assert(unknownLifecycle.RootElement.GetProperty("side").ValueKind == JsonValueKind.Null &&
+           unknownLifecycle.RootElement.GetProperty("role").ValueKind == JsonValueKind.Null &&
+           unknownLifecycle.RootElement.GetProperty("unavailableReasons").GetProperty("side").GetString() == "OrderSideNotObserved",
+        "CancelRequestNotRouted 缺少 metadata 時 Side/Role 必須是 null，不得假裝 Buy/EntryLong");
+}
+finally
+{
+    if (Directory.Exists(deferredManifestDirectory)) Directory.Delete(deferredManifestDirectory, recursive: true);
 }
 
 string failingRecorderDirectory = Path.Combine(Path.GetTempPath(), "kgi-recorder-dispose-" + Guid.NewGuid().ToString("N"));
@@ -1027,6 +1091,38 @@ finally
     if (Directory.Exists(recorderSetRoot)) Directory.Delete(recorderSetRoot, recursive: true);
 }
 
+using (var reservationSet = new StrategyRunRecorderSet())
+{
+    using var startReservationRace = new ManualResetEventSlim(false);
+    Task<bool>[] reservations = Enumerable.Range(0, 2).Select(_ => Task.Run(() =>
+    {
+        startReservationRace.Wait();
+        return reservationSet.TryReserve("same-live-instance");
+    })).ToArray();
+    startReservationRace.Set();
+    Task.WaitAll(reservations);
+    Assert(reservations.Count(task => task.Result) == 1,
+        "live instance ownership 必須在建立 recorder 目錄／stream 前原子 reservation");
+    string reservedOutput = Path.Combine(Path.GetTempPath(), "kgi-reserved-buffer-" + Guid.NewGuid().ToString("N"));
+    try
+    {
+        reservationSet.Record(new StrategySnapshot
+        {
+            InstanceId = "same-live-instance", StrategyType = "Reserved",
+            Reason = "start-buffered", UpdatedAt = DateTimeOffset.UtcNow
+        });
+        reservationSet.CommitReservation("same-live-instance", new SimulationRunRecorder(reservedOutput));
+        reservationSet.RemoveAndFinalize("same-live-instance", DateTimeOffset.UtcNow);
+        Assert(File.ReadAllText(Path.Combine(reservedOutput, "strategy-events.jsonl"))
+                .Contains("start-buffered", StringComparison.Ordinal),
+            "Host.Add 成功前 reservation 期間的 Start decision/snapshot 必須緩衝並在 recorder commit 後寫入");
+    }
+    finally
+    {
+        if (Directory.Exists(reservedOutput)) Directory.Delete(reservedOutput, recursive: true);
+    }
+}
+
 string integratedArtifactPath = Path.Combine(Path.GetTempPath(), "kgi-integrated-artifact-" + Guid.NewGuid().ToString("N"));
 try
 {
@@ -1056,6 +1152,8 @@ try
         integratedSource.Emit(Trade("ART", "225MC", 95m, 401, integratedClock.Now));
         integratedClock.Advance(integratedClock.Now.AddSeconds(1));
         integratedSource.Emit(Trade("ART", "225MC", 115m, 402, integratedClock.Now));
+        Assert(integratedHost.Ledger.GetPosition(integratedStrategy.InstanceId, "ART").CompletedTrades == 1,
+            "Host 共用 ledger 必須權威記錄 nonzero→flat round trip");
         integratedRecorder.FinalizeSummary(integratedClock.Now);
     }
     string[] lifecycleLines = File.ReadAllLines(Path.Combine(integratedArtifactPath, "order-lifecycle.jsonl"));
@@ -1269,7 +1367,7 @@ sealed class ArtifactCycleStrategy : ISimulationStrategy, IManagedOrderStrategy,
     public StrategySnapshot GetSnapshot() => new()
     {
         StrategyType = StrategyType, InstanceId = InstanceId, State = State,
-        Reason = _fills >= 2 ? "CycleCompleted" : "Working", CompletedTrades = _fills >= 2 ? 1 : 0,
+        Reason = _fills >= 2 ? "CycleCompleted" : "Working",
         RealizedPnl = _fills >= 2 ? 10m : 0m, NetPnl = _fills >= 2 ? 8m : 0m,
         UpdatedAt = DateTimeOffset.UtcNow
     };

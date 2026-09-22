@@ -87,12 +87,19 @@ static void TestPeriodicStrategyPublishesTypedDecisionEvidence()
     strategy.OnMarketEvent(StrategyBook(110m, 115m, 20, 10, 3, clock.Now));
     clock.Advance(start.AddSeconds(3));
     strategy.OnMarketEvent(StrategyBook(120m, 125m, 20, 10, 4, clock.Now));
+    clock.Advance(start.AddSeconds(4));
+    strategy.OnMarketEvent(StrategyBook(125m, 130m, 20, 10, 5, clock.Now));
 
     StrategyDecisionObservation warmup = decisions.First(x => x.Decision == StrategyDecision.Warmup && x.Thresholds.Count > 0);
+    StrategyDecisionObservation noBook = decisions.First(x => x.Sequence == 0);
     StrategyDecisionObservation rejected = decisions.First(x => x.PrimaryReasonCode == "InvalidBook");
     StrategyDecisionObservation accepted = decisions.First(x => x.Decision == StrategyDecision.Accept);
     Assert(warmup.Thresholds.Any(x => x.Name == "DirectionWindowSeconds" && !x.Passed),
         "暖機 observation 必須包含尚未通過的方向窗門檻");
+    Assert(noBook.RequiredProductsPresent is null && noBook.CrossProductReceiveSkewSeconds is null &&
+           noBook.UnavailableReasons["requiredProductsPresent"] == "NoBookData" &&
+           noBook.UnavailableReasons["crossProductReceiveSkewSeconds"] == "NotApplicableSingleProduct",
+        "尚無 book 時不得伪造 required-products=true 或 cross-product skew");
     Assert(rejected.DataQualityFlags.Contains("InvalidBook"),
         "健康拒絕 observation 必須包含穩定資料品質原因");
     Assert(accepted.PrimaryReasonCode == "SignalAccepted" && accepted.CycleId == "cycle-1",
@@ -101,6 +108,14 @@ static void TestPeriodicStrategyPublishesTypedDecisionEvidence()
            accepted.Features.ContainsKey("averageObi") && accepted.QuoteAgeSeconds == 0m &&
            accepted.SpreadTicks == 1m,
         "接受 observation 必須包含特徵、門檻、報價年齡與價差");
+    Assert(decisions.Count(x => x.Decision == StrategyDecision.Accept) == 1,
+        "同一 candidate/cycle 只能發布一次 SignalAccepted");
+    Assert(decisions.Count(x => x.PrimaryReasonCode == "SignalAccepted") == 1,
+        "SignalAccepted reason 只能在真正建立新 cycle 時發布一次");
+    StrategyDecisionObservation working = decisions.Last();
+    Assert(working.Decision == StrategyDecision.Hold && working.PrimaryReasonCode == "WorkingBoth" &&
+           working.CandidateId == accepted.CandidateId && working.CycleId == accepted.CycleId,
+        $"進入工作狀態後必須保留 coordinator reason，不得被舊 assessment 改回 Accept；actual={working.Decision}/{working.PrimaryReasonCode}");
 }
 
 static void TestParameterDefaultsAndSummary()
@@ -782,8 +797,8 @@ static void TestPeriodicStrategyIsNotOcoWhenOneSideFills()
         "一側成交後另一側完成單必須維持獨立工作");
     PaperOrderRequest sell = orders.Single(x => x.Side == BuySell.Sell);
     strategy.OnExecution(Fill(sell.ClientOrderId, strategy.InstanceId, BuySell.Sell, sell.Price, start.AddSeconds(3)));
-    Assert(strategy.GetSnapshot().CompletedTrades == 1,
-        "雙邊實際成交且帳本空手後必須記錄一筆 completed trade");
+    Assert(strategy.GetSnapshot().CompletedTrades == 0,
+        "Periodic 不得自行計數 completed trade；權威值必須由 Runner 的共用 ledger 覆寫");
 }
 
 static void TestPeriodicStrategySuppressesReplacementAfterCancelFillRace()
@@ -1450,10 +1465,15 @@ static void TestPeriodicStrategyOneLegTimeoutHasExactBoundaryAndFlattens()
     var ledger = new KGIOptionPricing.StrategyFramework.Performance.PaperPortfolioLedger();
     (PeriodicQueueCycleStrategy strategy, MutableClock clock, List<PaperOrderRequest> orders) =
         StartWorkingUpStrategy("one-leg-timeout", RiskParameters(), start, ledger);
+    var decisions = new List<StrategyDecisionObservation>();
+    ((IStrategyDecisionSource)strategy).DecisionObserved += decisions.Add;
     var cancels = new List<string>();
     strategy.CancelOrderRequested += cancels.Add;
     PaperOrderRequest buy = orders.Single(x => x.Side == BuySell.Buy);
     ApplyFill(strategy, ledger, buy, 200m, clock.Now);
+    Assert(decisions.Last().Decision == StrategyDecision.Hold &&
+           decisions.Last().PrimaryReasonCode == "OneLegFilled",
+        "單邊成交後必須發布 Hold/OneLegFilled，不得重複 SignalAccepted");
 
     clock.Advance(clock.Now.AddSeconds(29));
     strategy.OnMarketEvent(StrategyBook(195m, 200m, 20, 10, 3, clock.Now));
@@ -1471,6 +1491,9 @@ static void TestPeriodicStrategyOneLegTimeoutHasExactBoundaryAndFlattens()
     Assert(exit.Side == BuySell.Sell && exit.Quantity == 1 &&
            strategy.GetSnapshot().Reason.Contains("OneLegTimeout", StringComparison.Ordinal),
         "逾時退出必須使用 Flatten/OneLegTimeout，不得誤標固定停損");
+    Assert(decisions.Any(x => x.Decision == StrategyDecision.Exit &&
+                              x.PrimaryReasonCode == "OneLegTimeout"),
+        "單邊逾時必須保留 Exit/OneLegTimeout 決策證據");
 }
 
 static void TestPeriodicStrategyUnhealthyBookRecoversOrFlattensWithoutFalseStop()
