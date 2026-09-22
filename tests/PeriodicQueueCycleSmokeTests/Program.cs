@@ -1011,11 +1011,17 @@ static void TestPeriodicStrategyPreservesReentrantInitialRejection()
         var submitted = new List<PaperOrderRequest>();
         var cancels = new List<string>();
         var decisions = new List<StrategyDecisionObservation>();
-        ((IStrategyDecisionSource)strategy).DecisionObserved += decisions.Add;
+        var causalEvents = new List<string>();
+        ((IStrategyDecisionSource)strategy).DecisionObserved += decision =>
+        {
+            decisions.Add(decision);
+            causalEvents.Add("decision:" + decision.PrimaryReasonCode);
+        };
         strategy.CancelOrderRequested += cancels.Add;
         strategy.OrderRequested += order =>
         {
             submitted.Add(order);
+            causalEvents.Add("submitted:" + order.Side);
             if (order.Side == rejectedSide)
                 strategy.OnOrderLifecycle(Rejected(order.ClientOrderId, strategy.InstanceId, clock.Now));
         };
@@ -1027,11 +1033,13 @@ static void TestPeriodicStrategyPreservesReentrantInitialRejection()
         Assert(strategy.State == StrategyLifecycleState.Faulted &&
                strategy.GetSnapshot().Reason == "OrderRejected",
             $"初始 {rejectedSide} 同步拒絕不得被 TryStart 覆寫 Faulted");
-        Assert(!decisions.Any(x => x.Decision == StrategyDecision.Accept ||
-                                   x.PrimaryReasonCode == "SignalAccepted") &&
+        Assert(decisions.Count(x => x.Decision == StrategyDecision.Accept &&
+                                    x.PrimaryReasonCode == "SignalAccepted") == 1 &&
+               causalEvents.IndexOf("decision:SignalAccepted") <
+               causalEvents.FindIndex(x => x.StartsWith("submitted:", StringComparison.Ordinal)) &&
                decisions.Last().Decision == StrategyDecision.Halt &&
                decisions.Last().PrimaryReasonCode == "OrderRejected",
-            $"初始 {rejectedSide} 同步拒絕後不得發布 Accept，且最後決策必須保留 OrderRejected");
+            $"初始 {rejectedSide} 必須先發布 SignalAccepted 意圖再送單；同步拒絕後最終決策保留 OrderRejected");
         if (rejectedSide == BuySell.Buy)
             Assert(submitted.Count == 1 && cancels.Count == 0,
                 "第一張買單同步拒絕後不得再送出或撤銷尚未送出的賣單");
@@ -1578,16 +1586,23 @@ static void TestPeriodicStrategyCooldownsClearDirectionWindow()
         ("OppositeInitialAheadA", "20"), ("OppositeRepriceThresholdB", "100000"), ("OppositeRepriceTargetC", "1"));
     (PeriodicQueueCycleStrategy strategy, MutableClock clock, List<PaperOrderRequest> orders) =
         StartWorkingUpStrategy("cycle-cooldown", parameters, start, ledger);
+    var decisions = new List<StrategyDecisionObservation>();
+    ((IStrategyDecisionSource)strategy).DecisionObserved += decisions.Add;
     PaperOrderRequest buy = orders.Single(x => x.Side == BuySell.Buy);
     PaperOrderRequest sell = orders.Single(x => x.Side == BuySell.Sell);
     ApplyFill(strategy, ledger, buy, 200m, clock.Now);
     ApplyFill(strategy, ledger, sell, 205m, clock.Now);
     Assert(strategy.GetSnapshot().Reason == "CoolingDown", "雙邊完成且帳本歸零後必須進入週期冷卻");
+    StrategyDecisionObservation cooling = decisions.Last();
+    Assert(!cooling.IsCandidate && cooling.CandidateId.Length == 0 && cooling.CycleId.Length == 0,
+        "market/lifecycle 進入 CoolingDown 時必須清除舊 candidate correlation，避免空 cycle 重複計數");
 
     clock.Advance(clock.Now.AddSeconds(44));
-    strategy.OnMarketEvent(StrategyBook(210m, 215m, 20, 10, 3, clock.Now));
+    strategy.OnHeartbeat(clock.Now);
     Assert(orders.Count == 2 && strategy.GetSnapshot().Reason == "CoolingDown",
         "45 秒週期冷卻尚未結束時不得建立新單");
+    Assert(!decisions.Last().IsCandidate && decisions.Last().CandidateId.Length == 0,
+        "heartbeat 冷卻路徑同樣不得沿用舊 candidate ID");
     clock.Advance(clock.Now.AddSeconds(1));
     strategy.OnMarketEvent(StrategyBook(220m, 225m, 20, 10, 4, clock.Now));
     Assert(orders.Count == 2 && strategy.State == StrategyLifecycleState.WarmingUp,

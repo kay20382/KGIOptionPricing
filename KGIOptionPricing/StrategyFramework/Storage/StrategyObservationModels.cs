@@ -48,6 +48,12 @@ public interface IStrategyDecisionSource
     event Action<StrategyDecisionObservation>? DecisionObserved;
 }
 
+public sealed record StrategyObservationDiagnostic(
+    DateTimeOffset Timestamp,
+    string Kind,
+    string ReasonCode,
+    string Detail);
+
 public sealed record InputArchiveIdentity
 {
     public string AbsolutePath { get; init; } = string.Empty;
@@ -261,4 +267,6 @@ public sealed record ParameterExperimentRecord
         new Dictionary<int, decimal?>();
     public ParameterExperimentStatus Status { get; init; }
     public string? ReasonCode { get; init; }
+    public IReadOnlyDictionary<string, string> UnavailableReasons { get; init; } =
+        new Dictionary<string, string>();
 }

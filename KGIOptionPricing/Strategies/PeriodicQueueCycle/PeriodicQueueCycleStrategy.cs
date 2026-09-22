@@ -193,13 +193,16 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
             _parameters.MaxChaseTicks);
         _activeCandidateId = $"{InstanceId}-cycle-{_coordinator.CycleNumber + 1}-candidate";
         _acceptDecisionPending = false;
-        if (_coordinator.TryStart(_lastAssessment.Direction, _lastAssessment, bounds, marketEvent))
+        if (_coordinator.PrepareCycle(_lastAssessment.Direction, _lastAssessment, bounds, marketEvent))
         {
+            State = StrategyLifecycleState.Running;
+            _reason = "SignalAccepted";
+            _activeCandidateId = $"{InstanceId}-{_coordinator.CurrentCycleId}-candidate";
+            _acceptDecisionPending = true;
+            Publish();
+            _coordinator.ActivatePreparedCycle();
             State = _coordinator.IsFaulted ? StrategyLifecycleState.Faulted : StrategyLifecycleState.Running;
             _reason = _coordinator.ReasonCode;
-            _activeCandidateId = $"{InstanceId}-{_coordinator.CurrentCycleId}-candidate";
-            _acceptDecisionPending = !_coordinator.IsFaulted &&
-                _coordinator.Phase is QueueCyclePhase.WorkingBoth or QueueCyclePhase.WorkingOneLeg;
         }
         else
         {
@@ -440,9 +443,7 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
         string cycleId = _coordinator?.CurrentCycleId ?? string.Empty;
         if (cycleId.Length == 0 && decision == StrategyDecision.Accept && _coordinator is not null)
             cycleId = $"cycle-{_coordinator.CycleNumber + 1}";
-        string candidateId = _activeCandidateId.Length > 0
-            ? _activeCandidateId
-            : _lastBook is null ? string.Empty : $"{InstanceId}-evaluation-{_lastBook.Sequence}";
+        string candidateId = _activeCandidateId;
         var features = new Dictionary<string, decimal?>
         {
             ["netMoveTicks"] = assessment?.NetMoveTicks,
@@ -627,6 +628,8 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
         _pendingCooldownSeconds = 0;
         _exitRequested = false;
         _fixedStopPrice = 0m;
+        _activeCandidateId = string.Empty;
+        _acceptDecisionPending = false;
         State = _paused ? StrategyLifecycleState.Suspended : StrategyLifecycleState.Running;
         _reason = "CoolingDown";
     }

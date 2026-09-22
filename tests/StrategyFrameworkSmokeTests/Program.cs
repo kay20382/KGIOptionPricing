@@ -918,7 +918,7 @@ try
         {
             ExperimentId = "incomplete-empty", Status = ParameterExperimentStatus.Incomplete
         }), "Incomplete parameter experiment 仍須保留完整 identity、結果與穩定缺失原因");
-        recorder.Record(new ParameterExperimentRecord
+        var validExperiment = new ParameterExperimentRecord
         {
             ExperimentId = "experiment-1", BaselineRunId = "baseline-1", CandidateRunId = "run-observation-1",
             StrategyType = "PeriodicQueueCycle", CodeVersion = "test-version",
@@ -936,6 +936,40 @@ try
             GuardrailValues = new Dictionary<string, decimal?> { ["minimumCompletedTrades"] = 1m },
             Results = new Dictionary<string, decimal?> { ["completedTrades"] = 1m },
             AdverseSlippageStress = new Dictionary<int, decimal?> { [0] = 28m, [1] = -72m, [2] = -172m }
+        };
+        recorder.Record(validExperiment);
+        AssertThrows<ArgumentException>(() => recorder.Record(validExperiment with
+        {
+            ExperimentId = "undefined-change",
+            ChangedParameters = new Dictionary<string, string> { ["UnknownParameter"] = "2" }
+        }), "changed parameters 必須是 candidate 子集，且每個 key 都有 typed definition");
+        AssertThrows<ArgumentException>(() => recorder.Record(validExperiment with
+        {
+            ExperimentId = "off-step", CandidateParameters = new Dictionary<string, string> { ["MinMoveTicks"] = "1.1" },
+            ChangedParameters = new Dictionary<string, string> { ["MinMoveTicks"] = "1.1" }
+        }), "候選數值必須符合 type、allowed/search range 與 step");
+        AssertThrows<ArgumentException>(() => recorder.Record(validExperiment with
+        {
+            ExperimentId = "grid-no-ordinal", SearchMethod = "grid", CandidateOrdinal = null
+        }), "grid 搜尋必須記錄 candidate ordinal");
+        AssertThrows<ArgumentException>(() => recorder.Record(validExperiment with
+        {
+            ExperimentId = "random-no-seed", SearchMethod = "random", RandomSeed = null
+        }), "random 搜尋必須記錄 random seed");
+        AssertThrows<ArgumentException>(() => recorder.Record(validExperiment with
+        {
+            ExperimentId = "valid-null-result",
+            Results = new Dictionary<string, decimal?> { ["completedTrades"] = null }
+        }), "Valid experiment 的 results/guardrails 必須是完整有限值，不得用 null 假裝已驗證");
+        recorder.Record(validExperiment with
+        {
+            ExperimentId = "incomplete-with-provenance", Status = ParameterExperimentStatus.Incomplete,
+            ReasonCode = "ReplayInterrupted", Results = new Dictionary<string, decimal?>(),
+            AdverseSlippageStress = new Dictionary<int, decimal?>(),
+            UnavailableReasons = new Dictionary<string, string>
+            {
+                ["Results"] = "ReplayInterrupted", ["AdverseSlippageStress"] = "ReplayInterrupted"
+            }
         });
         recorder.FinalizeSummary(observedAt.AddSeconds(4));
     }
@@ -1090,10 +1124,66 @@ try
         replayBoundary, boundaryStarted.AddMinutes(1));
     Assert(replayIdentity.MutationReasonCode == "InputMutatedDuringRun",
         "backtest 輸入在執行中變動必須標記 InputMutatedDuringRun，不得悄悄採用結束時 hash");
+
+    string sameLengthFile = Path.Combine(boundaryDirectory, "same-length.jsonl");
+    File.WriteAllText(sameLengthFile, "prefix-A");
+    InputArchiveBoundary sameLengthBoundary = InputArchiveBoundaryCapture.Begin(
+        sameLengthFile, appendOnly: true, boundaryStarted);
+    File.WriteAllText(sameLengthFile, "prefix-B");
+    File.AppendAllText(sameLengthFile, "run-data");
+    InputArchiveIdentity sameLengthIdentity = InputArchiveBoundaryCapture.Complete(
+        sameLengthBoundary, boundaryStarted.AddMinutes(1));
+    Assert(sameLengthIdentity.MutationReasonCode == "InputMutatedDuringRun",
+        "live append archive 的既有 prefix 即使長度相同被改寫，也必須判定輸入突變");
+
+    string emptyDirectory = Path.Combine(boundaryDirectory, "empty");
+    Directory.CreateDirectory(emptyDirectory);
+    InputArchiveIdentity emptyIdentity = InputArchiveBoundaryCapture.Complete(
+        InputArchiveBoundaryCapture.Begin(emptyDirectory, appendOnly: true, boundaryStarted),
+        boundaryStarted.AddMinutes(1));
+    Assert(emptyIdentity.Sha256 is null &&
+           emptyIdentity.MissingFields.Contains("ArchiveFiles") &&
+           emptyIdentity.MissingFields.Contains("EmptyArchive"),
+        "空 archive 必須明確 unavailable，不得產生看似有效的空集合 hash");
+
+    string deletedFile = Path.Combine(boundaryDirectory, "deleted.jsonl");
+    File.WriteAllText(deletedFile, "will-delete");
+    InputArchiveBoundary deletedBoundary = InputArchiveBoundaryCapture.Begin(
+        deletedFile, appendOnly: false, boundaryStarted);
+    File.Delete(deletedFile);
+    InputArchiveIdentity deletedIdentity = InputArchiveBoundaryCapture.Complete(
+        deletedBoundary, boundaryStarted.AddMinutes(1));
+    Assert(deletedIdentity.MutationReasonCode == "InputMutatedDuringRun" && deletedIdentity.Sha256 is null,
+        "archive replacement/deletion race 必須回傳穩定 mutation/unavailable，不可拋例外毀掉 run");
 }
 finally
 {
     if (Directory.Exists(boundaryDirectory)) Directory.Delete(boundaryDirectory, recursive: true);
+}
+
+string archiveBarrierRoot = Path.Combine(Path.GetTempPath(), "kgi-archive-barrier-" + Guid.NewGuid().ToString("N"));
+try
+{
+    using var archiveWriter = new MarketDataArchiveWriter(archiveBarrierRoot, "barrier-run");
+    archiveWriter.Record(Book("BAR", "BAR", 99m, 101m, 1, DateTimeOffset.UtcNow));
+    ArchiveWriterSnapshot startSnapshot = archiveWriter.CaptureBarrier();
+    InputArchiveBoundary barrierBoundary = InputArchiveBoundaryCapture.Begin(startSnapshot, DateTimeOffset.UtcNow);
+    archiveWriter.Record(Book("BAR", "BAR", 100m, 102m, 2, DateTimeOffset.UtcNow.AddSeconds(1)));
+    ArchiveWriterSnapshot endSnapshot = archiveWriter.CaptureBarrier();
+    InputArchiveIdentity barrierIdentity = InputArchiveBoundaryCapture.Complete(
+        barrierBoundary, endSnapshot, DateTimeOffset.UtcNow.AddSeconds(1));
+    string barrierHash = barrierIdentity.Sha256!;
+    archiveWriter.Record(Book("BAR", "BAR", 101m, 103m, 3, DateTimeOffset.UtcNow.AddSeconds(2)));
+    archiveWriter.CaptureBarrier();
+    Assert(startSnapshot.Length < endSnapshot.Length && barrierIdentity.SizeBytes > 0 &&
+           barrierIdentity.Files.Single().StartOffset == startSnapshot.Length &&
+           barrierIdentity.Files.Single().EndOffset == endSnapshot.Length &&
+           InputArchiveBoundaryCapture.Verify(barrierIdentity) && barrierIdentity.Sha256 == barrierHash,
+        "writer channel barrier 必須 flush marker 前事件並固定 byte range；ended 後事件不得改變既有 run identity");
+}
+finally
+{
+    if (Directory.Exists(archiveBarrierRoot)) Directory.Delete(archiveBarrierRoot, recursive: true);
 }
 
 string failingRecorderDirectory = Path.Combine(Path.GetTempPath(), "kgi-recorder-dispose-" + Guid.NewGuid().ToString("N"));
@@ -1113,6 +1203,55 @@ try
 finally
 {
     if (Directory.Exists(failingRecorderDirectory)) Directory.Delete(failingRecorderDirectory, recursive: true);
+}
+
+string constructorFailureDirectory = Path.Combine(Path.GetTempPath(), "kgi-recorder-constructor-" + Guid.NewGuid().ToString("N"));
+try
+{
+    Directory.CreateDirectory(constructorFailureDirectory);
+    Directory.CreateDirectory(Path.Combine(constructorFailureDirectory, "order-lifecycle.jsonl"));
+    AssertThrows<UnauthorizedAccessException>(() => new SimulationRunRecorder(constructorFailureDirectory),
+        "第三個 artifact 建立失敗時 constructor 必須回報失敗");
+    Directory.Delete(Path.Combine(constructorFailureDirectory, "order-lifecycle.jsonl"));
+    Assert(!File.Exists(Path.Combine(constructorFailureDirectory, "strategy-events.jsonl")) &&
+           !File.Exists(Path.Combine(constructorFailureDirectory, "strategy-decisions.jsonl")),
+        "constructor 中途失敗必須關閉先前 stream 並清除本次 partial outputs");
+}
+finally
+{
+    if (Directory.Exists(constructorFailureDirectory)) Directory.Delete(constructorFailureDirectory, recursive: true);
+}
+
+string retryFinalizeDirectory = Path.Combine(Path.GetTempPath(), "kgi-recorder-finalize-retry-" + Guid.NewGuid().ToString("N"));
+try
+{
+    using var retrySet = new StrategyRunRecorderSet();
+    Assert(retrySet.TryReserve("retry-finalize"), "finalize retry fixture 必須取得 reservation");
+    var retryRecorder = new SimulationRunRecorder(retryFinalizeDirectory);
+    retryRecorder.PrepareManifest(new RunManifest
+    {
+        RunId = "retry-finalize", StrategyType = "Probe", InstanceId = "retry-finalize",
+        Mode = StrategyRunMode.LiveShadow, StartedAt = DateTimeOffset.UtcNow
+    });
+    int finalizeAttempts = 0;
+    retrySet.CommitReservation("retry-finalize", retryRecorder, endedAt =>
+    {
+        if (++finalizeAttempts == 1) throw new IOException("transient finalizer failure");
+        return new RunManifest
+        {
+            RunId = "retry-finalize", StrategyType = "Probe", InstanceId = "retry-finalize",
+            Mode = StrategyRunMode.LiveShadow, StartedAt = endedAt.AddMinutes(-1), EndedAt = endedAt
+        };
+    });
+    AssertThrows<AggregateException>(() => retrySet.RemoveAndFinalize("retry-finalize", DateTimeOffset.UtcNow),
+        "第一次 manifest finalize 失敗必須保留 closing recorder 供重試");
+    retrySet.RemoveAndFinalize("retry-finalize", DateTimeOffset.UtcNow.AddSeconds(1));
+    Assert(finalizeAttempts == 2 && File.Exists(Path.Combine(retryFinalizeDirectory, "run-manifest.json")),
+        "同 instance Remove 重試必須完成原 recorder，不可在首次失敗時不可逆移除 ownership");
+}
+finally
+{
+    if (Directory.Exists(retryFinalizeDirectory)) Directory.Delete(retryFinalizeDirectory, recursive: true);
 }
 
 string recorderSetRoot = Path.Combine(Path.GetTempPath(), "kgi-recorder-set-" + Guid.NewGuid().ToString("N"));
@@ -1194,6 +1333,9 @@ using (var reservationSet = new StrategyRunRecorderSet())
 using (var operationGate = new StrategyInstanceOperationGate())
 {
     using IDisposable addLease = operationGate.Enter("linearized-instance");
+    using IDisposable nestedLease = operationGate.Enter("linearized-instance");
+    AssertThrows<InvalidOperationException>(() => operationGate.BeginDispose(),
+        "owner callback 內 Dispose 必須立即失敗，不得等待自己的 lease 形成死鎖");
     using var removeAttempted = new ManualResetEventSlim(false);
     using var removeEntered = new ManualResetEventSlim(false);
     Task removeTask = Task.Run(() =>
@@ -1205,10 +1347,21 @@ using (var operationGate = new StrategyInstanceOperationGate())
     Assert(removeAttempted.Wait(TimeSpan.FromSeconds(2)), "Remove race 測試必須確實抵達同 instance lease");
     Assert(!removeEntered.Wait(TimeSpan.FromMilliseconds(100)),
         "同 instance Remove 必須等待 Add recorder-first lifecycle 完整結束");
+    Task disposeWaiter = Task.Run(() =>
+    {
+        operationGate.BeginDispose();
+        operationGate.ReopenAfterFailedDispose();
+    });
+    Assert(!disposeWaiter.Wait(TimeSpan.FromMilliseconds(100)),
+        "外部 Dispose 必須等待既有 Add lease 安全結束");
+    nestedLease.Dispose();
     addLease.Dispose();
     Assert(removeEntered.Wait(TimeSpan.FromSeconds(2)),
         "Add lease 結束後 Remove 必須取得 ownership，避免 orphan recorder");
     removeTask.GetAwaiter().GetResult();
+    Assert(disposeWaiter.Wait(TimeSpan.FromSeconds(2)),
+        "host/recorder dispose 失敗後 gate 必須可 reopen 供 Remove/Get/retry 使用");
+    using IDisposable retryLease = operationGate.Enter("linearized-instance");
 }
 
 var disposedOperationGate = new StrategyInstanceOperationGate();
@@ -1236,6 +1389,50 @@ try
 finally
 {
     if (Directory.Exists(observationFailurePath)) Directory.Delete(observationFailurePath, recursive: true);
+}
+
+string hostObservationFailurePath = Path.Combine(Path.GetTempPath(), "kgi-host-observation-failure-" + Guid.NewGuid().ToString("N"));
+try
+{
+    var fatalSource = new FakeSource();
+    using var fatalHost = new StrategyHost(fatalSource, new SystemStrategyClock());
+    using var fatalSet = new StrategyRunRecorderSet();
+    var fatalRecorder = new SimulationRunRecorder(hostObservationFailurePath);
+    fatalSet.Add("host-fatal-observation", fatalRecorder);
+    fatalRecorder.Dispose();
+    fatalHost.SnapshotChanged += fatalSet.Record;
+    fatalHost.ExecutionOccurred += fatalSet.Record;
+    fatalHost.OrderLifecycleOccurred += fatalSet.Record;
+    fatalHost.DecisionObserved += fatalSet.Record;
+    fatalSet.FatalObservationFailure += (instanceId, exception) =>
+        fatalHost.MarkObservationFault(instanceId, exception);
+    var fatalStrategy = new ManagedProbeStrategy("host-fatal-observation", "HFO");
+    var fatalBroker = new ConcurrentCallbackExecutionService();
+    StrategyInstanceRunner fatalRunner = fatalHost.Add(fatalStrategy, new ResolvedStrategyUniverse
+    {
+        Tradable = Product("HFO", "HFO", 1m, 1m)
+    }, 1m, fatalBroker);
+    Assert(fatalRunner.GetSnapshot().State == StrategyLifecycleState.Faulted &&
+           fatalRunner.GetSnapshot().Reason == "FatalObservationFailure",
+        "Host.Add 同步 artifact failure 必須在返回前將 runner fail-close，不可返回 Running/Ready");
+    fatalStrategy.Request("blocked-after-observation-fault", BuySell.Buy, 100m);
+    fatalSource.Emit(Book("HFO", "HFO", 99m, 101m, 1, DateTimeOffset.UtcNow));
+    Assert(fatalStrategy.MarketEvents.Count == 0,
+        "observation fault 後必須阻止 OnMarket/Pulse/新 order，且不可觸發自動 cancel/flatten");
+    fatalBroker.RaiseFill(new ExecutionEvent
+    {
+        Sequence = 1, MarketSequence = 1, Timestamp = DateTimeOffset.UtcNow,
+        StrategyInstanceId = fatalStrategy.InstanceId, ClientOrderId = "late-fill", OrderId = "late-order",
+        Symbol = "HFO", Side = BuySell.Buy, Role = PaperOrderRole.EntryLong,
+        Price = 100m, Quantity = 1, Commission = 1m
+    });
+    Assert(fatalStrategy.Executions.Count == 1 &&
+           fatalSet.GetPendingDiagnostics(fatalStrategy.InstanceId).Any(item => item.Kind == "Execution"),
+        "fail-close 後 late fill/lifecycle 仍須送入 runner，並保留於公開 emergency diagnostic buffer");
+}
+finally
+{
+    if (Directory.Exists(hostObservationFailurePath)) Directory.Delete(hostObservationFailurePath, recursive: true);
 }
 
 string excursionArtifactPath = Path.Combine(Path.GetTempPath(), "kgi-excursion-artifact-" + Guid.NewGuid().ToString("N"));

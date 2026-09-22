@@ -37,6 +37,7 @@ public sealed class StrategyInstanceRunner : IDisposable
     private int _failedDisposeAttempt;
     private Exception? _lastDisposeException;
     private bool _paused;
+    private bool _observationFaulted;
 
     public string InstanceId => _strategy.InstanceId;
     internal bool IsDisposed { get { lock (_sync) return _disposed; } }
@@ -105,7 +106,7 @@ public sealed class StrategyInstanceRunner : IDisposable
     {
         lock (_sync)
         {
-            if (_disposed || _disposing || !UsesSymbol(marketEvent.Symbol)) return;
+            if (_disposed || _disposing || _observationFaulted || !UsesSymbol(marketEvent.Symbol)) return;
             // Mark open positions from an actual last-traded price, never a half-tick midpoint.
             if (marketEvent.LastPrice > 0m)
                 _ledger.ApplyMark(marketEvent.Symbol, marketEvent.LastPrice);
@@ -134,7 +135,7 @@ public sealed class StrategyInstanceRunner : IDisposable
     {
         lock (_sync)
         {
-            if (_disposed || _disposing || _strategy is not IStrategyHeartbeat heartbeat) return;
+            if (_disposed || _disposing || _observationFaulted || _strategy is not IStrategyHeartbeat heartbeat) return;
             if (_clock is IEventDrivenStrategyClock eventClock) eventClock.Advance(now);
             if (_paused)
             {
@@ -192,18 +193,26 @@ public sealed class StrategyInstanceRunner : IDisposable
 
     private void OnOrderRequested(PaperOrderRequest request)
     {
-        try { _broker.Submit(request, _clock.Now); }
-        catch (BrokerReconciliationRequiredException)
+        lock (_sync)
         {
-            // The execution service already published the protocol failure.
-            // Preserve the strategy so Live can pause it for manual recovery.
+            if (_observationFaulted || _disposed || _disposing) return;
+            try { _broker.Submit(request, _clock.Now); }
+            catch (BrokerReconciliationRequiredException)
+            {
+                // The execution service already published the protocol failure.
+                // Preserve the strategy so Live can pause it for manual recovery.
+            }
         }
     }
 
     private void OnCancelAllRequested()
     {
-        try { _broker.CancelAll(_strategy.InstanceId); }
-        catch (BrokerReconciliationRequiredException) { }
+        lock (_sync)
+        {
+            if (_observationFaulted || _disposed || _disposing) return;
+            try { _broker.CancelAll(_strategy.InstanceId); }
+            catch (BrokerReconciliationRequiredException) { }
+        }
     }
 
     private void OnStrategySnapshotChanged(StrategySnapshot snapshot) =>
@@ -211,25 +220,26 @@ public sealed class StrategyInstanceRunner : IDisposable
 
     private void OnCancelOrderRequested(string clientOrderId)
     {
-        try
+        lock (_sync)
         {
-            if (_managedBroker?.CancelByClientOrderId(_strategy.InstanceId, clientOrderId) != false) return;
+            if (_observationFaulted || _disposed || _disposing) return;
+            try
+            {
+                if (_managedBroker?.CancelByClientOrderId(_strategy.InstanceId, clientOrderId) != false) return;
+            }
+            catch (BrokerReconciliationRequiredException) { return; }
+            var failure = new OrderLifecycleEvent
+            {
+                Timestamp = _clock.Now,
+                StrategyInstanceId = _strategy.InstanceId,
+                ClientOrderId = clientOrderId,
+                PreviousState = OrderLifecycleState.CancelPending,
+                State = OrderLifecycleState.CancelPending,
+                ReasonCode = "CancelRequestNotRouted"
+            };
+            _managedStrategy?.OnOrderLifecycle(failure);
+            OrderLifecycleOccurred?.Invoke(failure);
         }
-        catch (BrokerReconciliationRequiredException)
-        {
-            return;
-        }
-        var failure = new OrderLifecycleEvent
-        {
-            Timestamp = _clock.Now,
-            StrategyInstanceId = _strategy.InstanceId,
-            ClientOrderId = clientOrderId,
-            PreviousState = OrderLifecycleState.CancelPending,
-            State = OrderLifecycleState.CancelPending,
-            ReasonCode = "CancelRequestNotRouted"
-        };
-        _managedStrategy?.OnOrderLifecycle(failure);
-        OrderLifecycleOccurred?.Invoke(failure);
     }
 
     private void OnOrderLifecycleChanged(OrderLifecycleEvent orderEvent)
@@ -290,6 +300,12 @@ public sealed class StrategyInstanceRunner : IDisposable
     private StrategySnapshot GetSnapshotCore()
     {
         StrategySnapshot snapshot = WithPnl(_strategy.GetSnapshot());
+        if (_observationFaulted) return snapshot with
+        {
+            State = StrategyLifecycleState.Faulted,
+            Reason = "FatalObservationFailure",
+            UpdatedAt = DateTimeOffset.Now
+        };
         return !_paused || snapshot.State is StrategyLifecycleState.Faulted or StrategyLifecycleState.Stopped
             ? snapshot : snapshot with
         {
@@ -297,6 +313,12 @@ public sealed class StrategyInstanceRunner : IDisposable
             Reason = "使用者暫停",
             UpdatedAt = DateTimeOffset.Now
         };
+    }
+
+    internal void MarkObservationFault(Exception exception)
+    {
+        ArgumentNullException.ThrowIfNull(exception);
+        lock (_sync) _observationFaulted = true;
     }
 
     public void Dispose()
@@ -377,6 +399,7 @@ public sealed class StrategyHost : IDisposable
     private bool _disposing;
     private bool _administrativeStop;
     private readonly Dictionary<string, int> _addOwners = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, StrategyInstanceRunner> _startingRunners = new(StringComparer.OrdinalIgnoreCase);
     internal bool IsDisposed { get { lock (_sync) return _disposed; } }
 
     public event Action<StrategySnapshot>? SnapshotChanged;
@@ -414,6 +437,7 @@ public sealed class StrategyHost : IDisposable
         {
             _source.Subscribe(universe.AllProducts);
             runner = new StrategyInstanceRunner(strategy, universe, _ledger, _clock, commissionPerContract, executionService, deferStart: true);
+            lock (_sync) _startingRunners[strategy.InstanceId] = runner;
             runner.SnapshotChanged += PublishSnapshotSafely;
             runner.ExecutionOccurred += execution => ExecutionOccurred?.Invoke(execution);
             runner.OrderLifecycleOccurred += PublishOrderLifecycleSafely;
@@ -450,6 +474,7 @@ public sealed class StrategyHost : IDisposable
             lock (_sync)
             {
                 _addOwners.Remove(strategy.InstanceId);
+                _startingRunners.Remove(strategy.InstanceId);
                 Monitor.PulseAll(_sync);
             }
         }
@@ -466,6 +491,20 @@ public sealed class StrategyHost : IDisposable
         StrategyInstanceRunner? runner = FindForOperation(instanceId);
         if (runner == null) return false;
         runner.Stop(reason);
+        return true;
+    }
+
+    public bool MarkObservationFault(string instanceId, Exception exception)
+    {
+        StrategyInstanceRunner? runner;
+        lock (_sync)
+        {
+            _startingRunners.TryGetValue(instanceId, out runner);
+            runner ??= _runners.FirstOrDefault(candidate =>
+                string.Equals(candidate.InstanceId, instanceId, StringComparison.OrdinalIgnoreCase));
+        }
+        if (runner == null) return false;
+        runner.MarkObservationFault(exception);
         return true;
     }
 

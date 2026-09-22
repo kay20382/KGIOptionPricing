@@ -89,7 +89,7 @@ internal sealed class QueueCycleOrderCoordinator
     internal event Action<PaperOrderRequest>? OrderRequested;
     internal event Action<string>? CancelOrderRequested;
 
-    internal bool TryStart(
+    internal bool PrepareCycle(
         CycleDirection direction,
         DirectionAssessment assessment,
         FrozenPriceBounds bounds,
@@ -125,17 +125,24 @@ internal sealed class QueueCycleOrderCoordinator
             direction == CycleDirection.Up ? _parameters.OppositeRepriceThresholdB : _parameters.TrendRepriceThresholdB,
             direction == CycleDirection.Up ? _parameters.OppositeRepriceTargetC : _parameters.TrendRepriceTargetC);
 
+        ReasonCode = "SignalAccepted";
+        return true;
+    }
+
+    internal void ActivatePreparedCycle()
+    {
+        if (Phase != QueueCyclePhase.SubmittingPair || _buy is null || _sell is null)
+            throw new InvalidOperationException("尚未準備可送出的雙邊週期。");
         PaperOrderRequest buyOrder = CreateOrder(_buy);
         PaperOrderRequest sellOrder = CreateOrder(_sell);
         _buy.Submitted = true;
         OrderRequested?.Invoke(buyOrder);
-        if (IsFaulted) return true;
+        if (IsFaulted) return;
         _sell.Submitted = true;
         OrderRequested?.Invoke(sellOrder);
-        if (IsFaulted) return true;
+        if (IsFaulted) return;
         UpdateWorkingPhase();
         if (!_buy.HasFill && !_sell.HasFill) ReasonCode = "SignalAccepted";
-        return true;
     }
 
     internal void EvaluateReprices(MarketEvent book)

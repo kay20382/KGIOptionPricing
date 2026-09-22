@@ -97,6 +97,9 @@ public sealed class SimulationRunRecorder : IDisposable
     private RunManifest? _manifest;
 
     public string DirectoryPath { get; }
+    internal bool ManifestFinalized { get { lock (_sync) return _manifestWritten; } }
+    internal bool SummaryFinalized { get { lock (_sync) return _summaryFinalized; } }
+    internal bool IsDisposed { get { lock (_sync) return _disposed; } }
 
     public SimulationRunRecorder(string directoryPath, TimeSpan? decisionHeartbeatInterval = null)
     {
@@ -105,12 +108,38 @@ public sealed class SimulationRunRecorder : IDisposable
         _decisionHeartbeatInterval = decisionHeartbeatInterval ?? TimeSpan.FromSeconds(5);
         if (_decisionHeartbeatInterval < TimeSpan.Zero)
             throw new ArgumentOutOfRangeException(nameof(decisionHeartbeatInterval));
-        _events = Writer("strategy-events.jsonl");
-        _decisions = Writer("strategy-decisions.jsonl");
-        _orderLifecycle = Writer("order-lifecycle.jsonl");
-        _experiments = Writer("parameter-experiments.jsonl");
-        _trades = Writer("executions.csv");
-        _trades.WriteLine("timestamp,sequence,marketSequence,instanceId,cycleId,generation,clientOrderId,orderId,symbol,side,role,price,quantity,commission,triggerMarketPrice");
+        StreamWriter? events = null, decisions = null, lifecycle = null, experiments = null, trades = null;
+        var created = new List<string>();
+        StreamWriter Open(string name)
+        {
+            string path = Path.Combine(DirectoryPath, name);
+            bool existed = File.Exists(path);
+            StreamWriter writer = Writer(name);
+            if (!existed) created.Add(path);
+            return writer;
+        }
+        try
+        {
+            events = Open("strategy-events.jsonl");
+            decisions = Open("strategy-decisions.jsonl");
+            lifecycle = Open("order-lifecycle.jsonl");
+            experiments = Open("parameter-experiments.jsonl");
+            trades = Open("executions.csv");
+            trades.WriteLine("timestamp,sequence,marketSequence,instanceId,cycleId,generation,clientOrderId,orderId,symbol,side,role,price,quantity,commission,triggerMarketPrice");
+        }
+        catch
+        {
+            foreach (IDisposable? stream in new IDisposable?[] { events, decisions, lifecycle, experiments, trades })
+                try { stream?.Dispose(); } catch { }
+            foreach (string path in created)
+                try { if (File.Exists(path)) File.Delete(path); } catch { }
+            throw;
+        }
+        _events = events!;
+        _decisions = decisions!;
+        _orderLifecycle = lifecycle!;
+        _experiments = experiments!;
+        _trades = trades!;
     }
 
     public void RecordManifest(RunManifest manifest)
@@ -462,11 +491,14 @@ public sealed class SimulationRunRecorder : IDisposable
         if (experiment.SecondaryObjectives.Count == 0 && experiment.Objectives.Count < 2)
             missing.Add("SecondaryObjectives");
         if (experiment.GuardrailValues.Count == 0 && experiment.Guardrails.Count == 0) missing.Add("Guardrails");
-        if (experiment.Results.Count == 0) missing.Add("Results");
+        bool incompleteStatus = experiment.Status is ParameterExperimentStatus.Rejected or ParameterExperimentStatus.Incomplete;
+        if (experiment.Results.Count == 0 &&
+            (!incompleteStatus || !experiment.UnavailableReasons.ContainsKey("Results"))) missing.Add("Results");
         if (experiment.ExecutionAssumptions.Count == 0) missing.Add("ExecutionAssumptions");
         if (experiment.ProductMapping.Count == 0) missing.Add("ProductMapping");
         if (!new[] { 0, 1, 2 }.All(key => experiment.AdverseSlippageStress.TryGetValue(key, out decimal? value) &&
-                                               value.HasValue))
+                                               value.HasValue) &&
+            (!incompleteStatus || !experiment.UnavailableReasons.ContainsKey("AdverseSlippageStress")))
             missing.Add("AdverseSlippageStress[0,1,2]");
         if (experiment.ParameterDefinitions.Count == 0) missing.Add("ParameterDefinitions");
         foreach ((string name, ParameterSearchDefinition definition) in experiment.ParameterDefinitions)
@@ -481,13 +513,63 @@ public sealed class SimulationRunRecorder : IDisposable
                 definition.SearchMaximum > definition.AllowedMaximum)
                 missing.Add($"ParameterDefinitions.{name}");
         }
+        foreach ((string name, string value) in experiment.CandidateParameters)
+        {
+            if (!experiment.ParameterDefinitions.TryGetValue(name, out ParameterSearchDefinition? definition))
+            {
+                missing.Add($"ParameterDefinitions.{name}");
+                continue;
+            }
+            if (!TryValidateParameterValue(value, definition)) missing.Add($"CandidateParameters.{name}");
+        }
+        foreach ((string name, string value) in experiment.ChangedParameters)
+            if (!experiment.CandidateParameters.TryGetValue(name, out string? candidate) ||
+                !string.Equals(candidate, value, StringComparison.Ordinal) ||
+                !experiment.ParameterDefinitions.ContainsKey(name))
+                missing.Add($"ChangedParameters.{name}");
+        if (experiment.SearchMethod.Equals("grid", StringComparison.OrdinalIgnoreCase) &&
+            !experiment.CandidateOrdinal.HasValue) missing.Add("CandidateOrdinal");
+        if (experiment.SearchMethod.Equals("random", StringComparison.OrdinalIgnoreCase))
+        {
+            if (!experiment.RandomSeed.HasValue) missing.Add("RandomSeed");
+            if (!experiment.CandidateOrdinal.HasValue) missing.Add("CandidateOrdinal");
+        }
         if (experiment.Status is ParameterExperimentStatus.Rejected or ParameterExperimentStatus.Incomplete &&
             string.IsNullOrWhiteSpace(experiment.ReasonCode))
             missing.Add("ReasonCode");
+        if (experiment.Status == ParameterExperimentStatus.Valid)
+        {
+            if (experiment.Results.Any(result => !result.Value.HasValue)) missing.Add("ResultsFinite");
+            if (experiment.GuardrailValues.Any(guardrail => !guardrail.Value.HasValue))
+                missing.Add("GuardrailValuesFinite");
+        }
         if (missing.Count > 0)
             throw new ArgumentException($"{experiment.Status} parameter experiment 缺少可重現欄位：" +
                                         string.Join(",", missing),
                 nameof(experiment));
+    }
+
+    private static bool TryValidateParameterValue(string value, ParameterSearchDefinition definition)
+    {
+        if (definition.Type.Equals("bool", StringComparison.OrdinalIgnoreCase))
+            return bool.TryParse(value, out _);
+        if (definition.Type.Equals("string", StringComparison.OrdinalIgnoreCase)) return true;
+        if (!decimal.TryParse(value, NumberStyles.Number, CultureInfo.InvariantCulture, out decimal parsed))
+            return false;
+        if (definition.Type.Equals("int", StringComparison.OrdinalIgnoreCase) && parsed != decimal.Truncate(parsed))
+            return false;
+        if (definition.AllowedMinimum.HasValue && parsed < definition.AllowedMinimum.Value ||
+            definition.AllowedMaximum.HasValue && parsed > definition.AllowedMaximum.Value ||
+            definition.SearchMinimum.HasValue && parsed < definition.SearchMinimum.Value ||
+            definition.SearchMaximum.HasValue && parsed > definition.SearchMaximum.Value)
+            return false;
+        if (definition.Step is > 0m)
+        {
+            decimal origin = definition.SearchMinimum ?? definition.AllowedMinimum ?? 0m;
+            if ((parsed - origin) % definition.Step.Value != 0m) return false;
+        }
+        return definition.Type.Equals("decimal", StringComparison.OrdinalIgnoreCase) ||
+               definition.Type.Equals("int", StringComparison.OrdinalIgnoreCase);
     }
 
     public void FinalizeSummary(DateTimeOffset finalizedAt)
