@@ -187,13 +187,13 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
             return;
         }
 
-        FrozenPriceBounds bounds = QueueCyclePricingPolicy.CreateBounds(
-            marketEvent.MidPrice,
-            _context.Universe.Tradable.TickSize,
-            _parameters.MaxChaseTicks);
         _activeCandidateId = $"{InstanceId}-cycle-{_coordinator.CycleNumber + 1}-candidate";
         _acceptDecisionPending = false;
-        if (_coordinator.PrepareCycle(_lastAssessment.Direction, _lastAssessment, bounds, marketEvent))
+        if (_coordinator.PrepareCycle(
+            _lastAssessment.Direction,
+            _lastAssessment,
+            _context.Universe.Tradable.TickSize,
+            marketEvent))
         {
             State = StrategyLifecycleState.Running;
             _reason = "SignalAccepted";
@@ -366,7 +366,6 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
     public StrategySnapshot GetSnapshot()
     {
         PositionSnapshot position = Position();
-        FrozenPriceBounds? bounds = _coordinator?.FrozenBounds;
         return new StrategySnapshot
         {
             StrategyType = StrategyType,
@@ -380,10 +379,10 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
             State = State,
             Reason = _reason,
             LastPrice = _lastBook?.LastPrice ?? 0m,
-            CenterPrice = bounds?.Anchor ?? _lastBook?.MidPrice ?? 0m,
+            CenterPrice = _lastBook?.MidPrice ?? 0m,
             Range = _lastAssessment?.PathTicks ?? 0m,
-            BuyEntry = bounds?.BuyLimit ?? 0m,
-            SellEntry = bounds?.SellLimit ?? 0m,
+            BuyEntry = _coordinator?.BuyWorkingPrice ?? 0m,
+            SellEntry = _coordinator?.SellWorkingPrice ?? 0m,
             StopPrice = _fixedStopPrice,
             Position = position.NetQuantity,
             RealizedPnl = position.RealizedPnl,

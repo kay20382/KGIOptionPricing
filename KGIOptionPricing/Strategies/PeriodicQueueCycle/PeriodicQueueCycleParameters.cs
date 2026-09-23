@@ -20,7 +20,6 @@ public sealed class PeriodicQueueCycleParameters
     public decimal MaxSpreadTicks { get; private init; }
     public decimal MaxVolatilityTicks { get; private init; }
     public decimal QuoteFreshnessSeconds { get; private init; }
-    public decimal MaxChaseTicks { get; private init; }
     public decimal StopLossTicks { get; private init; }
     public int MaxOneLegSeconds { get; private init; }
     public int CycleCooldownSeconds { get; private init; }
@@ -50,7 +49,6 @@ public sealed class PeriodicQueueCycleParameters
         $"MaxSpreadTicks={General(MaxSpreadTicks)}",
         $"MaxVolatilityTicks={General(MaxVolatilityTicks)}",
         $"QuoteFreshnessSeconds={General(QuoteFreshnessSeconds)}",
-        $"MaxChaseTicks={General(MaxChaseTicks)}",
         $"StopLossTicks={General(StopLossTicks)}",
         $"MaxOneLegSeconds={MaxOneLegSeconds}",
         $"CycleCooldownSeconds={CycleCooldownSeconds}",
@@ -90,7 +88,6 @@ public sealed class PeriodicQueueCycleParameters
             MaxSpreadTicks = ReadDecimal(source, "MaxSpreadTicks", 2m, 1m, 20m),
             MaxVolatilityTicks = ReadDecimal(source, "MaxVolatilityTicks", 5m, 1m, 100m),
             QuoteFreshnessSeconds = ReadDecimal(source, "QuoteFreshnessSeconds", 2m, 0.1m, 30m),
-            MaxChaseTicks = ReadDecimal(source, "MaxChaseTicks", 2m, 0m, 20m),
             StopLossTicks = ReadDecimal(source, "StopLossTicks", 6m, 1m, 100m),
             MaxOneLegSeconds = ReadInt(source, "MaxOneLegSeconds", 30, 1, 300),
             CycleCooldownSeconds = ReadInt(source, "CycleCooldownSeconds", 45, 0, 3_600),

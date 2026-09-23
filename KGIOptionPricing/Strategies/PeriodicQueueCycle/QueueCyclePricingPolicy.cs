@@ -6,12 +6,6 @@ namespace KGIOptionPricing.Strategies.PeriodicQueueCycle;
 
 public enum QueuePriceAction { Hold, Place, Reprice }
 
-public sealed record FrozenPriceBounds(
-    decimal Anchor,
-    decimal TickSize,
-    decimal BuyLimit,
-    decimal SellLimit);
-
 public sealed record QueuePriceDecision(
     QueuePriceAction Action,
     decimal Price,
@@ -25,40 +19,20 @@ public sealed record QueuePriceDecision(
 /// </summary>
 public sealed class QueueCyclePricingPolicy
 {
-    public static FrozenPriceBounds CreateBounds(decimal anchor, decimal tickSize, decimal maxChaseTicks)
-    {
-        if (anchor <= 0m) throw new ArgumentOutOfRangeException(nameof(anchor));
-        if (tickSize <= 0m) throw new ArgumentOutOfRangeException(nameof(tickSize));
-        if (maxChaseTicks < 0m) throw new ArgumentOutOfRangeException(nameof(maxChaseTicks));
-
-        decimal chaseDistance = maxChaseTicks * tickSize;
-        decimal buyLimit = AlignDown(anchor + chaseDistance, tickSize);
-        decimal sellLimit = AlignUp(anchor - chaseDistance, tickSize);
-        var bounds = new FrozenPriceBounds(anchor, tickSize, buyLimit, sellLimit);
-        if (!IsValidBounds(bounds))
-            throw new ArgumentException("The derived frozen price bounds are inconsistent.", nameof(maxChaseTicks));
-        return bounds;
-    }
-
     public QueuePriceDecision SelectInitial(
         BuySell side,
         MarketEvent book,
         int targetAhead,
-        FrozenPriceBounds bounds)
+        decimal tickSize)
     {
-        if (!IsValidBounds(bounds))
-            return Hold(0m, 0, 0, "InvalidBounds");
-        if (!IsValidBook(book, bounds.TickSize))
+        if (!IsValidBook(book, tickSize))
             return Hold(0m, 0, 0, "InvalidBook");
 
-        decimal candidate = SelectForAheadTarget(side, book, Math.Max(0, targetAhead), bounds.TickSize);
-        decimal bounded = side == BuySell.Buy
-            ? Math.Min(candidate, bounds.BuyLimit)
-            : Math.Max(candidate, bounds.SellLimit);
+        decimal candidate = SelectForAheadTarget(side, book, Math.Max(0, targetAhead), tickSize);
 
         return new QueuePriceDecision(
             QueuePriceAction.Place,
-            bounded,
+            candidate,
             0,
             0,
             "InitialPriceSelected");
@@ -71,12 +45,10 @@ public sealed class QueueCyclePricingPolicy
         int samePriceAhead,
         int thresholdB,
         int targetC,
-        FrozenPriceBounds bounds)
+        decimal tickSize)
     {
         int normalizedSameAhead = Math.Max(0, samePriceAhead);
-        if (!IsValidBounds(bounds))
-            return Hold(currentPrice, normalizedSameAhead, 0, "InvalidBounds");
-        if (!IsValidBook(book, bounds.TickSize) || currentPrice <= 0m)
+        if (!IsValidBook(book, tickSize) || currentPrice <= 0m)
             return Hold(currentPrice, normalizedSameAhead, 0, "InvalidBook");
 
         int betterQuantity = BetterPriceQuantity(side, book, currentPrice);
@@ -84,16 +56,14 @@ public sealed class QueueCyclePricingPolicy
         if (totalAhead <= thresholdB)
             return Hold(currentPrice, normalizedSameAhead, betterQuantity, "RepriceThresholdNotExceeded");
 
-        decimal candidate = SelectForAheadTarget(side, book, Math.Max(0, targetC), bounds.TickSize);
-        bool crossesBoundary = side == BuySell.Buy
-            ? candidate > bounds.BuyLimit
-            : candidate < bounds.SellLimit;
+        decimal candidate = SelectForAheadTarget(side, book, Math.Max(0, targetC), tickSize);
         bool moreAggressive = side == BuySell.Buy
             ? candidate > currentPrice
             : candidate < currentPrice;
 
-        if (crossesBoundary || !moreAggressive)
-            return Hold(currentPrice, normalizedSameAhead, betterQuantity, "PriceBoundaryReached");
+        if (!moreAggressive)
+            return Hold(currentPrice, normalizedSameAhead, betterQuantity,
+                candidate == currentPrice ? "TargetPriceUnchanged" : "TargetPriceLessAggressive");
 
         return new QueuePriceDecision(
             QueuePriceAction.Reprice,
@@ -146,15 +116,6 @@ public sealed class QueueCyclePricingPolicy
         return total;
     }
 
-    private static bool IsValidBounds(FrozenPriceBounds bounds) =>
-        bounds is not null &&
-        bounds.Anchor > 0m &&
-        bounds.TickSize > 0m &&
-        bounds.BuyLimit > 0m &&
-        bounds.SellLimit > 0m &&
-        IsTickAligned(bounds.BuyLimit, bounds.TickSize) &&
-        IsTickAligned(bounds.SellLimit, bounds.TickSize);
-
     private static bool IsValidBook(MarketEvent book, decimal tickSize)
     {
         if (book is null || book.Kind != MarketEventKind.Book ||
@@ -182,12 +143,6 @@ public sealed class QueueCyclePricingPolicy
 
         return true;
     }
-
-    private static decimal AlignDown(decimal price, decimal tickSize) =>
-        decimal.Floor(price / tickSize) * tickSize;
-
-    private static decimal AlignUp(decimal price, decimal tickSize) =>
-        decimal.Ceiling(price / tickSize) * tickSize;
 
     private static bool IsTickAligned(decimal price, decimal tickSize) =>
         tickSize > 0m && price % tickSize == 0m;

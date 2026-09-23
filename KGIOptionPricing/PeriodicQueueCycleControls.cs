@@ -39,7 +39,6 @@ public sealed class PeriodicQueueCycleControls : FlowLayoutPanel
         AddNumber("MaxSpreadTicks", "最大價差 ticks", 2, 1, 100);
         AddNumber("MaxVolatilityTicks", "最大波動 ticks", 5, 0, 100);
         AddNumber("QuoteFreshnessSeconds", "行情新鮮秒", 2, .1m, 60m, 1);
-        AddNumber("MaxChaseTicks", "最大追價 ticks", 2, 0, 100);
         AddNumber("StopLossTicks", "固定停損 ticks", 6, 1, 100);
         AddNumber("MaxOneLegSeconds", "單邊成交逾時秒", 30, 1, 600);
         AddNumber("CycleCooldownSeconds", "一般冷卻秒", 45, 0, 3600);

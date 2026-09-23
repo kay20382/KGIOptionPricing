@@ -6,6 +6,8 @@ using KGIOptionPricing.Strategies.PeriodicQueueCycle;
 using KGIOptionPricing.StrategyFramework;
 
 TestParameterDefaultsAndSummary();
+TestPeriodicQueueLegacyPriceBoundaryIsIgnored();
+TestPeriodicQueueLegacyMaxChaseSettingIsIgnored();
 TestInvariantParsing();
 TestParameterSafetyRanges();
 TestParameterSafetyBoundariesAreAccepted();
@@ -17,11 +19,10 @@ TestUtcSecondSamplingAndWarmup();
 TestQueueInitialPricingUsesCumulativeAheadSymmetrically();
 TestQueueRepriceRequiresStrictlyMoreThanThreshold();
 TestQueueRepriceNeverBecomesLessAggressive();
-TestQueuePricingUsesFrozenInwardBounds();
+TestQueuePricingFollowsBookWithoutBoundary();
 TestQueuePricingHandlesZeroTargetOneTickSpreadAndInvalidBooks();
 TestQueuePricingSupportsDifferentTickSizes();
-TestQueuePricingRejectsOffTickBooksAndInvalidBounds();
-TestQueuePricingAllowsZeroChaseWithHalfTickAnchor();
+TestQueuePricingRejectsOffTickBooksAndInvalidTickSize();
 TestPeriodicStrategyWarmsUpAndSubmitsBothSidesTogether();
 TestPeriodicStrategyMapsDirectionalQueueParameters();
 TestPeriodicStrategyRepricesOnlyAfterExactCancellation();
@@ -216,7 +217,7 @@ static void TestParameterDefaultsAndSummary()
            p.ObiConfirmSeconds == 3 && p.DirectionReverseSeconds == 3 &&
            p.MinSideDepth == 827 && p.MinNearDepth == 165 && p.MinDepthRatio == 0.35m &&
            p.MaxSpreadTicks == 2m && p.MaxVolatilityTicks == 5m &&
-           p.QuoteFreshnessSeconds == 2m && p.MaxChaseTicks == 2m &&
+           p.QuoteFreshnessSeconds == 2m &&
            p.StopLossTicks == 6m && p.MaxOneLegSeconds == 30 &&
            p.CycleCooldownSeconds == 45 && p.StopLossCooldownSeconds == 60 &&
            p.ShockCooldownSeconds == 45 && p.MarketDataRecoverySeconds == 2m &&
@@ -225,7 +226,7 @@ static void TestParameterDefaultsAndSummary()
            p.OppositeInitialAheadA == 240 && p.OppositeRepriceThresholdB == 312 && p.OppositeRepriceTargetC == 22,
         "週期策略預設參數不符設計規格");
 
-    const string expected = "DirectionWindowSeconds=15;MinMoveTicks=2;MinTrendEfficiency=0.40;MinDepthObi=0.10;ObiConfirmSeconds=3;DirectionReverseSeconds=3;MinSideDepth=827;MinNearDepth=165;MinDepthRatio=0.35;MaxSpreadTicks=2;MaxVolatilityTicks=5;QuoteFreshnessSeconds=2;MaxChaseTicks=2;StopLossTicks=6;MaxOneLegSeconds=30;CycleCooldownSeconds=45;StopLossCooldownSeconds=60;ShockCooldownSeconds=45;MarketDataRecoverySeconds=2;CommissionPerContract=36;ResearchValidated=false;TrendInitialAheadA=22;TrendRepriceThresholdB=49;TrendRepriceTargetC=22;OppositeInitialAheadA=240;OppositeRepriceThresholdB=312;OppositeRepriceTargetC=22";
+    const string expected = "DirectionWindowSeconds=15;MinMoveTicks=2;MinTrendEfficiency=0.40;MinDepthObi=0.10;ObiConfirmSeconds=3;DirectionReverseSeconds=3;MinSideDepth=827;MinNearDepth=165;MinDepthRatio=0.35;MaxSpreadTicks=2;MaxVolatilityTicks=5;QuoteFreshnessSeconds=2;StopLossTicks=6;MaxOneLegSeconds=30;CycleCooldownSeconds=45;StopLossCooldownSeconds=60;ShockCooldownSeconds=45;MarketDataRecoverySeconds=2;CommissionPerContract=36;ResearchValidated=false;TrendInitialAheadA=22;TrendRepriceThresholdB=49;TrendRepriceTargetC=22;OppositeInitialAheadA=240;OppositeRepriceThresholdB=312;OppositeRepriceTargetC=22";
     Assert(p.ParameterSummary == expected, $"參數摘要必須完整且穩定。實際：{p.ParameterSummary}");
 }
 
@@ -270,7 +271,6 @@ static void TestParameterSafetyRanges()
         ("MaxSpreadTicks", "0.99"), ("MaxSpreadTicks", "20.01"),
         ("MaxVolatilityTicks", "0.99"), ("MaxVolatilityTicks", "100.01"),
         ("QuoteFreshnessSeconds", "0.09"), ("QuoteFreshnessSeconds", "30.01"),
-        ("MaxChaseTicks", "-0.01"), ("MaxChaseTicks", "20.01"),
         ("StopLossTicks", "0.99"), ("StopLossTicks", "100.01"),
         ("MaxOneLegSeconds", "0"), ("MaxOneLegSeconds", "301"),
         ("CycleCooldownSeconds", "-1"), ("CycleCooldownSeconds", "3601"),
@@ -317,8 +317,6 @@ static void TestParameterSafetyBoundariesAreAccepted()
         ("MaxVolatilityTicks upper", Values(("MaxVolatilityTicks", "100"))),
         ("QuoteFreshnessSeconds lower", Values(("QuoteFreshnessSeconds", "0.1"))),
         ("QuoteFreshnessSeconds upper", Values(("QuoteFreshnessSeconds", "30"))),
-        ("MaxChaseTicks lower", Values(("MaxChaseTicks", "0"))),
-        ("MaxChaseTicks upper", Values(("MaxChaseTicks", "20"))),
         ("StopLossTicks lower", Values(("StopLossTicks", "1"))),
         ("StopLossTicks upper", Values(("StopLossTicks", "100"))),
         ("MaxOneLegSeconds lower", Values(("MaxOneLegSeconds", "1"))),
@@ -544,14 +542,34 @@ static void TestUtcSecondSamplingAndWarmup()
         $"缺秒暖機必須揭露尾端實際連續秒數，實際 {warmup.Observed}");
 }
 
+static void TestPeriodicQueueLegacyPriceBoundaryIsIgnored()
+{
+    var policy = new QueueCyclePricingPolicy();
+    MarketEvent book = QueueBook(5m, 100m, 110m, new[] { 10, 15 }, new[] { 10, 15 });
+
+    QueuePriceDecision decision = policy.EvaluateReprice(
+        BuySell.Buy, book, 85m, 40, 10, 22, 5m);
+
+    Assert(decision.Action == QueuePriceAction.Reprice && decision.Price == 95m,
+        "目標價較目前買價積極時，即使跨越舊價格邊界也必須改價");
+}
+
+static void TestPeriodicQueueLegacyMaxChaseSettingIsIgnored()
+{
+    PeriodicQueueCycleParameters parameters = PeriodicQueueCycleParameters.Parse(Values(
+        ("MaxChaseTicks", "-100")));
+
+    Assert(!parameters.ParameterSummary.Contains("MaxChaseTicks=", StringComparison.Ordinal),
+        "舊 MaxChaseTicks 設定必須被安全忽略，且不得顯示為有效參數");
+}
+
 static void TestQueueInitialPricingUsesCumulativeAheadSymmetrically()
 {
     var policy = new QueueCyclePricingPolicy();
     MarketEvent book = QueueBook(5m, 100m, 110m, new[] { 10, 15, 20 }, new[] { 7, 9, 30 });
-    FrozenPriceBounds bounds = QueueCyclePricingPolicy.CreateBounds(105m, 5m, 10m);
 
-    QueuePriceDecision buy = policy.SelectInitial(BuySell.Buy, book, 22, bounds);
-    QueuePriceDecision sell = policy.SelectInitial(BuySell.Sell, book, 22, bounds);
+    QueuePriceDecision buy = policy.SelectInitial(BuySell.Buy, book, 22, 5m);
+    QueuePriceDecision sell = policy.SelectInitial(BuySell.Sell, book, 22, 5m);
 
     Assert(buy.Action == QueuePriceAction.Place && buy.Price == 95m,
         $"買單 A 必須選在累積第 22 口所在價位 95，實際 {buy.Action}/{buy.Price}");
@@ -563,12 +581,11 @@ static void TestQueueRepriceRequiresStrictlyMoreThanThreshold()
 {
     var policy = new QueueCyclePricingPolicy();
     MarketEvent book = QueueBook(5m, 100m, 110m, new[] { 10, 15, 20 }, new[] { 7, 9, 30 });
-    FrozenPriceBounds bounds = QueueCyclePricingPolicy.CreateBounds(105m, 5m, 10m);
 
-    QueuePriceDecision buyAtB = policy.EvaluateReprice(BuySell.Buy, book, 90m, 5, 30, 22, bounds);
-    QueuePriceDecision buyAboveB = policy.EvaluateReprice(BuySell.Buy, book, 90m, 5, 29, 22, bounds);
-    QueuePriceDecision sellAtB = policy.EvaluateReprice(BuySell.Sell, book, 125m, 5, 51, 12, bounds);
-    QueuePriceDecision sellAboveB = policy.EvaluateReprice(BuySell.Sell, book, 125m, 5, 50, 12, bounds);
+    QueuePriceDecision buyAtB = policy.EvaluateReprice(BuySell.Buy, book, 90m, 5, 30, 22, 5m);
+    QueuePriceDecision buyAboveB = policy.EvaluateReprice(BuySell.Buy, book, 90m, 5, 29, 22, 5m);
+    QueuePriceDecision sellAtB = policy.EvaluateReprice(BuySell.Sell, book, 125m, 5, 51, 12, 5m);
+    QueuePriceDecision sellAboveB = policy.EvaluateReprice(BuySell.Sell, book, 125m, 5, 50, 12, 5m);
 
     Assert(buyAtB.Action == QueuePriceAction.Hold && buyAtB.Price == 90m &&
            buyAtB.BetterPriceQuantity == 25 && buyAtB.SamePriceAheadQuantity == 5,
@@ -586,79 +603,45 @@ static void TestQueueRepriceNeverBecomesLessAggressive()
 {
     var policy = new QueueCyclePricingPolicy();
     MarketEvent book = QueueBook(5m, 100m, 110m, new[] { 10, 15, 20 }, new[] { 10, 15, 20 });
-    FrozenPriceBounds bounds = QueueCyclePricingPolicy.CreateBounds(105m, 5m, 10m);
 
-    QueuePriceDecision buy = policy.EvaluateReprice(BuySell.Buy, book, 100m, 50, 10, 22, bounds);
-    QueuePriceDecision sell = policy.EvaluateReprice(BuySell.Sell, book, 110m, 50, 10, 22, bounds);
+    QueuePriceDecision buy = policy.EvaluateReprice(BuySell.Buy, book, 100m, 50, 10, 22, 5m);
+    QueuePriceDecision sell = policy.EvaluateReprice(BuySell.Sell, book, 110m, 50, 10, 22, 5m);
 
-    Assert(buy.Action == QueuePriceAction.Hold && buy.Price == 100m && buy.ReasonCode == "PriceBoundaryReached",
+    Assert(buy.Action == QueuePriceAction.Hold && buy.Price == 100m && buy.ReasonCode == "TargetPriceLessAggressive",
         "買單 C 候選較低時不得往較不積極方向改掛");
-    Assert(sell.Action == QueuePriceAction.Hold && sell.Price == 110m && sell.ReasonCode == "PriceBoundaryReached",
+    Assert(sell.Action == QueuePriceAction.Hold && sell.Price == 110m && sell.ReasonCode == "TargetPriceLessAggressive",
         "賣單 C 候選較高時不得往較不積極方向改掛");
 }
 
-static void TestQueuePricingUsesFrozenInwardBounds()
+static void TestQueuePricingFollowsBookWithoutBoundary()
 {
     var policy = new QueueCyclePricingPolicy();
-    FrozenPriceBounds bounds = QueueCyclePricingPolicy.CreateBounds(102.5m, 5m, 2m);
-    Assert(bounds.Anchor == 102.5m && bounds.BuyLimit == 110m && bounds.SellLimit == 95m,
-        $"半 Tick 中價邊界取整錯誤：{bounds.Anchor}/{bounds.BuyLimit}/{bounds.SellLimit}");
-
-    MarketEvent initialOutside = QueueBook(5m, 115m, 120m, new[] { 10 }, new[] { 10 });
-    QueuePriceDecision clampedBuy = policy.SelectInitial(BuySell.Buy, initialOutside, 1, bounds);
-    MarketEvent initialSellOutside = QueueBook(5m, 85m, 90m, new[] { 10 }, new[] { 10 });
-    QueuePriceDecision clampedSell = policy.SelectInitial(BuySell.Sell, initialSellOutside, 1, bounds);
-    Assert(clampedBuy.Action == QueuePriceAction.Place && clampedBuy.Price == 110m,
-        "買單首次掛單越界時必須向內夾到凍結上界");
-    Assert(clampedSell.Action == QueuePriceAction.Place && clampedSell.Price == 95m,
-        "賣單首次掛單越界時必須向內夾到凍結下界");
-
     MarketEvent buyBook = QueueBook(5m, 100m, 110m, new[] { 10, 15 }, new[] { 10, 15 });
-    FrozenPriceBounds exactBuyBounds = new(92.5m, 5m, 95m, 90m);
-    QueuePriceDecision exactBuy = policy.EvaluateReprice(BuySell.Buy, buyBook, 90m, 40, 10, 22, exactBuyBounds);
-    Assert(exactBuy.Action == QueuePriceAction.Reprice && exactBuy.Price == 95m,
-        "買單改掛候選恰好命中凍結上界時應允許改掛");
-
-    FrozenPriceBounds crossedBuyBounds = new(87.5m, 5m, 90m, 85m);
-    QueuePriceDecision crossedBuy = policy.EvaluateReprice(BuySell.Buy, buyBook, 85m, 40, 10, 22, crossedBuyBounds);
-    Assert(crossedBuy.Action == QueuePriceAction.Hold && crossedBuy.Price == 85m &&
-           crossedBuy.ReasonCode == "PriceBoundaryReached",
-        "買單改掛候選越過凍結上界時必須維持原價");
+    QueuePriceDecision buy = policy.EvaluateReprice(BuySell.Buy, buyBook, 85m, 40, 10, 22, 5m);
+    Assert(buy.Action == QueuePriceAction.Reprice && buy.Price == 95m,
+        "買單改價不受舊價格邊界限制，必須跟隨目前十檔的 C 目標");
 
     MarketEvent sellBook = QueueBook(5m, 100m, 110m, new[] { 4, 6, 8 }, new[] { 7, 9, 30 });
-    FrozenPriceBounds exactSellBounds = new(120m, 5m, 130m, 115m);
-    QueuePriceDecision exactSell = policy.EvaluateReprice(BuySell.Sell, sellBook, 125m, 40, 10, 12, exactSellBounds);
-    Assert(exactSell.Action == QueuePriceAction.Reprice && exactSell.Price == 115m,
-        "賣單改掛候選恰好命中凍結下界時應允許改掛");
-
-    FrozenPriceBounds crossedSellBounds = new(122.5m, 5m, 130m, 120m);
-    QueuePriceDecision crossedSell = policy.EvaluateReprice(BuySell.Sell, sellBook, 125m, 40, 10, 12, crossedSellBounds);
-    Assert(crossedSell.Action == QueuePriceAction.Hold && crossedSell.Price == 125m &&
-           crossedSell.ReasonCode == "PriceBoundaryReached",
-        "賣單改掛候選越過凍結下界時必須維持原價");
-
-    FrozenPriceBounds originalBounds = bounds;
-    _ = policy.SelectInitial(BuySell.Buy, QueueBook(5m, 130m, 135m, new[] { 10 }, new[] { 10 }), 1, bounds);
-    Assert(bounds == originalBounds && bounds.BuyLimit == 110m && bounds.SellLimit == 95m,
-        "市場移動後不得重算或移動週期價格邊界");
+    QueuePriceDecision sell = policy.EvaluateReprice(BuySell.Sell, sellBook, 125m, 40, 10, 12, 5m);
+    Assert(sell.Action == QueuePriceAction.Reprice && sell.Price == 115m,
+        "賣單改價不受舊價格邊界限制，必須跟隨目前十檔的 C 目標");
 }
 
 static void TestQueuePricingHandlesZeroTargetOneTickSpreadAndInvalidBooks()
 {
     var policy = new QueueCyclePricingPolicy();
-    FrozenPriceBounds bounds = QueueCyclePricingPolicy.CreateBounds(102.5m, 5m, 10m);
     MarketEvent oneTick = QueueBook(5m, 100m, 105m, new[] { 10 }, new[] { 10 });
 
-    QueuePriceDecision buy = policy.SelectInitial(BuySell.Buy, oneTick, 0, bounds);
-    QueuePriceDecision sell = policy.SelectInitial(BuySell.Sell, oneTick, 0, bounds);
+    QueuePriceDecision buy = policy.SelectInitial(BuySell.Buy, oneTick, 0, 5m);
+    QueuePriceDecision sell = policy.SelectInitial(BuySell.Sell, oneTick, 0, 5m);
     Assert(buy.Action == QueuePriceAction.Place && buy.Price == 105m,
         "A=0 且價差一跳時買單必須使用對手第一檔，不得穿價");
     Assert(sell.Action == QueuePriceAction.Place && sell.Price == 100m,
         "A=0 且價差一跳時賣單必須使用對手第一檔，不得穿價");
 
     MarketEvent invalid = oneTick with { AskPrices = Array.Empty<decimal>(), AskQuantities = Array.Empty<int>() };
-    QueuePriceDecision invalidInitial = policy.SelectInitial(BuySell.Buy, invalid, 22, bounds);
-    QueuePriceDecision invalidReprice = policy.EvaluateReprice(BuySell.Sell, invalid, 105m, 20, 10, 22, bounds);
+    QueuePriceDecision invalidInitial = policy.SelectInitial(BuySell.Buy, invalid, 22, 5m);
+    QueuePriceDecision invalidReprice = policy.EvaluateReprice(BuySell.Sell, invalid, 105m, 20, 10, 22, 5m);
     Assert(invalidInitial.Action == QueuePriceAction.Hold && invalidInitial.Price == 0m &&
            invalidInitial.ReasonCode == "InvalidBook",
         "無效 Book 不得產生首次掛單價格");
@@ -670,28 +653,23 @@ static void TestQueuePricingHandlesZeroTargetOneTickSpreadAndInvalidBooks()
 static void TestQueuePricingSupportsDifferentTickSizes()
 {
     var policy = new QueueCyclePricingPolicy();
-    FrozenPriceBounds bounds = QueueCyclePricingPolicy.CreateBounds(101.25m, 2.5m, 1m);
-    Assert(bounds.BuyLimit == 102.5m && bounds.SellLimit == 100m,
-        $"2.5 Tick 的向內價格邊界錯誤：{bounds.BuyLimit}/{bounds.SellLimit}");
-
     MarketEvent book = QueueBook(2.5m, 100m, 102.5m, new[] { 10 }, new[] { 10 });
-    QueuePriceDecision buy = policy.SelectInitial(BuySell.Buy, book, 0, bounds);
-    QueuePriceDecision sell = policy.SelectInitial(BuySell.Sell, book, 0, bounds);
+    QueuePriceDecision buy = policy.SelectInitial(BuySell.Buy, book, 0, 2.5m);
+    QueuePriceDecision sell = policy.SelectInitial(BuySell.Sell, book, 0, 2.5m);
     Assert(buy.Price == 102.5m && sell.Price == 100m,
-        $"政策必須使用 bounds.TickSize，不得寫死 5：{buy.Price}/{sell.Price}");
+        $"政策必須使用傳入的 TickSize，不得寫死 5：{buy.Price}/{sell.Price}");
 }
 
-static void TestQueuePricingRejectsOffTickBooksAndInvalidBounds()
+static void TestQueuePricingRejectsOffTickBooksAndInvalidTickSize()
 {
     var policy = new QueueCyclePricingPolicy();
-    FrozenPriceBounds validBounds = QueueCyclePricingPolicy.CreateBounds(102.5m, 5m, 2m);
 
     MarketEvent offTick = QueueBook(5m, 100m, 110m, new[] { 10, 15 }, new[] { 7, 9 }) with
     {
         BidPrices = new[] { 100m, 92.5m }
     };
-    QueuePriceDecision offTickInitial = policy.SelectInitial(BuySell.Buy, offTick, 22, validBounds);
-    QueuePriceDecision offTickReprice = policy.EvaluateReprice(BuySell.Buy, offTick, 90m, 40, 10, 22, validBounds);
+    QueuePriceDecision offTickInitial = policy.SelectInitial(BuySell.Buy, offTick, 22, 5m);
+    QueuePriceDecision offTickReprice = policy.EvaluateReprice(BuySell.Buy, offTick, 90m, 40, 10, 22, 5m);
     Assert(offTickInitial.Action == QueuePriceAction.Hold && offTickInitial.Price == 0m &&
            offTickInitial.ReasonCode == "InvalidBook",
         "任一正價 Book level 未對齊 Tick 時不得猜測修正或首次掛單");
@@ -703,7 +681,7 @@ static void TestQueuePricingRejectsOffTickBooksAndInvalidBounds()
     {
         AskPrices = new[] { 110m, 117.5m }
     };
-    QueuePriceDecision offTickSell = policy.SelectInitial(BuySell.Sell, offTickAsk, 22, validBounds);
+    QueuePriceDecision offTickSell = policy.SelectInitial(BuySell.Sell, offTickAsk, 22, 5m);
     Assert(offTickSell.Action == QueuePriceAction.Hold && offTickSell.Price == 0m &&
            offTickSell.ReasonCode == "InvalidBook",
         "賣方候選價未對齊 Tick 時也不得猜測修正或掛單");
@@ -716,57 +694,15 @@ static void TestQueuePricingRejectsOffTickBooksAndInvalidBounds()
     {
         AskPrices = new[] { 110m, 120m, 115m }
     };
-    Assert(policy.SelectInitial(BuySell.Buy, bidOutOfOrder, 22, validBounds).ReasonCode == "InvalidBook",
+    Assert(policy.SelectInitial(BuySell.Buy, bidOutOfOrder, 22, 5m).ReasonCode == "InvalidBook",
         "買方價位未嚴格遞減時必須拒絕 Book");
-    Assert(policy.SelectInitial(BuySell.Sell, askOutOfOrder, 22, validBounds).ReasonCode == "InvalidBook",
+    Assert(policy.SelectInitial(BuySell.Sell, askOutOfOrder, 22, 5m).ReasonCode == "InvalidBook",
         "賣方價位未嚴格遞增時必須拒絕 Book");
 
-    AssertThrows<ArgumentOutOfRangeException>(() => QueueCyclePricingPolicy.CreateBounds(102.5m, 0m, 2m),
-        "CreateBounds 不得接受零 TickSize");
-
-    var invalidBounds = new[]
-    {
-        new FrozenPriceBounds(102.5m, 0m, 110m, 95m),
-        new FrozenPriceBounds(0m, 5m, 110m, 95m),
-        new FrozenPriceBounds(102.5m, 5m, 0m, 95m),
-        new FrozenPriceBounds(102.5m, 5m, 110m, 0m),
-        new FrozenPriceBounds(102.5m, 5m, 107.5m, 95m),
-        new FrozenPriceBounds(102.5m, 5m, 110m, 97.5m)
-    };
-    foreach (FrozenPriceBounds invalid in invalidBounds)
-    {
-        QueuePriceDecision initial = policy.SelectInitial(
-            BuySell.Buy, QueueBook(5m, 100m, 110m, new[] { 10 }, new[] { 7 }), 1, invalid);
-        QueuePriceDecision reprice = policy.EvaluateReprice(
-            BuySell.Sell, QueueBook(5m, 100m, 110m, new[] { 10 }, new[] { 7 }), 120m, 20, 10, 1, invalid);
-        Assert(initial.Action == QueuePriceAction.Hold && initial.ReasonCode == "InvalidBounds",
-            $"不一致 FrozenPriceBounds 必須在首次選價拒絕：{invalid}");
-        Assert(reprice.Action == QueuePriceAction.Hold && reprice.ReasonCode == "InvalidBounds",
-            $"不一致 FrozenPriceBounds 必須在改掛判斷拒絕：{invalid}");
-    }
-}
-
-static void TestQueuePricingAllowsZeroChaseWithHalfTickAnchor()
-{
-    var policy = new QueueCyclePricingPolicy();
-    FrozenPriceBounds zeroChase = QueueCyclePricingPolicy.CreateBounds(102.5m, 5m, 0m);
-    Assert(zeroChase.Anchor == 102.5m && zeroChase.BuyLimit == 100m && zeroChase.SellLimit == 105m,
-        $"半 Tick anchor 的零追價界線必須各自向內取整：{zeroChase.BuyLimit}/{zeroChase.SellLimit}");
-
-    MarketEvent oneTickBook = QueueBook(5m, 100m, 105m, new[] { 10 }, new[] { 7 });
-    QueuePriceDecision buy = policy.SelectInitial(BuySell.Buy, oneTickBook, 0, zeroChase);
-    QueuePriceDecision sell = policy.SelectInitial(BuySell.Sell, oneTickBook, 0, zeroChase);
-    Assert(buy.Action == QueuePriceAction.Place && buy.Price == 100m,
-        $"零追價買單必須受獨立買方上界限制在 100，實際 {buy.Action}/{buy.Price}");
-    Assert(sell.Action == QueuePriceAction.Place && sell.Price == 105m,
-        $"零追價賣單必須受獨立賣方下界限制在 105，實際 {sell.Action}/{sell.Price}");
-
-    FrozenPriceBounds independentlyValid = new(102.5m, 5m, 95m, 110m);
-    QueuePriceDecision independentBuy = policy.SelectInitial(BuySell.Buy, oneTickBook, 1, independentlyValid);
-    QueuePriceDecision independentSell = policy.SelectInitial(BuySell.Sell, oneTickBook, 1, independentlyValid);
-    Assert(independentBuy.Action == QueuePriceAction.Place && independentBuy.Price == 95m &&
-           independentSell.Action == QueuePriceAction.Place && independentSell.Price == 110m,
-        "只要兩側界線各自為正且對齊 Tick，就不得以跨側關係拒絕 FrozenPriceBounds");
+    QueuePriceDecision invalidTick = policy.SelectInitial(
+        BuySell.Buy, QueueBook(5m, 100m, 110m, new[] { 10 }, new[] { 7 }), 1, 0m);
+    Assert(invalidTick.Action == QueuePriceAction.Hold && invalidTick.ReasonCode == "InvalidBook",
+        "零 TickSize 不得產生猜測價格");
 }
 
 static void TestPeriodicStrategyWarmsUpAndSubmitsBothSidesTogether()

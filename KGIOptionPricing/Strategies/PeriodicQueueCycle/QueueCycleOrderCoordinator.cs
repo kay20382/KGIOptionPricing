@@ -54,6 +54,7 @@ internal sealed class QueueCycleOrderCoordinator
     private LegState _exitState = LegState.Cancelled;
     private PaperOrderRole? _exitRole;
     private long _exitSequence;
+    private decimal _tickSize;
 
     internal QueueCycleOrderCoordinator(
         string instanceId,
@@ -71,7 +72,8 @@ internal sealed class QueueCycleOrderCoordinator
     internal string CurrentCycleId => _buy?.CycleId ?? string.Empty;
     internal CycleDirection FrozenDirection { get; private set; } = CycleDirection.Neutral;
     internal DirectionAssessment? FrozenAssessment { get; private set; }
-    internal FrozenPriceBounds? FrozenBounds { get; private set; }
+    internal decimal BuyWorkingPrice => _buy?.CurrentPrice ?? 0m;
+    internal decimal SellWorkingPrice => _sell?.CurrentPrice ?? 0m;
     internal bool IsFaulted => Phase == QueueCyclePhase.Faulted;
     internal bool BothUnfilled => _buy is not null && _sell is not null &&
         !_buy.HasFill && !_sell.HasFill;
@@ -92,7 +94,7 @@ internal sealed class QueueCycleOrderCoordinator
     internal bool PrepareCycle(
         CycleDirection direction,
         DirectionAssessment assessment,
-        FrozenPriceBounds bounds,
+        decimal tickSize,
         MarketEvent book)
     {
         if (direction == CycleDirection.Neutral || Phase is QueueCyclePhase.SubmittingPair or QueueCyclePhase.WorkingBoth)
@@ -104,8 +106,8 @@ internal sealed class QueueCycleOrderCoordinator
         int sellInitial = direction == CycleDirection.Up
             ? _parameters.OppositeInitialAheadA
             : _parameters.TrendInitialAheadA;
-        QueuePriceDecision buy = _pricing.SelectInitial(BuySell.Buy, book, buyInitial, bounds);
-        QueuePriceDecision sell = _pricing.SelectInitial(BuySell.Sell, book, sellInitial, bounds);
+        QueuePriceDecision buy = _pricing.SelectInitial(BuySell.Buy, book, buyInitial, tickSize);
+        QueuePriceDecision sell = _pricing.SelectInitial(BuySell.Sell, book, sellInitial, tickSize);
         if (buy.Action != QueuePriceAction.Place || sell.Action != QueuePriceAction.Place)
         {
             ReasonCode = buy.Action != QueuePriceAction.Place ? buy.ReasonCode : sell.ReasonCode;
@@ -116,7 +118,7 @@ internal sealed class QueueCycleOrderCoordinator
         CycleNumber++;
         FrozenDirection = direction;
         FrozenAssessment = assessment;
-        FrozenBounds = bounds;
+        _tickSize = tickSize;
         string cycleId = $"cycle-{CycleNumber}";
         _buy = CreateLeg(cycleId, BuySell.Buy, buy.Price,
             direction == CycleDirection.Up ? _parameters.TrendRepriceThresholdB : _parameters.OppositeRepriceThresholdB,
@@ -147,7 +149,7 @@ internal sealed class QueueCycleOrderCoordinator
 
     internal void EvaluateReprices(MarketEvent book)
     {
-        if (FrozenBounds is null || IsFaulted) return;
+        if (_tickSize <= 0m || IsFaulted) return;
         EvaluateReprice(_buy, book);
         if (IsFaulted) return;
         EvaluateReprice(_sell, book);
@@ -163,7 +165,7 @@ internal sealed class QueueCycleOrderCoordinator
         _sell = null;
         FrozenDirection = CycleDirection.Neutral;
         FrozenAssessment = null;
-        FrozenBounds = null;
+        _tickSize = 0m;
         Phase = QueueCyclePhase.Ready;
         ReasonCode = "WarmupIncomplete";
         return true;
@@ -221,7 +223,7 @@ internal sealed class QueueCycleOrderCoordinator
         _exitRole = null;
         FrozenDirection = CycleDirection.Neutral;
         FrozenAssessment = null;
-        FrozenBounds = null;
+        _tickSize = 0m;
         Phase = QueueCyclePhase.CoolingDown;
         ReasonCode = "CoolingDown";
     }
@@ -402,7 +404,7 @@ internal sealed class QueueCycleOrderCoordinator
 
     private void EvaluateReprice(OrderLeg? leg, MarketEvent book)
     {
-        if (IsFaulted || leg is null || leg.State != LegState.Working || FrozenBounds is null) return;
+        if (IsFaulted || leg is null || leg.State != LegState.Working || _tickSize <= 0m) return;
         int samePriceAhead = QuantityAtPrice(leg.Side, book, leg.CurrentPrice);
         QueuePriceDecision decision = _pricing.EvaluateReprice(
             leg.Side,
@@ -411,7 +413,7 @@ internal sealed class QueueCycleOrderCoordinator
             samePriceAhead,
             leg.RepriceThresholdB,
             leg.RepriceTargetC,
-            FrozenBounds);
+            _tickSize);
         if (decision.Action != QueuePriceAction.Reprice) return;
 
         leg.PendingReplacementPrice = decision.Price;
