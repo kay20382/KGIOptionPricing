@@ -1,5 +1,6 @@
 using KGIOptionPricing.StrategyFramework;
 using KGIOptionPricing.StrategyFramework.Recovery;
+using KGIOptionPricing.StrategyFramework.Execution;
 using KGIOptionPricing.OrderManagement.Core;
 using KGIOptionPricing.StrategyFramework.Performance;
 
@@ -80,6 +81,61 @@ using (var runner = new StrategyInstanceRunner(
 }
 
 Console.WriteLine("PASS Task 1 strategy identity and checkpoint schema");
+
+string storeDirectory = Path.Combine(Path.GetTempPath(), "kgi-live-route-" + Guid.NewGuid().ToString("N"));
+Directory.CreateDirectory(storeDirectory);
+try
+{
+    var store = new LiveOrderOwnershipStore(storeDirectory);
+    LiveOrderOwnerKey ownerA = new("MR-A", 4, "entry-1");
+    LiveOrderOwnerKey ownerB = new("MR-B", 4, "entry-1");
+    store.Prepare(new LiveOrderOwnership { Key = ownerA, Account = "ACC", Symbol = "225MC-Z26", Quantity = 1 });
+    store.Prepare(new LiveOrderOwnership { Key = ownerB, Account = "ACC", Symbol = "225MC-Z26", Quantity = 1 });
+    try
+    {
+        store.Prepare(new LiveOrderOwnership { Key = ownerA, Account = "ACC", Symbol = "225MC-Z26", Quantity = 1 });
+        throw new InvalidOperationException("duplicate owner key was accepted");
+    }
+    catch (InvalidOperationException exception) when (exception.Message.Contains("owner", StringComparison.OrdinalIgnoreCase)) { }
+    store.BindAlias(ownerA, new BrokerOrderAlias("ACC", "20260923", "OrdNo", "ORD-1"));
+    try
+    {
+        store.BindAlias(ownerB, new BrokerOrderAlias("ACC", "20260923", "OrdNo", "ORD-1"));
+        throw new InvalidOperationException("duplicate broker alias was accepted");
+    }
+    catch (InvalidOperationException exception) when (exception.Message.Contains("alias", StringComparison.OrdinalIgnoreCase)) { }
+    Assert(store.TryAcceptFill(ownerA, "EXEC-1", 1).Accepted, "new exec id was not accepted");
+    Assert(!store.TryAcceptFill(ownerA, "EXEC-1", 1).Accepted, "duplicate exec id was accepted twice");
+    Assert(store.TryAcceptFill(ownerB, null, 1).Accepted, "new cumulative fill was not accepted");
+    Assert(!store.TryAcceptFill(ownerB, null, 1).Accepted, "unchanged cumulative watermark was accepted twice");
+    store.MarkSubmissionUnknown(ownerA, "gateway timeout");
+    store.Dispose();
+    File.AppendAllText(Path.Combine(storeDirectory, "ownership.jsonl"), "{\"Sequence\":");
+    using var restarted = new LiveOrderOwnershipStore(storeDirectory);
+    LiveOrderOwnership restoredUnknown = restarted.LoadOpenRoutes("ACC", "225MC-Z26").Single(x => x.Key == ownerA);
+    Assert(restoredUnknown.SubmissionState == StrategySubmissionState.Unknown, "submission unknown did not survive restart");
+    Assert(restarted.LoadOpenRoutes("ACC", "225MC-Z26").Count == 2, "valid routes were lost after truncated tail recovery");
+
+    string corruptDirectory = Path.Combine(Path.GetTempPath(), "kgi-live-route-corrupt-" + Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(corruptDirectory);
+    try
+    {
+        using (var clean = new LiveOrderOwnershipStore(corruptDirectory))
+            clean.Prepare(new LiveOrderOwnership { Key = ownerA, Account = "ACC", Symbol = "225MC-Z26", Quantity = 1 });
+        File.AppendAllText(Path.Combine(corruptDirectory, "ownership.jsonl"), "{\"Sequence\":2,\"broken\":true}\n");
+        using var corrupt = new LiveOrderOwnershipStore(corruptDirectory);
+        Assert(corrupt.Replay().IsQuarantined, "complete corrupted journal record did not quarantine ownership data");
+    }
+    finally
+    {
+        Directory.Delete(corruptDirectory, recursive: true);
+    }
+}
+finally
+{
+    Directory.Delete(storeDirectory, recursive: true);
+}
+Console.WriteLine("PASS Task 2 ownership journal persistence, idempotency and corruption handling");
 
 sealed class FakeRecoveryParticipant : IStrategyRecoveryParticipant
 {
