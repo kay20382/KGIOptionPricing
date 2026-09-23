@@ -286,6 +286,51 @@ Assert(restoredLedger.GetPosition("A", 1, "225MC-Z26").NetQuantity == 1,
     "strategy ledger checkpoint did not restore the exact run generation position");
 Console.WriteLine("PASS Task 4 strategy/account ledger separation and execution idempotency");
 
+var orderBookA = new ManagedStrategyOrderBook("A", 11);
+var orderBookB = new ManagedStrategyOrderBook("B", 11);
+string clientA = orderBookA.NextClientOrderId("EntryLong", "cycle-1");
+string clientB = orderBookB.NextClientOrderId("EntryLong", "cycle-1");
+Assert(clientA != clientB, "different strategy instances generated a colliding client order id");
+PaperOrderRequest managedRequestA = new()
+{
+    StrategyInstanceId = "A", StrategyRunGeneration = 11, ClientOrderId = clientA,
+    CycleId = "cycle-1", Generation = 3, Symbol = "225MC-Z26", Quantity = 1
+};
+orderBookA.Track(managedRequestA);
+orderBookA.Apply(new OrderLifecycleEvent
+{
+    StrategyInstanceId = "A", StrategyRunGeneration = 11, ClientOrderId = clientA,
+    CycleId = "cycle-1", Generation = 3, State = OrderLifecycleState.Cancelled
+});
+Assert(orderBookA.ActiveClientOrderIds.Count == 0, "cancel ack left an order active");
+Assert(orderBookA.Apply(new OrderLifecycleEvent
+{
+    StrategyInstanceId = "A", StrategyRunGeneration = 11, ClientOrderId = clientA,
+    CycleId = "cycle-1", Generation = 3, State = OrderLifecycleState.Filled, FilledQuantity = 1
+}), "late fill after cancel ack lost its original order route");
+ManagedOrderBookCheckpoint managedCheckpoint = orderBookA.Capture();
+var restoredOrderBook = new ManagedStrategyOrderBook("A", 11);
+restoredOrderBook.Restore(managedCheckpoint);
+Assert(restoredOrderBook.ActiveClientOrderIds.Count == 0 &&
+       restoredOrderBook.TryGet(clientA, out PaperOrderRequest? restoredRequest) &&
+       restoredRequest?.Generation == 3,
+    "managed order checkpoint did not preserve order generation and terminal lifecycle");
+Assert(restoredOrderBook.NextClientOrderId("EntryLong", "cycle-1") != clientA,
+    "restored managed order book reused an earlier client order id");
+try
+{
+    new ManagedStrategyOrderBook("A", 12).Restore(managedCheckpoint);
+    throw new InvalidOperationException("managed order checkpoint accepted another run generation");
+}
+catch (InvalidOperationException exception) when (exception.Message.Contains("generation", StringComparison.OrdinalIgnoreCase)) { }
+try
+{
+    StrategyLiveCapabilityGate.EnsureLiveCapable(strategy);
+    throw new InvalidOperationException("legacy strategy unexpectedly passed the live capability gate");
+}
+catch (InvalidOperationException exception) when (exception.Message.Contains(nameof(IManagedOrderStrategy), StringComparison.Ordinal)) { }
+Console.WriteLine("PASS Task 5 managed order lifecycle and checkpoint helper");
+
 sealed class FakeRecoveryParticipant : IStrategyRecoveryParticipant
 {
     public string StrategyType => "Fake";

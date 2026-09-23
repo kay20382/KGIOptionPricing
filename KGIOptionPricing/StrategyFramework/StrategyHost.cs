@@ -435,8 +435,10 @@ public sealed class StrategyHost : IDisposable
         ResolvedStrategyUniverse universe,
         decimal commissionPerContract = 0m,
         IStrategyExecutionService? executionService = null,
-        long? strategyRunGeneration = null)
+        long? strategyRunGeneration = null,
+        bool requireLiveCapabilities = false)
     {
+        if (requireLiveCapabilities) StrategyLiveCapabilityGate.EnsureLiveCapable(strategy);
         lock (_sync)
         {
             if (_disposed || _disposing) throw new ObjectDisposedException(nameof(StrategyHost));
