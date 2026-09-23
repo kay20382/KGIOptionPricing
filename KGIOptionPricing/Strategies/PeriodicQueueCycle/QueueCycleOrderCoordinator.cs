@@ -180,7 +180,12 @@ internal sealed class QueueCycleOrderCoordinator
         CancelWithoutReplacement(_sell, CancelIntent.Exit);
     }
 
-    internal bool TrySubmitExit(PositionSnapshot position, PaperOrderRole role, decimal price, string reasonCode)
+    internal bool TrySubmitExit(
+        PositionSnapshot position,
+        PaperOrderRole role,
+        PaperOrderType type,
+        decimal price,
+        string reasonCode)
     {
         if (IsFaulted || !EntryOrdersTerminal || _exitClientOrderId is not null ||
             position.NetQuantity == 0 || price <= 0m)
@@ -199,7 +204,7 @@ internal sealed class QueueCycleOrderCoordinator
             StrategyInstanceId = _instanceId,
             Symbol = _symbol,
             Side = position.NetQuantity > 0 ? BuySell.Sell : BuySell.Buy,
-            Type = PaperOrderType.Market,
+            Type = type,
             Role = role,
             Price = price,
             Quantity = Math.Abs(position.NetQuantity)

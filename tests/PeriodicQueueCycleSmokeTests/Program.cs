@@ -51,6 +51,7 @@ TestPeriodicStrategyStopsRepriceEvaluationAfterFirstRouteFailure();
 TestPeriodicStrategyFaultsOnLateFillFromRetiredCycle();
 TestPeriodicStrategyDoesNotStartCycleWithExistingPosition();
 TestPeriodicStrategyFixedStopsUseLedgerAndWaitForPeerTerminal();
+TestPeriodicFixedStopWaitsForFreshCounterpartyQuote();
 TestPeriodicStrategyOneLegTimeoutHasExactBoundaryAndFlattens();
 TestPeriodicStrategyUnhealthyBookRecoversOrFlattensWithoutFalseStop();
 TestPeriodicStrategyCancelFillRaceRereadsLedgerBeforeExit();
@@ -1483,8 +1484,10 @@ static void TestPeriodicStrategyFixedStopsUseLedgerAndWaitForPeerTerminal()
 
         strategy.OnOrderLifecycle(Cancelled(peerId, strategy.InstanceId, clock.Now));
         PaperOrderRequest exit = orders.Single(x => x.Role == PaperOrderRole.StopLoss);
-        Assert(exit.Side != filledSide && exit.Quantity == 1,
-            $"{filledSide} 固定停損必須以共用帳本淨部位發出恰一張反向單");
+        decimal expectedCounterpartyPrice = filledSide == BuySell.Buy ? adverse.BestBid : adverse.BestAsk;
+        Assert(exit.Side != filledSide && exit.Quantity == 1 &&
+               exit.Type == PaperOrderType.BrokerLimit && exit.Price == expectedCounterpartyPrice,
+            $"{filledSide} 固定停損必須以共用帳本淨部位、對手價 BrokerLimit 發出恰一張反向單");
         Assert(strategy.GetSnapshot().Reason.Contains("FixedStopLoss", StringComparison.Ordinal),
             "固定反向價格退出必須使用穩定原因 FixedStopLoss");
         strategy.OnOrderLifecycle(Cancelled(peerId, strategy.InstanceId, clock.Now));
@@ -1498,6 +1501,34 @@ static void TestPeriodicStrategyFixedStopsUseLedgerAndWaitForPeerTerminal()
         Assert(strategy.State == StrategyLifecycleState.WarmingUp,
             "固定停損 60 秒冷卻結束後必須清空舊方向窗重新暖機");
     }
+}
+
+static void TestPeriodicFixedStopWaitsForFreshCounterpartyQuote()
+{
+    DateTimeOffset start = new(2026, 9, 23, 6, 30, 0, TimeSpan.Zero);
+    var ledger = new KGIOptionPricing.StrategyFramework.Performance.PaperPortfolioLedger();
+    (PeriodicQueueCycleStrategy strategy, MutableClock clock, List<PaperOrderRequest> orders) =
+        StartWorkingUpStrategy("fixed-stop-fresh-quote", RiskParameters(), start, ledger);
+    var cancels = new List<string>();
+    strategy.CancelOrderRequested += cancels.Add;
+    PaperOrderRequest buy = orders.Single(x => x.Side == BuySell.Buy);
+    ApplyFill(strategy, ledger, buy, 200m, clock.Now);
+
+    clock.Advance(clock.Now.AddSeconds(1));
+    strategy.OnMarketEvent(StrategyBook(170m, 175m, 20, 10, 3, clock.Now));
+    string peerId = orders.Single(x => x.Side == BuySell.Sell).ClientOrderId;
+    Assert(cancels.SequenceEqual(new[] { peerId }, StringComparer.Ordinal),
+        "固定停損必須先撤銷 peer 完成單");
+
+    clock.Advance(clock.Now.AddSeconds(3));
+    strategy.OnOrderLifecycle(Cancelled(peerId, strategy.InstanceId, clock.Now));
+    Assert(orders.Count == 2,
+        "取消確認時的健康報價已過期，固定停損不得沿用舊對手價送出委託");
+
+    strategy.OnMarketEvent(StrategyBook(165m, 170m, 20, 10, 4, clock.Now));
+    PaperOrderRequest exit = orders.Single(x => x.Role == PaperOrderRole.StopLoss);
+    Assert(exit.Type == PaperOrderType.BrokerLimit && exit.Side == BuySell.Sell && exit.Price == 165m,
+        "下一筆健康行情到達後，固定停損必須以該筆最佳買價賣出");
 }
 
 static void TestPeriodicStrategyOneLegTimeoutHasExactBoundaryAndFlattens()

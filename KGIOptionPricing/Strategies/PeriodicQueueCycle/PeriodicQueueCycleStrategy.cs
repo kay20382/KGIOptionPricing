@@ -596,10 +596,21 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
         if (!_coordinator.EntryOrdersTerminal || _exitRequested) return;
 
         MarketEvent? priceBook = _lastHealthyBook;
+        if (_pendingExitRole == PaperOrderRole.StopLoss && !HasFreshCounterpartyQuote(priceBook))
+            return;
+
         decimal price = position.NetQuantity > 0 ? priceBook?.BestBid ?? 0m : priceBook?.BestAsk ?? 0m;
-        if (price <= 0m) price = position.AveragePrice;
+        if (price <= 0m)
+        {
+            if (_pendingExitRole == PaperOrderRole.StopLoss) return;
+            price = position.AveragePrice;
+        }
+
+        PaperOrderType type = _pendingExitRole == PaperOrderRole.StopLoss
+            ? PaperOrderType.BrokerLimit
+            : PaperOrderType.Market;
         _exitRequested = _coordinator.TrySubmitExit(
-            position, _pendingExitRole.Value, price, _pendingExitReason ?? "RiskExit");
+            position, _pendingExitRole.Value, type, price, _pendingExitReason ?? "RiskExit");
         if (_exitRequested) _reason = _pendingExitReason ?? "RiskExit";
     }
 
@@ -645,6 +656,16 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
             State = _paused ? StrategyLifecycleState.Suspended : StrategyLifecycleState.Running;
             if (_pendingExitReason is not null) _reason = _pendingExitReason;
         }
+    }
+
+    private bool HasFreshCounterpartyQuote(MarketEvent? book)
+    {
+        if (_context is null || book is null || book.Kind != MarketEventKind.Book ||
+            book.BestBid <= 0m || book.BestAsk <= 0m || book.BestBid >= book.BestAsk)
+            return false;
+
+        decimal ageSeconds = (decimal)(_context.Clock.Now - book.Timestamp).Ticks / TimeSpan.TicksPerSecond;
+        return ageSeconds >= 0m && ageSeconds <= _parameters.QuoteFreshnessSeconds;
     }
 
     private static bool IsHealthFailure(string reasonCode) => reasonCode is
