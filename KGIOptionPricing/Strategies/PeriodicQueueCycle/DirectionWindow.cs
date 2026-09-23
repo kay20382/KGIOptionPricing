@@ -21,6 +21,16 @@ public sealed record DirectionAssessment(
     IReadOnlyList<string> OtherFailedReasonCodes,
     IReadOnlyList<ThresholdResult> Thresholds);
 
+internal sealed record DirectionWindowSample(long UtcSecond, long Sequence, DateTimeOffset Timestamp,
+    decimal MidPrice, decimal DepthObi, decimal BidDepth, decimal AskDepth, decimal BidNearDepth,
+    decimal AskNearDepth, decimal SpreadPrice);
+internal sealed record DirectionWindowObservation(long UtcSecond, DateTimeOffset Timestamp, long Sequence);
+internal sealed record DirectionWindowRejection(DateTimeOffset Timestamp, long Sequence, string PrimaryReasonCode,
+    IReadOnlyList<string> OtherFailedReasonCodes, IReadOnlyList<ThresholdResult> Thresholds,
+    decimal SpreadTicks, decimal VolatilityTicks);
+internal sealed record DirectionWindowCheckpoint(IReadOnlyList<DirectionWindowSample> Samples,
+    IReadOnlyList<DirectionWindowObservation> Observations, DirectionWindowRejection? LastRejection);
+
 public sealed class DirectionWindow
 {
     private readonly decimal _tickSize;
@@ -38,6 +48,31 @@ public sealed class DirectionWindow
 
     public int SampleCount => _samples.Count;
     public long LatestSequence => _samples.Count == 0 ? 0L : _samples.Values.Last().Sequence;
+
+    internal DirectionWindowCheckpoint Capture() => new(
+        _samples.Select(x => new DirectionWindowSample(x.Key, x.Value.Sequence, x.Value.Timestamp,
+            x.Value.MidPrice, x.Value.DepthObi, x.Value.BidDepth, x.Value.AskDepth,
+            x.Value.BidNearDepth, x.Value.AskNearDepth, x.Value.SpreadPrice)).ToArray(),
+        _observedIdentities.Select(x => new DirectionWindowObservation(x.Key, x.Value.Timestamp, x.Value.Sequence)).ToArray(),
+        _lastRejection is null ? null : new DirectionWindowRejection(_lastRejection.Timestamp,
+            _lastRejection.Sequence, _lastRejection.PrimaryReasonCode, _lastRejection.OtherFailedReasonCodes,
+            _lastRejection.Thresholds, _lastRejection.SpreadTicks, _lastRejection.VolatilityTicks));
+
+    internal void Restore(DirectionWindowCheckpoint checkpoint)
+    {
+        ArgumentNullException.ThrowIfNull(checkpoint);
+        _samples.Clear(); _observedIdentities.Clear();
+        foreach (DirectionWindowSample x in checkpoint.Samples)
+            _samples[x.UtcSecond] = new Sample(x.UtcSecond, x.Sequence, x.Timestamp, x.MidPrice,
+                x.DepthObi, x.BidDepth, x.AskDepth, x.BidNearDepth, x.AskNearDepth, x.SpreadPrice);
+        foreach (DirectionWindowObservation x in checkpoint.Observations)
+            _observedIdentities[x.UtcSecond] = new ObservedIdentity(x.Timestamp, x.Sequence);
+        _lastRejection = checkpoint.LastRejection is null ? null : new Rejection(
+            checkpoint.LastRejection.Timestamp, checkpoint.LastRejection.Sequence,
+            checkpoint.LastRejection.PrimaryReasonCode, checkpoint.LastRejection.OtherFailedReasonCodes,
+            checkpoint.LastRejection.Thresholds, checkpoint.LastRejection.SpreadTicks,
+            checkpoint.LastRejection.VolatilityTicks);
+    }
 
     public bool TryAdd(MarketEvent item, DateTimeOffset now)
     {

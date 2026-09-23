@@ -44,3 +44,7 @@ Setup:
 
 - Task 6 ruling: keep legacy direct `OnExecution` test/simulation callbacks usable when they omit a cycle id by allocating the next local cycle only if this run has no current cycle; routed live callbacks retain their exact CycleId. Cost if wrong: direct callers must not replay an old unscoped execution after a later cycle has begun; managed live routing always supplies cycle and run identity.
 - Task 6: all three strategies now implement managed order, exact-cancel observer and recovery participant contracts; order requests carry client/cycle/run identity; exit/cancel/reject lifecycle updates remain order-scoped; checkpoints capture indicators/windows, current position-protection/cooldown flags and working order book. Recovery, strategy-framework, and Nikkei smoke suites pass; serialized round-trip was tested after market samples populated state. Signal equations and parameter defaults are unchanged.
+
+## Task 7: Migrate Mini Lead, OrderBook Trend and PQC
+
+- Task 7: all three now implement managed order observation and versioned recovery checkpoints; PQC preserves order repricing `Generation` separately from `StrategyRunGeneration` and captures direction samples, both live legs, one-leg timer, cooldown and stop state. All three restore paused and require explicit Resume. Mini Lead, OrderBook, PQC and aggregate recovery smoke suites pass. Strategy parameter defaults and pricing logic remain unchanged.

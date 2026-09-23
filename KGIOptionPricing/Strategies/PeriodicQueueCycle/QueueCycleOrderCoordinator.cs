@@ -22,8 +22,18 @@ internal enum QueueCyclePhase
 
 internal sealed class QueueCycleOrderCoordinator
 {
-    private enum LegState { Working, CancelPending, Filled, Cancelled }
-    private enum CancelIntent { None, Reprice, Exit, LateFillSafety, Fault }
+    internal enum LegState { Working, CancelPending, Filled, Cancelled }
+    internal enum CancelIntent { None, Reprice, Exit, LateFillSafety, Fault }
+
+    internal sealed record OrderLegCheckpoint(BuySell Side, string CycleId, int RepriceThresholdB,
+        int RepriceTargetC, int Generation, decimal CurrentPrice, string ClientOrderId,
+        string[] ClientOrderIds, string[] FilledClientOrderIds, LegState State, bool Submitted,
+        bool HasFill, decimal? PendingReplacementPrice, CancelIntent CancelIntent);
+    internal sealed record QueueCycleCoordinatorCheckpoint(QueueCyclePhase Phase, string ReasonCode,
+        long CycleNumber, CycleDirection FrozenDirection, DirectionAssessment? FrozenAssessment,
+        OrderLegCheckpoint? Buy, OrderLegCheckpoint? Sell, string[] RetiredClientOrderIds,
+        string[] RetiredFilledClientOrderIds, string? ExitClientOrderId, LegState ExitState,
+        PaperOrderRole? ExitRole, long ExitSequence, decimal TickSize);
 
     private sealed class OrderLeg
     {
@@ -44,6 +54,7 @@ internal sealed class QueueCycleOrderCoordinator
     }
 
     private readonly string _instanceId;
+    private readonly long _strategyRunGeneration;
     private readonly string _symbol;
     private readonly PeriodicQueueCycleParameters _parameters;
     private readonly QueueCyclePricingPolicy _pricing = new();
@@ -60,9 +71,11 @@ internal sealed class QueueCycleOrderCoordinator
     internal QueueCycleOrderCoordinator(
         string instanceId,
         string symbol,
-        PeriodicQueueCycleParameters parameters)
+        PeriodicQueueCycleParameters parameters,
+        long strategyRunGeneration = 1)
     {
         _instanceId = instanceId;
+        _strategyRunGeneration = strategyRunGeneration;
         _symbol = symbol;
         _parameters = parameters;
     }
@@ -93,6 +106,43 @@ internal sealed class QueueCycleOrderCoordinator
         $"Cycle={_buy?.CycleId ?? "none"};Direction={FrozenDirection};" +
         $"Buy={LegSummary(_buy)};Sell={LegSummary(_sell)};" +
         $"Exit={_exitClientOrderId ?? "none"},{_exitRole?.ToString() ?? "none"},{_exitState}";
+
+    internal QueueCycleCoordinatorCheckpoint Capture() => new(Phase, ReasonCode, CycleNumber,
+        FrozenDirection, FrozenAssessment, SaveLeg(_buy), SaveLeg(_sell), _retiredClientOrderIds.ToArray(),
+        _retiredFilledClientOrderIds.ToArray(), _exitClientOrderId, _exitState, _exitRole, _exitSequence, _tickSize);
+
+    internal void Restore(QueueCycleCoordinatorCheckpoint checkpoint)
+    {
+        ArgumentNullException.ThrowIfNull(checkpoint);
+        Phase = checkpoint.Phase; ReasonCode = checkpoint.ReasonCode; CycleNumber = checkpoint.CycleNumber;
+        FrozenDirection = checkpoint.FrozenDirection; FrozenAssessment = checkpoint.FrozenAssessment;
+        _buy = LoadLeg(checkpoint.Buy); _sell = LoadLeg(checkpoint.Sell);
+        _retiredClientOrderIds.Clear(); foreach (string id in checkpoint.RetiredClientOrderIds) _retiredClientOrderIds.Add(id);
+        _retiredFilledClientOrderIds.Clear(); foreach (string id in checkpoint.RetiredFilledClientOrderIds) _retiredFilledClientOrderIds.Add(id);
+        _exitClientOrderId = checkpoint.ExitClientOrderId; _exitState = checkpoint.ExitState;
+        _exitRole = checkpoint.ExitRole; _exitSequence = checkpoint.ExitSequence; _tickSize = checkpoint.TickSize;
+    }
+
+    private static OrderLegCheckpoint? SaveLeg(OrderLeg? leg) => leg is null ? null : new OrderLegCheckpoint(
+        leg.Side, leg.CycleId, leg.RepriceThresholdB, leg.RepriceTargetC, leg.Generation,
+        leg.CurrentPrice, leg.ClientOrderId, leg.ClientOrderIds.ToArray(), leg.FilledClientOrderIds.ToArray(),
+        leg.State, leg.Submitted, leg.HasFill, leg.PendingReplacementPrice, leg.CancelIntent);
+
+    private static OrderLeg? LoadLeg(OrderLegCheckpoint? saved)
+    {
+        if (saved is null) return null;
+        var leg = new OrderLeg
+        {
+            Side = saved.Side, CycleId = saved.CycleId, RepriceThresholdB = saved.RepriceThresholdB,
+            RepriceTargetC = saved.RepriceTargetC, Generation = saved.Generation, CurrentPrice = saved.CurrentPrice,
+            ClientOrderId = saved.ClientOrderId, State = saved.State, Submitted = saved.Submitted,
+            HasFill = saved.HasFill, PendingReplacementPrice = saved.PendingReplacementPrice,
+            CancelIntent = saved.CancelIntent
+        };
+        foreach (string id in saved.ClientOrderIds) leg.ClientOrderIds.Add(id);
+        foreach (string id in saved.FilledClientOrderIds) leg.FilledClientOrderIds.Add(id);
+        return leg;
+    }
 
     internal event Action<PaperOrderRequest>? OrderRequested;
     internal event Action<string>? CancelOrderRequested;
@@ -197,7 +247,7 @@ internal sealed class QueueCycleOrderCoordinator
             position.NetQuantity == 0 || price <= 0m)
             return false;
 
-        _exitClientOrderId = $"{_instanceId}-cycle-{CycleNumber}-exit-{++_exitSequence}";
+        _exitClientOrderId = $"{_instanceId}-run-{_strategyRunGeneration}-cycle-{CycleNumber}-exit-{++_exitSequence}";
         _exitState = LegState.Working;
         _exitRole = role;
         Phase = QueueCyclePhase.Flattening;
@@ -207,6 +257,7 @@ internal sealed class QueueCycleOrderCoordinator
             ClientOrderId = _exitClientOrderId,
             CycleId = $"cycle-{CycleNumber}",
             Generation = 1,
+            StrategyRunGeneration = _strategyRunGeneration,
             StrategyInstanceId = _instanceId,
             Symbol = _symbol,
             Side = position.NetQuantity > 0 ? BuySell.Sell : BuySell.Buy,
@@ -560,6 +611,7 @@ internal sealed class QueueCycleOrderCoordinator
         ClientOrderId = leg.ClientOrderId,
         CycleId = leg.CycleId,
         Generation = leg.Generation,
+        StrategyRunGeneration = _strategyRunGeneration,
         StrategyInstanceId = _instanceId,
         Symbol = _symbol,
         Side = leg.Side,
@@ -570,7 +622,7 @@ internal sealed class QueueCycleOrderCoordinator
     };
 
     private string ClientOrderId(string cycleId, BuySell side, int generation) =>
-        $"{_instanceId}-{cycleId}-{(side == BuySell.Buy ? "buy" : "sell")}-g{generation}";
+        $"{_instanceId}-run-{_strategyRunGeneration}-{cycleId}-{(side == BuySell.Buy ? "buy" : "sell")}-g{generation}";
 
     private static bool IsOutstanding(OrderLeg? leg) =>
         leg is { Submitted: true, State: LegState.Working or LegState.CancelPending };

@@ -6,6 +6,9 @@ using KGIOptionPricing.StrategyFramework.Performance;
 using KGIOptionPricing.Strategies.MeanReversionScalper;
 using KGIOptionPricing.Strategies.WaveletScalper;
 using KGIOptionPricing.Strategies.NikkeiMicrostructureAlpha;
+using KGIOptionPricing.Strategies.MiniLeadMicro;
+using KGIOptionPricing.Strategies.OrderBookTrend;
+using KGIOptionPricing.Strategies.PeriodicQueueCycle;
 
 static void Assert(bool condition, string message)
 {
@@ -385,6 +388,27 @@ foreach (ISimulationStrategy migrated in firstMigratedStrategies)
         $"{migrated.StrategyType} did not restore safely before Start without replaying entry logic");
 }
 Console.WriteLine("PASS Task 6 MR, MODWT and Nikkei use uniform managed-order/recovery contracts");
+
+IStrategyFactory[] finalFactories =
+{
+    new MiniLeadMicroFactory(), new OrderBookTrendFactory(), new PeriodicQueueCycleFactory()
+};
+foreach (IStrategyFactory factory in finalFactories)
+{
+    ISimulationStrategy original = factory.Create(new StrategyDefinition { StrategyType = factory.StrategyType, InstanceId = factory.StrategyType + "-recovery" });
+    StrategyLiveCapabilityGate.EnsureLiveCapable(original);
+    original.Start(new StrategyRuntimeContext(sharedUniverse, new SystemStrategyClock(), new PaperPortfolioLedger(), 29));
+    StrategyRecoveryCheckpoint task7Checkpoint = ((IStrategyRecoveryParticipant)original).CaptureRecoveryCheckpoint();
+    ISimulationStrategy restored = factory.Create(new StrategyDefinition { StrategyType = factory.StrategyType, InstanceId = original.InstanceId });
+    ((IStrategyRecoveryParticipant)restored).RestoreRecoveryCheckpoint(task7Checkpoint);
+    restored.Start(new StrategyRuntimeContext(sharedUniverse, new SystemStrategyClock(), new PaperPortfolioLedger(), 29));
+    Assert(restored.State == StrategyLifecycleState.Suspended &&
+           ((IStrategyRecoveryParticipant)restored).CaptureRecoveryCheckpoint().StrategyRunGeneration == 29,
+        $"{factory.StrategyType} must restore paused with the same run generation");
+    Assert(original is IManagedOrderSubmissionObserver && original is IStrategyRecoveryParticipant,
+        $"{factory.StrategyType} is missing uniform order observation/recovery capability");
+}
+Console.WriteLine("PASS Task 7 Mini Lead, OrderBook Trend and PQC use uniform managed-order/recovery contracts and restart paused");
 
 sealed class FakeRecoveryParticipant : IStrategyRecoveryParticipant
 {

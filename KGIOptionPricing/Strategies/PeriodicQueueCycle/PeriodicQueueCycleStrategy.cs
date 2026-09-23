@@ -1,9 +1,18 @@
+using System.Text.Json;
 using KGIOptionPricing.StrategyFramework;
+using KGIOptionPricing.StrategyFramework.Recovery;
 
 namespace KGIOptionPricing.Strategies.PeriodicQueueCycle;
 
-public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOrderStrategy, IStrategyHeartbeat, IStrategyDecisionSource
+public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOrderStrategy, IManagedOrderSubmissionObserver, IStrategyRecoveryParticipant, IStrategyHeartbeat, IStrategyDecisionSource
 {
+    private sealed record RecoveryState(ManagedOrderBookCheckpoint OrderBook, DirectionWindowCheckpoint? DirectionWindow,
+        QueueCycleOrderCoordinator.QueueCycleCoordinatorCheckpoint? Coordinator, MarketEvent? LastBook, MarketEvent? LastHealthyBook,
+        DateTimeOffset? LastObservedBookTimestamp, long LastObservedBookSequence, string Reason, int OppositeDirectionSeconds,
+        long LastOppositeUtcSecond, bool Paused, bool StopRequested, string StopReason, DateTimeOffset? OneLegStartedAt,
+        DateTimeOffset? UnhealthySince, DateTimeOffset? CooldownUntil, PaperOrderRole? PendingExitRole,
+        string? PendingExitReason, int PendingCooldownSeconds, bool ExitRequested, decimal FixedStopPrice,
+        string ActiveCandidateId, bool AcceptDecisionPending, StrategyLifecycleState State);
     private readonly StrategyDefinition _definition;
     private readonly PeriodicQueueCycleParameters _parameters;
     private StrategyRuntimeContext? _context;
@@ -30,6 +39,10 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
     private decimal _fixedStopPrice;
     private string _activeCandidateId = string.Empty;
     private bool _acceptDecisionPending;
+    private long _strategyRunGeneration;
+    private ManagedStrategyOrderBook? _managedOrderBook;
+    private bool _restoreBeforeStart;
+    public string RecoverySchema => "periodic-queue-cycle/v1";
 
     internal PeriodicQueueCycleStrategy(
         StrategyDefinition definition,
@@ -52,18 +65,41 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
     public void Start(StrategyRuntimeContext context)
     {
         ArgumentNullException.ThrowIfNull(context);
-        if (State != StrategyLifecycleState.Created) throw new InvalidOperationException("策略已啟動。");
+        if (State != StrategyLifecycleState.Created && !_restoreBeforeStart) throw new InvalidOperationException("策略已啟動。");
         if (context.Universe.Tradable.TickSize <= 0m)
             throw new ArgumentException("交易商品 TickSize 必須大於零。", nameof(context));
 
         _context = context;
+        if (_restoreBeforeStart)
+        {
+            if (_strategyRunGeneration != context.StrategyRunGeneration)
+                throw new InvalidOperationException("Restored PQC run generation does not match runtime context.");
+        }
+        else _strategyRunGeneration = context.StrategyRunGeneration;
+        _managedOrderBook ??= new ManagedStrategyOrderBook(InstanceId, context.StrategyRunGeneration);
+        if (_managedOrderBook.StrategyRunGeneration != context.StrategyRunGeneration)
+            throw new InvalidOperationException("PQC managed order book generation mismatch.");
         _directionWindow = new DirectionWindow(context.Universe.Tradable.TickSize, _parameters);
         _coordinator = new QueueCycleOrderCoordinator(
-            InstanceId, context.Universe.Tradable.Symbol, _parameters);
+            InstanceId, context.Universe.Tradable.Symbol, _parameters, context.StrategyRunGeneration);
+        if (_restoreBeforeStart && _restoreCoordinator is not null)
+            _coordinator.Restore(_restoreCoordinator);
+        if (_restoreBeforeStart && _restoreDirectionWindow is not null)
+            _directionWindow.Restore(_restoreDirectionWindow);
         _coordinator.OrderRequested += ForwardOrder;
         _coordinator.CancelOrderRequested += ForwardCancel;
-        State = StrategyLifecycleState.WarmingUp;
-        _reason = "WarmupIncomplete";
+        if (_restoreBeforeStart)
+        {
+            _paused = true;
+            State = StrategyLifecycleState.Suspended;
+            _reason = "RecoveryAwaitingResume";
+        }
+        else
+        {
+            State = StrategyLifecycleState.WarmingUp;
+            _reason = "WarmupIncomplete";
+        }
+        _restoreBeforeStart = false;
         Publish();
     }
 
@@ -316,6 +352,7 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
     public void OnOrderLifecycle(OrderLifecycleEvent orderEvent)
     {
         if (!string.Equals(orderEvent.StrategyInstanceId, InstanceId, StringComparison.OrdinalIgnoreCase)) return;
+        _managedOrderBook?.Apply(orderEvent);
         _coordinator?.OnOrderLifecycle(orderEvent);
         _reason = _coordinator?.ReasonCode ?? _reason;
         ApplyCoordinatorState();
@@ -323,6 +360,48 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
         TryCompleteCycle();
         TryCompleteStop();
         Publish();
+    }
+
+    private QueueCycleOrderCoordinator.QueueCycleCoordinatorCheckpoint? _restoreCoordinator;
+    private DirectionWindowCheckpoint? _restoreDirectionWindow;
+
+    public void OnOrderSubmitted(PaperOrderRequest request) => _managedOrderBook?.Track(request);
+
+    public StrategyRecoveryCheckpoint CaptureRecoveryCheckpoint()
+    {
+        if (_strategyRunGeneration <= 0) throw new InvalidOperationException("PQC has no strategy run generation to checkpoint.");
+        var state = new RecoveryState(_managedOrderBook?.Capture() ?? new ManagedOrderBookCheckpoint(InstanceId,
+                _strategyRunGeneration, 0, Array.Empty<ManagedOrderRecord>()),
+            _directionWindow?.Capture(), _coordinator?.Capture(), _lastBook, _lastHealthyBook,
+            _lastObservedBookTimestamp, _lastObservedBookSequence, _reason, _oppositeDirectionSeconds,
+            _lastOppositeUtcSecond, _paused, _stopRequested, _stopReason, _oneLegStartedAt, _unhealthySince,
+            _cooldownUntil, _pendingExitRole, _pendingExitReason, _pendingCooldownSeconds, _exitRequested,
+            _fixedStopPrice, _activeCandidateId, _acceptDecisionPending, State);
+        return new StrategyRecoveryCheckpoint(StrategyType, InstanceId, _strategyRunGeneration, RecoverySchema,
+            _context?.Clock.Now ?? DateTimeOffset.Now, JsonSerializer.Serialize(state));
+    }
+
+    public void RestoreRecoveryCheckpoint(StrategyRecoveryCheckpoint checkpoint)
+    {
+        long expectedRun = _context?.StrategyRunGeneration ?? checkpoint.StrategyRunGeneration;
+        StrategyRecoveryCheckpointValidator.EnsureCompatible(checkpoint, StrategyType, InstanceId, expectedRun, RecoverySchema);
+        RecoveryState saved = JsonSerializer.Deserialize<RecoveryState>(checkpoint.PayloadJson)
+            ?? throw new InvalidOperationException("PQC recovery payload is empty.");
+        _strategyRunGeneration = checkpoint.StrategyRunGeneration;
+        _managedOrderBook = new ManagedStrategyOrderBook(InstanceId, _strategyRunGeneration);
+        _managedOrderBook.Restore(saved.OrderBook);
+        _lastBook = saved.LastBook; _lastHealthyBook = saved.LastHealthyBook;
+        _lastObservedBookTimestamp = saved.LastObservedBookTimestamp; _lastObservedBookSequence = saved.LastObservedBookSequence;
+        _reason = saved.Reason; _oppositeDirectionSeconds = saved.OppositeDirectionSeconds;
+        _lastOppositeUtcSecond = saved.LastOppositeUtcSecond; _paused = saved.Paused;
+        _stopRequested = saved.StopRequested; _stopReason = saved.StopReason; _oneLegStartedAt = saved.OneLegStartedAt;
+        _unhealthySince = saved.UnhealthySince; _cooldownUntil = saved.CooldownUntil;
+        _pendingExitRole = saved.PendingExitRole; _pendingExitReason = saved.PendingExitReason;
+        _pendingCooldownSeconds = saved.PendingCooldownSeconds; _exitRequested = saved.ExitRequested;
+        _fixedStopPrice = saved.FixedStopPrice; _activeCandidateId = saved.ActiveCandidateId;
+        _acceptDecisionPending = saved.AcceptDecisionPending; State = saved.State;
+        _restoreCoordinator = saved.Coordinator; _restoreDirectionWindow = saved.DirectionWindow;
+        _restoreBeforeStart = true;
     }
 
     public void Pause(string reason)
