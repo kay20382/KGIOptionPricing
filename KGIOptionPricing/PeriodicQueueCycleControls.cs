@@ -45,12 +45,12 @@ public sealed class PeriodicQueueCycleControls : FlowLayoutPanel
         AddNumber("StopLossCooldownSeconds", "停損冷卻秒", 60, 0, 3600);
         AddNumber("ShockCooldownSeconds", "震盪冷卻秒", 45, 0, 3600);
         AddNumber("MarketDataRecoverySeconds", "資料恢復秒", 2, 0, 60);
-        AddNumber("TrendInitialAheadA", "順勢 A", 22, 0, 1_000_000);
-        AddNumber("TrendRepriceThresholdB", "順勢 B", 49, 0, 1_000_000);
-        AddNumber("TrendRepriceTargetC", "順勢 C", 22, 0, 1_000_000);
-        AddNumber("OppositeInitialAheadA", "反向 A", 240, 0, 1_000_000);
-        AddNumber("OppositeRepriceThresholdB", "反向 B", 312, 0, 1_000_000);
-        AddNumber("OppositeRepriceTargetC", "反向 C", 22, 0, 1_000_000);
+        AddNumber("TrendInitialAheadA", "順勢 A", 100, 0, 1_000_000);
+        AddNumber("TrendRepriceThresholdB", "順勢 B", 200, 0, 1_000_000);
+        AddNumber("TrendRepriceTargetC", "順勢 C", 100, 0, 1_000_000);
+        AddNumber("OppositeInitialAheadA", "反向 A", 600, 0, 1_000_000);
+        AddNumber("OppositeRepriceThresholdB", "反向 B", 700, 0, 1_000_000);
+        AddNumber("OppositeRepriceTargetC", "反向 C", 600, 0, 1_000_000);
         Add("每口每次費", Commission);
         if (live)
         {

@@ -96,12 +96,12 @@ public sealed class PeriodicQueueCycleParameters
             MarketDataRecoverySeconds = ReadDecimal(source, "MarketDataRecoverySeconds", 2m, 0.1m, 30m),
             CommissionPerContract = ReadNonNegativeDecimal(source, "CommissionPerContract", 36m),
             ResearchValidated = ReadBoolean(source, "ResearchValidated", false),
-            TrendInitialAheadA = ReadNonNegativeInt(source, "TrendInitialAheadA", 22),
-            TrendRepriceThresholdB = ReadPositiveInt(source, "TrendRepriceThresholdB", 49),
-            TrendRepriceTargetC = ReadNonNegativeInt(source, "TrendRepriceTargetC", 22),
-            OppositeInitialAheadA = ReadNonNegativeInt(source, "OppositeInitialAheadA", 240),
-            OppositeRepriceThresholdB = ReadPositiveInt(source, "OppositeRepriceThresholdB", 312),
-            OppositeRepriceTargetC = ReadNonNegativeInt(source, "OppositeRepriceTargetC", 22)
+            TrendInitialAheadA = ReadNonNegativeInt(source, "TrendInitialAheadA", 100),
+            TrendRepriceThresholdB = ReadPositiveInt(source, "TrendRepriceThresholdB", 200),
+            TrendRepriceTargetC = ReadNonNegativeInt(source, "TrendRepriceTargetC", 100),
+            OppositeInitialAheadA = ReadNonNegativeInt(source, "OppositeInitialAheadA", 600),
+            OppositeRepriceThresholdB = ReadPositiveInt(source, "OppositeRepriceThresholdB", 700),
+            OppositeRepriceTargetC = ReadNonNegativeInt(source, "OppositeRepriceTargetC", 600)
         };
 
         if (result.ObiConfirmSeconds > result.DirectionWindowSeconds)

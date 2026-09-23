@@ -197,8 +197,16 @@ static void TestPeriodicControlSurfaceDefaultsAndResearchGate()
             Assert(simulationDefinition.StrategyType == PeriodicQueueCycleFactory.TypeName &&
                    simulationDefinition.Parameters["MaxOneLegSeconds"] == "30" &&
                    simulationDefinition.Parameters["CycleCooldownSeconds"] == "45" &&
-                   simulationDefinition.Parameters["StopLossCooldownSeconds"] == "60",
-                "週期策略控制頁必須暴露單邊逾時與各種冷卻時間的預設值");
+                   simulationDefinition.Parameters["StopLossCooldownSeconds"] == "60" &&
+                   simulationDefinition.Parameters["TrendInitialAheadA"] == "100" &&
+                   simulationDefinition.Parameters["TrendRepriceThresholdB"] == "200" &&
+                   simulationDefinition.Parameters["TrendRepriceTargetC"] == "100" &&
+                   simulationDefinition.Parameters["OppositeInitialAheadA"] == "600" &&
+                   simulationDefinition.Parameters["OppositeRepriceThresholdB"] == "700" &&
+                   simulationDefinition.Parameters["OppositeRepriceTargetC"] == "600" &&
+                   liveDefinition.Parameters["TrendInitialAheadA"] == "100" &&
+                   liveDefinition.Parameters["OppositeInitialAheadA"] == "600",
+                "模擬與實盤控制頁必須使用相同的順勢與逆勢 A/B/C 預設值");
             Assert(!simulation.Controls.OfType<CheckBox>().Any(control => control.Name == "ResearchValidated") &&
                    live.Controls.OfType<CheckBox>().Single(control => control.Name == "ResearchValidated").Checked == false &&
                    LiveStrategyService.TryValidateResearchStrategy(liveDefinition, out string? reason) &&
@@ -232,11 +240,11 @@ static void TestParameterDefaultsAndSummary()
            p.CycleCooldownSeconds == 45 && p.StopLossCooldownSeconds == 60 &&
            p.ShockCooldownSeconds == 45 && p.MarketDataRecoverySeconds == 2m &&
            p.CommissionPerContract == 36m && !p.ResearchValidated &&
-           p.TrendInitialAheadA == 22 && p.TrendRepriceThresholdB == 49 && p.TrendRepriceTargetC == 22 &&
-           p.OppositeInitialAheadA == 240 && p.OppositeRepriceThresholdB == 312 && p.OppositeRepriceTargetC == 22,
+           p.TrendInitialAheadA == 100 && p.TrendRepriceThresholdB == 200 && p.TrendRepriceTargetC == 100 &&
+           p.OppositeInitialAheadA == 600 && p.OppositeRepriceThresholdB == 700 && p.OppositeRepriceTargetC == 600,
         "週期策略預設參數不符設計規格");
 
-    const string expected = "DirectionWindowSeconds=15;MinMoveTicks=2;MinTrendEfficiency=0.40;MinDepthObi=0.10;ObiConfirmSeconds=3;DirectionReverseSeconds=3;MinSideDepth=827;MinNearDepth=165;MinDepthRatio=0.35;MaxSpreadTicks=2;MaxVolatilityTicks=5;QuoteFreshnessSeconds=2;StopLossTicks=6;MaxOneLegSeconds=30;CycleCooldownSeconds=45;StopLossCooldownSeconds=60;ShockCooldownSeconds=45;MarketDataRecoverySeconds=2;CommissionPerContract=36;ResearchValidated=false;TrendInitialAheadA=22;TrendRepriceThresholdB=49;TrendRepriceTargetC=22;OppositeInitialAheadA=240;OppositeRepriceThresholdB=312;OppositeRepriceTargetC=22";
+    const string expected = "DirectionWindowSeconds=15;MinMoveTicks=2;MinTrendEfficiency=0.40;MinDepthObi=0.10;ObiConfirmSeconds=3;DirectionReverseSeconds=3;MinSideDepth=827;MinNearDepth=165;MinDepthRatio=0.35;MaxSpreadTicks=2;MaxVolatilityTicks=5;QuoteFreshnessSeconds=2;StopLossTicks=6;MaxOneLegSeconds=30;CycleCooldownSeconds=45;StopLossCooldownSeconds=60;ShockCooldownSeconds=45;MarketDataRecoverySeconds=2;CommissionPerContract=36;ResearchValidated=false;TrendInitialAheadA=100;TrendRepriceThresholdB=200;TrendRepriceTargetC=100;OppositeInitialAheadA=600;OppositeRepriceThresholdB=700;OppositeRepriceTargetC=600";
     Assert(p.ParameterSummary == expected, $"參數摘要必須完整且穩定。實際：{p.ParameterSummary}");
 }
 
