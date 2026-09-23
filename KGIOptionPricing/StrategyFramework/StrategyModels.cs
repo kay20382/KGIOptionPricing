@@ -171,6 +171,9 @@ public sealed record StrategySnapshot
 {
     public string StrategyType { get; init; } = string.Empty;
     public string InstanceId { get; init; } = string.Empty;
+    public long StrategyRunGeneration { get; init; }
+    public string RecoveryState { get; init; } = string.Empty;
+    public string RecoveryReason { get; init; } = string.Empty;
     public string ParameterSummary { get; init; } = string.Empty;
     public string TradableProductId { get; init; } = string.Empty;
     public string TradableSymbol { get; init; } = string.Empty;

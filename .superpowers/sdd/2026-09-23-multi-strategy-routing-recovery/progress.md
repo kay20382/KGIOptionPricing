@@ -48,3 +48,11 @@ Setup:
 ## Task 7: Migrate Mini Lead, OrderBook Trend and PQC
 
 - Task 7: all three now implement managed order observation and versioned recovery checkpoints; PQC preserves order repricing `Generation` separately from `StrategyRunGeneration` and captures direction samples, both live legs, one-leg timer, cooldown and stop state. All three restore paused and require explicit Resume. Mini Lead, OrderBook, PQC and aggregate recovery smoke suites pass. Strategy parameter defaults and pricing logic remain unchanged.
+
+## Task 8: Live restart recovery coordinator
+
+- Task 8: implementation is fail-closed but incomplete. Added alias-only execution replay/dedupe into the strategy ledger, account reconciliation, run-generation recovery from the journal, checkpoint persistence on fills/lifecycle transitions, service Add/Resume gates, and explicit recovery status. Focused tests pass. The service deliberately remains `Recovering` when any persisted route exists because it still lacks a `KGITradeService` source for per-execution restart rows and the strategy-definition/checkpoint reconstruction path. Existing KGI `OrderInfo` exposes cumulative fill totals, not a per-execution recovery feed; do not enable restart trading until these adapters and end-to-end tests exist.
+
+## Task 9: Recovery status observability and final validation
+
+- Task 9: partial UI work exposes run generation, recovery state and exact recovery reason in the live status grids, with existing fixed-width columns retained. It does not yet expose the full account/manual/difference/quarantine reconciliation view or client/broker order IDs in the fill grid. The solution builds with 0 errors (existing package/nullable/unused-event warnings remain). `OrderManagementSmokeTests` currently fails an existing BrokerLimit mapper assertion (not modified in this task); do not claim full acceptance.

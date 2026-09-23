@@ -410,6 +410,38 @@ foreach (IStrategyFactory factory in finalFactories)
 }
 Console.WriteLine("PASS Task 7 Mini Lead, OrderBook Trend and PQC use uniform managed-order/recovery contracts and restart paused");
 
+string recoveryDirectory = Path.Combine(Path.GetTempPath(), "kgi-recovery-coordinator-" + Guid.NewGuid().ToString("N"));
+Directory.CreateDirectory(recoveryDirectory);
+try
+{
+    using var recoveryStore = new LiveOrderOwnershipStore(recoveryDirectory);
+    var routeOwner = new LiveOrderOwnerKey("PQC-A", 31, "client-a");
+    recoveryStore.Prepare(new LiveOrderOwnership
+    {
+        Key = routeOwner, Account = "ACC", Symbol = "225MC-Z26", CycleId = "cycle-1",
+        Role = PaperOrderRole.EntryLong, Quantity = 1
+    });
+    var brokerAlias = new BrokerOrderAlias("ACC", "20260924", "OrdNo", "BRK-31");
+    recoveryStore.BindAlias(routeOwner, brokerAlias);
+    var positionLedger = new PaperPortfolioLedger();
+    positionLedger.RegisterProduct("PQC-A", 31, new ResolvedProduct { ProductId = "225MC", Symbol = "225MC-Z26", TickSize = 5m, ContractMultiplier = 10m });
+    var recoveredAccountLedger = new AccountPositionLedger();
+    var recoveryCoordinator = new LiveStrategyRecoveryCoordinator(recoveryStore, recoveredAccountLedger, positionLedger);
+    var brokerSnapshot = new BrokerRecoverySnapshot(Array.Empty<OrderInfo>(), new[]
+    {
+        new BrokerExecutionRow("ACC", "225MC-Z26", "EXEC-31", 1, 100m, BuySell.Buy, brokerAlias, DateTimeOffset.UtcNow)
+    }, new[] { new BrokerPositionRow("ACC", "225MC-Z26", 1, 100m) }, DateTimeOffset.UtcNow);
+    var recoveryResult = recoveryCoordinator.Recover("ACC", brokerSnapshot, positionLedger.GetAllPositions("225MC-Z26"));
+    Assert(recoveryResult.State == LiveRecoveryState.RecoveredPaused &&
+           positionLedger.GetPosition("PQC-A", 31, "225MC-Z26").NetQuantity == 1 && recoveryResult.MatchedOwners.Single() == routeOwner,
+        "recovery must replay a broker execution to its durable strategy owner before account reconciliation");
+    var unknownFill = brokerSnapshot with { Executions = new[] { brokerSnapshot.Executions[0] with { ExecutionId = "EXEC-UNKNOWN", Alias = new BrokerOrderAlias("ACC", "20260924", "OrdNo", "UNKNOWN") } } };
+    Assert(recoveryCoordinator.Recover("ACC", unknownFill, positionLedger.GetAllPositions("225MC-Z26")).State == LiveRecoveryState.Quarantined,
+        "recovery must quarantine fills without a unique durable alias");
+}
+finally { Directory.Delete(recoveryDirectory, recursive: true); }
+Console.WriteLine("PASS Task 8 recovery coordinator routes broker fills only through persisted aliases and reconciles before paused release");
+
 sealed class FakeRecoveryParticipant : IStrategyRecoveryParticipant
 {
     public string StrategyType => "Fake";

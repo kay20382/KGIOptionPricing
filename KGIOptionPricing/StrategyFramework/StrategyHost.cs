@@ -6,6 +6,7 @@ using System.Runtime.ExceptionServices;
 using System.Threading;
 using KGIOptionPricing.StrategyFramework.Execution;
 using KGIOptionPricing.StrategyFramework.Performance;
+using KGIOptionPricing.StrategyFramework.Recovery;
 
 namespace KGIOptionPricing.StrategyFramework;
 
@@ -135,6 +136,12 @@ public sealed class StrategyInstanceRunner : IDisposable
     }
 
     public StrategySnapshot GetSnapshot() { lock (_sync) return GetSnapshotCore(); }
+
+    internal StrategyRecoveryCheckpoint? CaptureRecoveryCheckpoint()
+    {
+        lock (_sync) return _strategy is IStrategyRecoveryParticipant recovery
+            ? recovery.CaptureRecoveryCheckpoint() : null;
+    }
 
     public void Pulse(DateTimeOffset now)
     {
@@ -505,6 +512,13 @@ public sealed class StrategyHost : IDisposable
     {
         StrategyInstanceRunner[] runners = GetRunnersForOperation(throwIfDisposed: true);
         return runners.Select(x => x.GetSnapshot()).ToArray();
+    }
+
+    public IReadOnlyList<StrategyRecoveryCheckpoint> CaptureRecoveryCheckpoints()
+    {
+        StrategyInstanceRunner[] runners = GetRunnersForOperation(throwIfDisposed: true);
+        return runners.Select(runner => runner.CaptureRecoveryCheckpoint())
+            .Where(checkpoint => checkpoint is not null).Cast<StrategyRecoveryCheckpoint>().ToArray();
     }
 
     public bool Stop(string instanceId, string reason = "使用者停止")

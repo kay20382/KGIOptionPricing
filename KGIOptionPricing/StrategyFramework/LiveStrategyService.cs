@@ -8,6 +8,8 @@ using KGIOptionPricing.Strategies.PeriodicQueueCycle;
 using KGIOptionPricing.Strategies.WaveletScalper;
 using KGIOptionPricing.StrategyFramework.Execution;
 using KGIOptionPricing.StrategyFramework.MarketData;
+using KGIOptionPricing.StrategyFramework.Performance;
+using KGIOptionPricing.StrategyFramework.Recovery;
 using System.Runtime.ExceptionServices;
 using System.Diagnostics;
 
@@ -58,6 +60,9 @@ public sealed class LiveStrategyService : IDisposable
     private readonly ConcurrentDictionary<string, AddReservation> _addReservations = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, StrategySnapshot> _deferredAddSnapshots = new(StringComparer.OrdinalIgnoreCase);
     private bool _disposed;
+    private readonly AccountPositionLedger _accountLedger = new();
+    private LiveRecoveryState _recoveryState = LiveRecoveryState.RecoveredPaused;
+    private string _recoveryReason = "Fresh process has no persisted strategy routes; explicit Resume is required.";
 
     public event Action<StrategySnapshot>? SnapshotChanged;
     public event Action<ExecutionEvent>? ExecutionOccurred;
@@ -106,6 +111,15 @@ public sealed class LiveStrategyService : IDisposable
             "KGIOptionPricing", "Strategy_Routes", routeAccountKey);
         _routeStore = new LiveOrderOwnershipStore(routeDirectory);
         _orderRouter = new LiveStrategyOrderRouter(new OrderManagerLiveStrategyOrderGateway(orders, trade), _routeStore);
+        LiveOwnershipSnapshot startupJournal = _routeStore.Replay();
+        _generationSequence = startupJournal.Routes.Select(route => route.Key.StrategyRunGeneration)
+            .Concat(startupJournal.Checkpoints.Select(checkpoint => checkpoint.StrategyRunGeneration))
+            .DefaultIfEmpty(0L).Max();
+        _recoveryState = startupJournal.IsQuarantined ? LiveRecoveryState.Quarantined :
+            startupJournal.Routes.Count > 0 || startupJournal.QuarantinedEvents.Count > 0
+                ? LiveRecoveryState.Recovering : LiveRecoveryState.RecoveredPaused;
+        _recoveryReason = startupJournal.QuarantineReason.Length > 0 ? startupJournal.QuarantineReason :
+            _recoveryState == LiveRecoveryState.Recovering ? "Persisted strategy orders/checkpoints require broker snapshot recovery." : _recoveryReason;
         _resolve = definition => _resolver.Resolve(definition.Universe);
         _createStrategy = definition => _registry.Get(definition.StrategyType).Create(definition);
         _createExecution = (definition, universe, commission) =>
@@ -128,7 +142,8 @@ public sealed class LiveStrategyService : IDisposable
         foreach (IStrategyFactory factory in CreateDefaultFactories()) _registry.Register(factory);
         _host = new StrategyHost(new KgiStrategyMarketDataSource(quote));
         _host.SnapshotChanged += OnSnapshot;
-        _host.ExecutionOccurred += execution => ExecutionOccurred?.Invoke(execution);
+        _host.ExecutionOccurred += OnExecutionCheckpoint;
+        _host.OrderLifecycleOccurred += OnLifecycleCheckpoint;
         _heartbeat = new StrategyHeartbeatTimer(Pulse);
     }
 
@@ -152,12 +167,15 @@ public sealed class LiveStrategyService : IDisposable
         _createExecutionWithGeneration = null;
         _afterHostAddFailure = afterHostAddFailure;
         _host.SnapshotChanged += OnSnapshot;
-        _host.ExecutionOccurred += execution => ExecutionOccurred?.Invoke(execution);
+        _host.ExecutionOccurred += OnExecutionCheckpoint;
+        _host.OrderLifecycleOccurred += OnLifecycleCheckpoint;
         _heartbeat = enableHeartbeat ? new StrategyHeartbeatTimer(Pulse) : null;
     }
 
     public void Add(StrategyDefinition definition, decimal commissionPerContract, decimal dailyLossLimit)
     {
+        if (_recoveryState != LiveRecoveryState.RecoveredPaused)
+            throw new InvalidOperationException($"策略回補尚未完成或需人工對帳，禁止新增實盤策略。[{_recoveryState}: {_recoveryReason}]");
         if (!_isLoggedIn()) throw new InvalidOperationException("交易服務尚未登入，禁止啟動實盤策略。");
         if (!TryValidateResearchStrategy(definition, out string? researchReason))
             throw new InvalidOperationException($"{definition.StrategyType} 尚屬研究策略；未明確標記已通過樣本外、滑價、延遲與模擬盤門檻，禁止實盤啟動。[{researchReason}]");
@@ -190,6 +208,7 @@ public sealed class LiveStrategyService : IDisposable
             try
             {
                 _host.Add(_createStrategy(definition), universe, commissionPerContract, execution, reservation.Generation);
+                PersistRecoveryCheckpoints();
                 added = true;
             }
             catch (Exception addError)
@@ -248,7 +267,39 @@ public sealed class LiveStrategyService : IDisposable
         return snapshot != null && _host.Pause(instanceId);
     }
 
-    public bool Resume(string instanceId) { WaitForAdd(instanceId); return _isLoggedIn() && _host.Resume(instanceId); }
+    public bool Resume(string instanceId)
+    {
+        WaitForAdd(instanceId);
+        if (_recoveryState != LiveRecoveryState.RecoveredPaused) return false;
+        return _isLoggedIn() && _host.Resume(instanceId);
+    }
+
+    public LiveRecoveryState RecoveryState => _recoveryState;
+    public string RecoveryReason => _recoveryReason;
+
+    /// <summary>Applies an explicit broker snapshot; never guesses ownership from product or net position.</summary>
+    public LiveRecoveryResult Recover(BrokerRecoverySnapshot brokerSnapshot)
+    {
+        if (_routeStore is null) throw new InvalidOperationException("Recovery journal is unavailable in this service instance.");
+        _recoveryState = LiveRecoveryState.Recovering;
+        var coordinator = new LiveStrategyRecoveryCoordinator(_routeStore, _accountLedger, _host.Ledger);
+        string account = _account();
+        PositionSnapshot[] strategyPositions = brokerSnapshot.Positions
+            .SelectMany(position => _host.Ledger.GetAllPositions(position.Symbol)).ToArray();
+        LiveRecoveryResult result = coordinator.Recover(account, brokerSnapshot, strategyPositions);
+        if (result.State == LiveRecoveryState.RecoveredPaused && _routeStore.Replay().Routes.Count > 0)
+        {
+            result = result with
+            {
+                State = LiveRecoveryState.Recovering,
+                Reason = "Broker orders/positions reconciled, but persisted strategy instances and checkpoints have not yet been restored; automatic trading remains locked."
+            };
+        }
+        _recoveryState = result.State;
+        _recoveryReason = result.Reason;
+        foreach (StrategySnapshot snapshot in _host.GetSnapshots()) PublishSnapshot(snapshot);
+        return result;
+    }
 
     public bool EmergencyStop(string instanceId, string reason = "使用者停止實盤策略")
     {
@@ -452,6 +503,12 @@ public sealed class LiveStrategyService : IDisposable
 
     private void PublishSnapshot(StrategySnapshot snapshot)
     {
+        snapshot = snapshot with
+        {
+            StrategyRunGeneration = _activeGenerations.GetValueOrDefault(snapshot.InstanceId),
+            RecoveryState = _recoveryState.ToString(),
+            RecoveryReason = _recoveryReason
+        };
         foreach (Action<StrategySnapshot> handler in (SnapshotChanged?.GetInvocationList() ?? Array.Empty<Delegate>())
                      .Cast<Action<StrategySnapshot>>())
         {
@@ -466,6 +523,29 @@ public sealed class LiveStrategyService : IDisposable
                 ? reservation.Generation
                 : _activeGenerations.GetValueOrDefault(snapshot.InstanceId);
             if (generation != 0) QueueRiskStop(snapshot.InstanceId, generation, $"觸發單日最大虧損 ¥{limit}");
+        }
+    }
+
+    private void OnExecutionCheckpoint(ExecutionEvent execution)
+    {
+        ExecutionOccurred?.Invoke(execution);
+        PersistRecoveryCheckpoints();
+    }
+
+    private void OnLifecycleCheckpoint(OrderLifecycleEvent lifecycle) => PersistRecoveryCheckpoints();
+
+    private void PersistRecoveryCheckpoints()
+    {
+        if (_routeStore is null || _recoveryState == LiveRecoveryState.Quarantined) return;
+        try
+        {
+            foreach (StrategyRecoveryCheckpoint checkpoint in _host.CaptureRecoveryCheckpoints())
+                _routeStore.AppendCheckpoint(checkpoint);
+        }
+        catch (Exception exception)
+        {
+            _recoveryState = LiveRecoveryState.Quarantined;
+            _recoveryReason = $"Strategy recovery checkpoint persistence failed: {exception.Message}";
         }
     }
 
