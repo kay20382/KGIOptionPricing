@@ -46,6 +46,7 @@ TestPeriodicStrategySnapshotExposesFrozenCycleAndLegState();
 TestPeriodicStrategyFaultsWhenRunnerCannotRouteTargetedCancel();
 TestPeriodicStrategyPreservesFaultDuringReentrantStopCancelFailure();
 TestPeriodicStrategyRetriesClosingBlockedCancellation();
+TestPeriodicStrategyAbsorbsExternalCancellationBeforeClose();
 TestPeriodicRunnerStopUsesTargetedManagedCancellation();
 TestPeriodicStrategyResumeStartsFreshCycleAfterFlatPause();
 TestPeriodicStrategyStopsRepriceEvaluationAfterFirstRouteFailure();
@@ -116,6 +117,13 @@ static void TestPeriodicStrategyPublishesTypedDecisionEvidence()
            accepted.Features.ContainsKey("averageObi") && accepted.QuoteAgeSeconds == 0m &&
            accepted.SpreadTicks == 1m,
         "接受 observation 必須包含特徵、門檻、報價年齡與價差");
+    Assert(accepted.Features["buyWorkingPrice"] is > 0m &&
+           accepted.Features["sellWorkingPrice"] is > 0m &&
+           accepted.Features["buyRepriceThresholdB"] == 100000m &&
+           accepted.Features["buyRepriceTargetC"] == 1m &&
+           accepted.Features["sellRepriceThresholdB"] == 100000m &&
+           accepted.Features["sellRepriceTargetC"] == 1m,
+        "模擬與實盤共用的 decision observation 必須揭露雙腿目前價格及 B/C 改價門檻");
     Assert(decisions.Count(x => x.Decision == StrategyDecision.Accept) == 1,
         "同一 candidate/cycle 只能發布一次 SignalAccepted");
     Assert(decisions.Count(x => x.PrimaryReasonCode == "SignalAccepted") == 1,
@@ -1344,6 +1352,26 @@ static void TestPeriodicStrategyRetriesClosingBlockedCancellation()
     strategy.OnOrderLifecycle(Cancelled(second, strategy.InstanceId, clock.Now));
     Assert(strategy.State == StrategyLifecycleState.Stopped,
         "重試撤單收到全部終態且帳本為零後，策略必須安全停止");
+}
+
+static void TestPeriodicStrategyAbsorbsExternalCancellationBeforeClose()
+{
+    DateTimeOffset start = new(2026, 9, 23, 23, 45, 0, TimeSpan.Zero);
+    (PeriodicQueueCycleStrategy strategy, MutableClock clock, List<PaperOrderRequest> orders) =
+        StartWorkingUpStrategy("external-cancel-before-close", NoRepriceParameters(), start);
+    var cancels = new List<string>();
+    strategy.CancelOrderRequested += cancels.Add;
+
+    string externallyCancelled = orders[0].ClientOrderId;
+    string remaining = orders[1].ClientOrderId;
+    strategy.OnOrderLifecycle(Cancelled(externallyCancelled, strategy.InstanceId, clock.Now));
+
+    strategy.Stop("人工撤單後關閉");
+    Assert(cancels.SequenceEqual(new[] { remaining }),
+        "人工撤單已回報終態時，關閉流程只能撤銷仍在工作的另一腿，不得重複撤單");
+    strategy.OnOrderLifecycle(Cancelled(remaining, strategy.InstanceId, clock.Now));
+    Assert(strategy.State == StrategyLifecycleState.Stopped,
+        "人工撤單後，剩餘完成單終態應可讓策略安全停止");
 }
 
 static void TestPeriodicRunnerStopUsesTargetedManagedCancellation()

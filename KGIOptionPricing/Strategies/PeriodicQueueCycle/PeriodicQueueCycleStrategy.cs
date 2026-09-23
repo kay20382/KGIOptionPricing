@@ -471,7 +471,13 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
             ["pathTicks"] = assessment?.PathTicks,
             ["trendEfficiency"] = assessment?.TrendEfficiency,
             ["averageObi"] = assessment?.AverageObi,
-            ["volatilityTicks"] = assessment?.VolatilityTicks
+            ["volatilityTicks"] = assessment?.VolatilityTicks,
+            ["buyWorkingPrice"] = _coordinator?.BuyWorkingPrice,
+            ["sellWorkingPrice"] = _coordinator?.SellWorkingPrice,
+            ["buyRepriceThresholdB"] = _coordinator?.BuyRepriceThresholdB,
+            ["buyRepriceTargetC"] = _coordinator?.BuyRepriceTargetC,
+            ["sellRepriceThresholdB"] = _coordinator?.SellRepriceThresholdB,
+            ["sellRepriceTargetC"] = _coordinator?.SellRepriceTargetC
         };
         var thresholds = assessment?.Thresholds.Select(threshold => new ThresholdObservation(
             threshold.Name,

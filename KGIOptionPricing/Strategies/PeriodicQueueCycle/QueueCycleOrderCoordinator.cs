@@ -75,6 +75,10 @@ internal sealed class QueueCycleOrderCoordinator
     internal DirectionAssessment? FrozenAssessment { get; private set; }
     internal decimal BuyWorkingPrice => _buy?.CurrentPrice ?? 0m;
     internal decimal SellWorkingPrice => _sell?.CurrentPrice ?? 0m;
+    internal int BuyRepriceThresholdB => _buy?.RepriceThresholdB ?? 0;
+    internal int BuyRepriceTargetC => _buy?.RepriceTargetC ?? 0;
+    internal int SellRepriceThresholdB => _sell?.RepriceThresholdB ?? 0;
+    internal int SellRepriceTargetC => _sell?.RepriceTargetC ?? 0;
     internal bool IsFaulted => Phase == QueueCyclePhase.Faulted;
     internal bool IsClosingBlocked => Phase == QueueCyclePhase.ClosingBlocked;
     internal bool BothUnfilled => _buy is not null && _sell is not null &&
@@ -367,6 +371,16 @@ internal sealed class QueueCycleOrderCoordinator
                 leg.CancelIntent = CancelIntent.None;
                 ReasonCode = "ClosingBlocked";
                 return;
+            case OrderLifecycleState.Cancelled when leg.State == LegState.Working:
+                // The broker can report a user-initiated cancellation without a
+                // preceding local CancelPending callback.  Accept that terminal
+                // state so a later Stop only targets the remaining working leg.
+                leg.State = LegState.Cancelled;
+                leg.PendingReplacementPrice = null;
+                leg.CancelIntent = CancelIntent.None;
+                ReasonCode = "ExternalCancelled";
+                UpdateWorkingPhase();
+                return;
             case OrderLifecycleState.Working when
                 leg.State == LegState.CancelPending &&
                 string.Equals(orderEvent.ReasonCode, "CancelFailed", StringComparison.OrdinalIgnoreCase):
@@ -566,5 +580,6 @@ internal sealed class QueueCycleOrderCoordinator
 
     private static string LegSummary(OrderLeg? leg) => leg is null
         ? "none"
-        : $"{leg.ClientOrderId},Generation={leg.Generation},State={leg.State},Price={leg.CurrentPrice},Intent={leg.CancelIntent}";
+        : $"{leg.ClientOrderId},Generation={leg.Generation},State={leg.State},Price={leg.CurrentPrice}," +
+          $"ThresholdB={leg.RepriceThresholdB},TargetC={leg.RepriceTargetC},Intent={leg.CancelIntent}";
 }
