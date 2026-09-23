@@ -3,6 +3,9 @@ using KGIOptionPricing.StrategyFramework.Recovery;
 using KGIOptionPricing.StrategyFramework.Execution;
 using KGIOptionPricing.OrderManagement.Core;
 using KGIOptionPricing.StrategyFramework.Performance;
+using KGIOptionPricing.Strategies.MeanReversionScalper;
+using KGIOptionPricing.Strategies.WaveletScalper;
+using KGIOptionPricing.Strategies.NikkeiMicrostructureAlpha;
 
 static void Assert(bool condition, string message)
 {
@@ -330,6 +333,58 @@ try
 }
 catch (InvalidOperationException exception) when (exception.Message.Contains(nameof(IManagedOrderStrategy), StringComparison.Ordinal)) { }
 Console.WriteLine("PASS Task 5 managed order lifecycle and checkpoint helper");
+
+var sharedUniverse = new ResolvedStrategyUniverse
+{
+    Tradable = new ResolvedProduct { ProductId = "225MC", Symbol = "225MC-Z26", TickSize = 5m, ContractMultiplier = 10m },
+    References = new[]
+    {
+        new ResolvedProduct { ProductId = "225", Symbol = "225-Z26", TickSize = 5m, ContractMultiplier = 10m },
+        new ResolvedProduct { ProductId = "225M", Symbol = "225M-Z26", TickSize = 5m, ContractMultiplier = 10m }
+    }
+};
+ISimulationStrategy[] firstMigratedStrategies =
+{
+    new MeanReversionScalperFactory().Create(new StrategyDefinition { StrategyType = MeanReversionScalperFactory.TypeName, InstanceId = "MR-managed" }),
+    new WaveletScalperFactory().Create(new StrategyDefinition { StrategyType = WaveletScalperFactory.TypeName, InstanceId = "MODWT-managed" }),
+    new NikkeiMicrostructureAlphaFactory().Create(new StrategyDefinition { StrategyType = NikkeiMicrostructureAlphaFactory.TypeName, InstanceId = "NIKKEI-managed" })
+};
+foreach (ISimulationStrategy migrated in firstMigratedStrategies)
+{
+    StrategyLiveCapabilityGate.EnsureLiveCapable(migrated);
+    migrated.Start(new StrategyRuntimeContext(sharedUniverse, new SystemStrategyClock(), new PaperPortfolioLedger(), 17));
+    migrated.OnMarketEvent(new MarketEvent
+    {
+        Sequence = 1, Kind = MarketEventKind.Trade, ProductId = "225MC", Symbol = "225MC-Z26",
+        LastPrice = 100m, Timestamp = DateTimeOffset.UtcNow.AddSeconds(-1),
+        BidPrices = new[] { 95m }, AskPrices = new[] { 100m }, BidQuantities = new[] { 10 }, AskQuantities = new[] { 10 }
+    });
+    IStrategyRecoveryParticipant recoveryParticipant = (IStrategyRecoveryParticipant)migrated;
+    StrategyRecoveryCheckpoint saved = recoveryParticipant.CaptureRecoveryCheckpoint();
+    recoveryParticipant.RestoreRecoveryCheckpoint(saved);
+    Assert(saved.StrategyRunGeneration == 17 && !string.IsNullOrWhiteSpace(saved.PayloadJson) &&
+           migrated.GetSnapshot().State == StrategyLifecycleState.WarmingUp &&
+           recoveryParticipant.CaptureRecoveryCheckpoint().PayloadJson == saved.PayloadJson,
+        $"{migrated.StrategyType} checkpoint did not preserve its run identity and payload");
+    IStrategyFactory factory = migrated.StrategyType switch
+    {
+        MeanReversionScalperFactory.TypeName => new MeanReversionScalperFactory(),
+        WaveletScalperFactory.TypeName => new WaveletScalperFactory(),
+        NikkeiMicrostructureAlphaFactory.TypeName => new NikkeiMicrostructureAlphaFactory(),
+        _ => throw new InvalidOperationException("Unexpected migrated strategy factory.")
+    };
+    ISimulationStrategy restoredBeforeStart = factory.Create(new StrategyDefinition
+    {
+        StrategyType = migrated.StrategyType,
+        InstanceId = migrated.InstanceId
+    });
+    ((IStrategyRecoveryParticipant)restoredBeforeStart).RestoreRecoveryCheckpoint(saved);
+    restoredBeforeStart.Start(new StrategyRuntimeContext(sharedUniverse, new SystemStrategyClock(), new PaperPortfolioLedger(), 17));
+    Assert(restoredBeforeStart.GetSnapshot().State == migrated.GetSnapshot().State &&
+           ((IStrategyRecoveryParticipant)restoredBeforeStart).CaptureRecoveryCheckpoint().PayloadJson == saved.PayloadJson,
+        $"{migrated.StrategyType} did not restore safely before Start without replaying entry logic");
+}
+Console.WriteLine("PASS Task 6 MR, MODWT and Nikkei use uniform managed-order/recovery contracts");
 
 sealed class FakeRecoveryParticipant : IStrategyRecoveryParticipant
 {

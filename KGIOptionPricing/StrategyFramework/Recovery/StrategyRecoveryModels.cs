@@ -12,6 +12,17 @@ public sealed record StrategyRecoveryCheckpoint(
 
 public static class StrategyRecoveryCheckpointValidator
 {
+    public static void EnsureCompatible(StrategyRecoveryCheckpoint checkpoint, string expectedStrategyType,
+        string expectedInstanceId, long expectedRunGeneration, string expectedSchema)
+    {
+        ArgumentNullException.ThrowIfNull(checkpoint);
+        if (!string.Equals(checkpoint.StrategyType, expectedStrategyType, StringComparison.Ordinal) ||
+            !string.Equals(checkpoint.StrategyInstanceId, expectedInstanceId, StringComparison.Ordinal) ||
+            checkpoint.StrategyRunGeneration != expectedRunGeneration ||
+            !string.Equals(checkpoint.Schema, expectedSchema, StringComparison.Ordinal))
+            throw new InvalidOperationException("Strategy recovery checkpoint identity or schema is incompatible.");
+    }
+
     public static void EnsureCompatible(
         StrategyRecoveryCheckpoint checkpoint,
         IStrategyRecoveryParticipant participant,
@@ -20,10 +31,7 @@ public static class StrategyRecoveryCheckpointValidator
         ArgumentNullException.ThrowIfNull(checkpoint);
         ArgumentNullException.ThrowIfNull(participant);
         StrategyRecoveryCheckpoint current = participant.CaptureRecoveryCheckpoint();
-        if (!string.Equals(checkpoint.StrategyType, current.StrategyType, StringComparison.Ordinal) ||
-            !string.Equals(checkpoint.StrategyInstanceId, current.StrategyInstanceId, StringComparison.Ordinal) ||
-            checkpoint.StrategyRunGeneration != expectedRunGeneration ||
-            !string.Equals(checkpoint.Schema, participant.RecoverySchema, StringComparison.Ordinal))
-            throw new InvalidOperationException("Strategy recovery checkpoint identity or schema is incompatible.");
+        EnsureCompatible(checkpoint, current.StrategyType, current.StrategyInstanceId,
+            expectedRunGeneration, participant.RecoverySchema);
     }
 }

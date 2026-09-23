@@ -51,6 +51,11 @@ public interface IManagedOrderStrategy
     void OnOrderLifecycle(OrderLifecycleEvent orderEvent);
 }
 
+public interface IManagedOrderSubmissionObserver
+{
+    void OnOrderSubmitted(PaperOrderRequest request);
+}
+
 public interface IStrategyRecoveryParticipant
 {
     string RecoverySchema { get; }
@@ -75,15 +80,18 @@ public sealed class StrategyRuntimeContext
     public ResolvedStrategyUniverse Universe { get; }
     public IStrategyClock Clock { get; }
     public IStrategyPerformanceView Performance { get; }
+    public long StrategyRunGeneration { get; }
 
     public StrategyRuntimeContext(
         ResolvedStrategyUniverse universe,
         IStrategyClock clock,
-        IStrategyPerformanceView performance)
+        IStrategyPerformanceView performance,
+        long strategyRunGeneration = 1)
     {
         Universe = universe;
         Clock = clock;
         Performance = performance;
+        StrategyRunGeneration = strategyRunGeneration;
     }
 }
 

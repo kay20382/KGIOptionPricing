@@ -604,7 +604,9 @@ foreach (decimal price in new[] { 100m, 105m, 100m, 105m, 100m, 105m, 100m, 95m,
     waveletTime = waveletTime.AddSeconds(1);
 }
 Assert(waveletOrders.Count == 1 && waveletOrders[0].Type == PaperOrderType.Market &&
-       waveletOrders[0].Role == PaperOrderRole.EntryLong && waveletOrders[0].Side == BuySell.Buy,
+       waveletOrders[0].Role == PaperOrderRole.EntryLong && waveletOrders[0].Side == BuySell.Buy &&
+       !string.IsNullOrWhiteSpace(waveletOrders[0].ClientOrderId) && !string.IsNullOrWhiteSpace(waveletOrders[0].CycleId) &&
+       waveletOrders[0].StrategyRunGeneration == 1,
     $"MODWT 負向偏離且 OBI 偏多時未建立模擬做多訊號；count={waveletOrders.Count}，reason={wavelet.GetSnapshot().Reason}");
 
 // Full strategy path with a tradable and two required reference products.
@@ -659,7 +661,9 @@ Assert(snapshots.Last().State == StrategyLifecycleState.Running && snapshots.Las
 source.Emit(Trade("MC", "225MC", 100m, 8, t0.AddSeconds(11), 99m, 101m));
 Assert(executions.Count == 0, "買單只觸價時不應成交");
 source.Emit(Trade("MC", "225MC", 95m, 9, t0.AddSeconds(12), 94m, 96m));
-Assert(executions.Count == 1 && executions[0].Role == PaperOrderRole.EntryLong, "穿越買單後應建立多單");
+Assert(executions.Count == 1 && executions[0].Role == PaperOrderRole.EntryLong &&
+       !string.IsNullOrWhiteSpace(executions[0].ClientOrderId) && !string.IsNullOrWhiteSpace(executions[0].CycleId) &&
+       executions[0].StrategyRunGeneration == 1, "穿越買單後應建立具精確身份的多單");
 // A 5-point bid/ask spread has a half-tick midpoint (97.5), but PnL must use the 100 trade.
 source.Emit(Trade("MC", "225MC", 100m, 10, t0.AddSeconds(12.5), 95m, 100m));
 StrategySnapshot tradeMarked = host.GetSnapshots().Single();

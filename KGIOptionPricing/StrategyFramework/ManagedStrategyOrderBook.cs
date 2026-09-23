@@ -88,6 +88,12 @@ public sealed class ManagedStrategyOrderBook
         }
     }
 
+    public bool HasActiveRole(PaperOrderRole role)
+    {
+        lock (_sync) return _orders.Values.Any(x => x.Request.Role == role &&
+            x.LastLifecycle?.State is not (OrderLifecycleState.Filled or OrderLifecycleState.Cancelled or OrderLifecycleState.Rejected));
+    }
+
     public ManagedOrderBookCheckpoint Capture()
     {
         lock (_sync) return new ManagedOrderBookCheckpoint(StrategyInstanceId, StrategyRunGeneration,
@@ -122,6 +128,7 @@ public static class StrategyLiveCapabilityGate
         ArgumentNullException.ThrowIfNull(strategy);
         var missing = new List<string>();
         if (strategy is not IManagedOrderStrategy) missing.Add(nameof(IManagedOrderStrategy));
+        if (strategy is not IManagedOrderSubmissionObserver) missing.Add(nameof(IManagedOrderSubmissionObserver));
         if (strategy is not IStrategyRecoveryParticipant) missing.Add(nameof(IStrategyRecoveryParticipant));
         if (missing.Count > 0)
             throw new InvalidOperationException($"{strategy.StrategyType} is not live-capable; missing: {string.Join(", ", missing)}.");

@@ -102,7 +102,7 @@ public sealed class StrategyInstanceRunner : IDisposable
         }
     }
 
-    internal void Initialize() => _strategy.Start(new StrategyRuntimeContext(_universe, _clock, _ledger));
+    internal void Initialize() => _strategy.Start(new StrategyRuntimeContext(_universe, _clock, _ledger, _strategyRunGeneration));
 
     public bool UsesSymbol(string symbol) => _universe.AllProducts.Any(x =>
         string.Equals(x.Symbol, symbol, StringComparison.OrdinalIgnoreCase));
@@ -206,6 +206,8 @@ public sealed class StrategyInstanceRunner : IDisposable
                 StrategyInstanceId = _strategy.InstanceId,
                 StrategyRunGeneration = _strategyRunGeneration
             };
+            if (_strategy is IManagedOrderSubmissionObserver submissionObserver)
+                submissionObserver.OnOrderSubmitted(ownedRequest);
             try { _broker.Submit(ownedRequest, _clock.Now); }
             catch (BrokerReconciliationRequiredException)
             {
