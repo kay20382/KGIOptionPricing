@@ -29,3 +29,8 @@ Setup:
 
 - Task 3 ruling: keep the per-run execution facade as a nested `RoutedGateway` owned by `LiveStrategyOrderRouter`, rather than adding another standalone public wrapper. The router owns subscription, route registration, event delivery and facade disposal as one lifecycle. Cost if wrong: future facade reuse outside the router will require extraction.
 - Task 3: implementation and focused tests complete; recovery/router, order-management, and strategy-framework smoke suites passed. Test outputs used isolated `BaseOutputPath` directories because unrelated live test processes held default build outputs open. Commit follows.
+
+## Task 4: Strategy/account ledgers and execution idempotency
+
+- Task 4 ruling: legacy lifecycle callbacks that omit `StrategyRunGeneration` are stamped with the runner's own generation at the serialized callback boundary; explicit mismatched generations remain rejected. This preserves older simulation callbacks without allowing them into the wrong run's ledger. Cost if wrong: an external producer that intended generation zero as a distinct owner cannot express that via the legacy callback shape and must adopt explicit run generation.
+- Task 4: strategy and recovery smoke tests pass, including opposite-side A/B virtual positions remaining +1/-1 while aggregate is zero; duplicate execution charges commission once; manual external fills reconcile separately; mapper keeps route owner while resolving broker Open/Close from account net; generation-aware checkpoint restores position. Warnings remain from existing package compatibility, unavailable NuGet vulnerability feed, and existing nullable/unused-event diagnostics.

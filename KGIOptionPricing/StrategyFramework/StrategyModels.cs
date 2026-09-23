@@ -110,6 +110,8 @@ public sealed record PaperOrder
 public sealed record ExecutionEvent
 {
     public long Sequence { get; init; }
+    public string ExecutionId { get; init; } = string.Empty;
+    public int CumulativeFilledQuantity { get; init; }
     public DateTimeOffset Timestamp { get; init; }
     public string StrategyInstanceId { get; init; } = string.Empty;
     public string ClientOrderId { get; init; } = string.Empty;
@@ -153,6 +155,7 @@ public sealed record OrderLifecycleEvent
 public sealed record PositionSnapshot
 {
     public string StrategyInstanceId { get; init; } = string.Empty;
+    public long StrategyRunGeneration { get; init; }
     public string Symbol { get; init; } = string.Empty;
     public int NetQuantity { get; init; }
     public decimal AveragePrice { get; init; }

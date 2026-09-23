@@ -249,6 +249,43 @@ finally
 }
 Console.WriteLine("PASS Task 3 single-subscription exact route dispatch");
 
+var strategyLedger = new PaperPortfolioLedger();
+strategyLedger.ApplyExecution(new ExecutionEvent { StrategyInstanceId = "A", StrategyRunGeneration = 1, ExecutionId = "A-1", Symbol = "225MC-Z26", Side = BuySell.Buy, Price = 100m, Quantity = 1, Commission = 2m });
+strategyLedger.ApplyExecution(new ExecutionEvent { StrategyInstanceId = "B", StrategyRunGeneration = 1, ExecutionId = "B-1", Symbol = "225MC-Z26", Side = BuySell.Sell, Price = 100m, Quantity = 1, Commission = 2m });
+strategyLedger.ApplyExecution(new ExecutionEvent { StrategyInstanceId = "A", StrategyRunGeneration = 1, ExecutionId = "A-1", Symbol = "225MC-Z26", Side = BuySell.Buy, Price = 100m, Quantity = 1, Commission = 2m });
+Assert(strategyLedger.GetPosition("A", 1, "225MC-Z26").NetQuantity == 1 &&
+       strategyLedger.GetPosition("B", 1, "225MC-Z26").NetQuantity == -1 &&
+       strategyLedger.GetStrategyNetQuantity("225MC-Z26") == 0 &&
+       strategyLedger.GetPosition("A", 1, "225MC-Z26").Costs == 2m,
+    "opposite strategies were netted together or duplicate fill counted twice");
+var accountLedger = new AccountPositionLedger();
+accountLedger.ReplaceBrokerSnapshot("ACC", new[] { new BrokerPositionRow("ACC", "225MC-Z26", 1) });
+accountLedger.ApplyManualExternalFill(new AccountFill("ACC", "225MC-Z26", "MANUAL-1", BuySell.Buy, 1));
+AccountProductSnapshot reconciled = accountLedger.Reconcile("ACC", "225MC-Z26", strategyLedger.GetAllPositions("225MC-Z26"));
+Assert(reconciled.StrategyNetQuantity == 0 && reconciled.ManualExternalNetQuantity == 1 &&
+       reconciled.BrokerNetQuantity == 1 && reconciled.DifferenceQuantity == 0,
+    "manual external fill was not isolated from strategy buckets or reconciliation difference");
+Assert(AccountPositionEffectResolver.Resolve(1, BuySell.Sell, 1) == PositionEffect.Close &&
+       AccountPositionEffectResolver.Resolve(1, BuySell.Buy, 1) == PositionEffect.Open,
+    "broker open/close effect did not use account net position independently of strategy ownership");
+try
+{
+    AccountPositionEffectResolver.Resolve(1, BuySell.Sell, 2);
+    throw new InvalidOperationException("mixed close/open order was not required to split");
+}
+catch (InvalidOperationException exception) when (exception.Message.Contains("拆", StringComparison.Ordinal)) { }
+OrderRequest mappedStrategyOrder = LiveStrategyOrderMapper.CreateBrokerLimit(
+    request with { Type = PaperOrderType.BrokerLimit }, new InstrumentKey { Symbol = "225MC-Z26" }, "KGI", "ACC", "real-1", accountNetQuantity: 1);
+Assert(mappedStrategyOrder.PositionEffect == PositionEffect.Open &&
+       mappedStrategyOrder.StrategyRoute?.StrategyInstanceId == "MR-A",
+    "account position effect resolution changed or discarded immutable strategy ownership");
+var ledgerCheckpoint = strategyLedger.Capture();
+var restoredLedger = new PaperPortfolioLedger();
+restoredLedger.Restore(ledgerCheckpoint);
+Assert(restoredLedger.GetPosition("A", 1, "225MC-Z26").NetQuantity == 1,
+    "strategy ledger checkpoint did not restore the exact run generation position");
+Console.WriteLine("PASS Task 4 strategy/account ledger separation and execution idempotency");
+
 sealed class FakeRecoveryParticipant : IStrategyRecoveryParticipant
 {
     public string StrategyType => "Fake";

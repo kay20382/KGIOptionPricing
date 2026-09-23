@@ -709,6 +709,8 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
             execution = new ExecutionEvent
             {
                 Sequence = Interlocked.Increment(ref _executionSequence),
+                ExecutionId = brokerOrder.Identity?.ExecID ?? string.Empty,
+                CumulativeFilledQuantity = effectiveCumulative,
                 Timestamp = _now(),
                 StrategyInstanceId = _instanceId,
                 ClientOrderId = tracked.Order.ClientOrderId,

@@ -1,4 +1,5 @@
 using KGIOptionPricing.OrderManagement.Core;
+using KGIOptionPricing.StrategyFramework.Performance;
 
 namespace KGIOptionPricing.StrategyFramework.Execution;
 
@@ -61,7 +62,8 @@ public static class LiveStrategyOrderMapper
         InstrumentKey instrument,
         string brokerId,
         string account,
-        string realOrderId)
+        string realOrderId,
+        int accountNetQuantity = 0)
     {
         ArgumentNullException.ThrowIfNull(request);
         ArgumentNullException.ThrowIfNull(instrument);
@@ -92,7 +94,7 @@ public static class LiveStrategyOrderMapper
             Price = (double)request.Price,
             Quantity = 1,
             TimeInForce = TimeInForce.ROD,
-            PositionEffect = PositionEffect.Auto,
+            PositionEffect = AccountPositionEffectResolver.Resolve(accountNetQuantity, request.Side, request.Quantity),
             BrokerId = brokerId,
             Account = account,
             StrategyRoute = new StrategyOrderRouteMetadata(

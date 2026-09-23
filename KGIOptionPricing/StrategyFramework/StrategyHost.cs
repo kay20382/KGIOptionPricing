@@ -66,7 +66,7 @@ public sealed class StrategyInstanceRunner : IDisposable
         if (_strategyRunGeneration <= 0) throw new ArgumentOutOfRangeException(nameof(strategyRunGeneration));
         _commissionPerContract = Math.Max(0m, commissionPerContract);
         _broker = executionService ?? new CrossPricePaperExecutionService(commissionPerContract, clock);
-        foreach (ResolvedProduct product in universe.AllProducts) ledger.RegisterProduct(strategy.InstanceId, product);
+        foreach (ResolvedProduct product in universe.AllProducts) ledger.RegisterProduct(strategy.InstanceId, _strategyRunGeneration, product);
         _strategy.OrderRequested += OnOrderRequested;
         _strategy.CancelAllRequested += OnCancelAllRequested;
         _strategy.SnapshotChanged += OnStrategySnapshotChanged;
@@ -286,6 +286,8 @@ public sealed class StrategyInstanceRunner : IDisposable
             if (_disposed || !string.Equals(execution.StrategyInstanceId, _strategy.InstanceId, StringComparison.OrdinalIgnoreCase) ||
                 (execution.StrategyRunGeneration != 0 && execution.StrategyRunGeneration != _strategyRunGeneration))
                 return;
+            if (execution.StrategyRunGeneration == 0)
+                execution = execution with { StrategyRunGeneration = _strategyRunGeneration };
             // Applying the execution and notifying the strategy are one serialized
             // state transition. Broker callbacks may be concurrent with heartbeats.
             _ledger.ApplyExecution(execution);
@@ -460,12 +462,12 @@ public sealed class StrategyHost : IDisposable
             try { runner.Initialize(); }
             catch (Exception startError)
             {
-                try { runner.Dispose(); _ledger.RemoveFlatInstance(strategy.InstanceId); }
+                try { runner.Dispose(); _ledger.RemoveFlatInstance(strategy.InstanceId, runner.StrategyRunGeneration); }
                 catch (Exception cleanupError)
                 {
                     if (runner.IsDisposed)
                     {
-                        _ledger.RemoveFlatInstance(strategy.InstanceId);
+                        _ledger.RemoveFlatInstance(strategy.InstanceId, runner.StrategyRunGeneration);
                         throw new AggregateException(
                             "策略 Start 失敗；執行資源已安全關閉，但 Stop cleanup 亦回報錯誤。",
                             startError, cleanupError);
@@ -547,7 +549,7 @@ public sealed class StrategyHost : IDisposable
             if (runner.IsDisposed)
             {
                 lock (_sync) _runners.Remove(runner);
-                _ledger.RemoveFlatInstance(instanceId);
+                _ledger.RemoveFlatInstance(instanceId, runner.StrategyRunGeneration);
             }
         }
         return true;
