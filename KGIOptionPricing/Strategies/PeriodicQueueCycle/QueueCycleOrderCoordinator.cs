@@ -12,6 +12,7 @@ internal enum QueueCyclePhase
     WorkingOneLeg,
     CancellingForReprice,
     CancellingForExit,
+    ClosingBlocked,
     Flattening,
     CoolingDown,
     Suspended,
@@ -75,6 +76,7 @@ internal sealed class QueueCycleOrderCoordinator
     internal decimal BuyWorkingPrice => _buy?.CurrentPrice ?? 0m;
     internal decimal SellWorkingPrice => _sell?.CurrentPrice ?? 0m;
     internal bool IsFaulted => Phase == QueueCyclePhase.Faulted;
+    internal bool IsClosingBlocked => Phase == QueueCyclePhase.ClosingBlocked;
     internal bool BothUnfilled => _buy is not null && _sell is not null &&
         !_buy.HasFill && !_sell.HasFill;
     internal bool HasOutstandingOrders => IsOutstanding(_buy) || IsOutstanding(_sell) ||
@@ -139,10 +141,10 @@ internal sealed class QueueCycleOrderCoordinator
         PaperOrderRequest sellOrder = CreateOrder(_sell);
         _buy.Submitted = true;
         OrderRequested?.Invoke(buyOrder);
-        if (IsFaulted) return;
+        if (IsFaulted || IsClosingBlocked) return;
         _sell.Submitted = true;
         OrderRequested?.Invoke(sellOrder);
-        if (IsFaulted) return;
+        if (IsFaulted || IsClosingBlocked) return;
         UpdateWorkingPhase();
         if (!_buy.HasFill && !_sell.HasFill) ReasonCode = "SignalAccepted";
     }
@@ -151,7 +153,7 @@ internal sealed class QueueCycleOrderCoordinator
     {
         if (_tickSize <= 0m || IsFaulted) return;
         EvaluateReprice(_buy, book);
-        if (IsFaulted) return;
+        if (IsFaulted || IsClosingBlocked) return;
         EvaluateReprice(_sell, book);
         UpdateWorkingPhase();
     }
@@ -301,10 +303,7 @@ internal sealed class QueueCycleOrderCoordinator
                 case OrderLifecycleState.Cancelled:
                 case OrderLifecycleState.Rejected:
                     _exitState = LegState.Cancelled;
-                    Phase = QueueCyclePhase.Faulted;
-                    ReasonCode = orderEvent.State == OrderLifecycleState.Rejected
-                        ? "ExitOrderRejected"
-                        : "ExitOrderCancelled";
+                    EnterClosingBlocked();
                     return;
                 case OrderLifecycleState.Working:
                 case OrderLifecycleState.Submitted:
@@ -328,8 +327,7 @@ internal sealed class QueueCycleOrderCoordinator
                 leg.State == LegState.CancelPending &&
                 string.Equals(orderEvent.ReasonCode, "CancelRequestNotRouted", StringComparison.Ordinal):
                 leg.PendingReplacementPrice = null;
-                Phase = QueueCyclePhase.Faulted;
-                ReasonCode = "CancelRequestNotRouted";
+                EnterClosingBlocked(leg);
                 return;
             case OrderLifecycleState.CancelPending when leg.State == LegState.CancelPending:
                 return;
@@ -362,14 +360,19 @@ internal sealed class QueueCycleOrderCoordinator
                 ReasonCode = "ReplacementSubmitted";
                 UpdateWorkingPhase();
                 return;
+            case OrderLifecycleState.Cancelled when
+                IsClosingBlocked && leg.State == LegState.Working:
+                leg.State = LegState.Cancelled;
+                leg.PendingReplacementPrice = null;
+                leg.CancelIntent = CancelIntent.None;
+                ReasonCode = "ClosingBlocked";
+                return;
             case OrderLifecycleState.Working when
                 leg.State == LegState.CancelPending &&
                 string.Equals(orderEvent.ReasonCode, "CancelFailed", StringComparison.OrdinalIgnoreCase):
                 if (leg.CancelIntent != CancelIntent.Reprice)
                 {
-                    leg.PendingReplacementPrice = null;
-                    Phase = QueueCyclePhase.Faulted;
-                    ReasonCode = "CancelFailedDuringExit";
+                    EnterClosingBlocked(leg);
                     return;
                 }
                 leg.PendingReplacementPrice = null;
@@ -383,8 +386,7 @@ internal sealed class QueueCycleOrderCoordinator
                 leg.CancelIntent = CancelIntent.None;
                 leg.State = LegState.Cancelled;
                 CancelWithoutReplacement(ReferenceEquals(leg, _buy) ? _sell : _buy, CancelIntent.Fault);
-                Phase = QueueCyclePhase.Faulted;
-                ReasonCode = "OrderRejected";
+                EnterClosingBlocked();
                 return;
         }
     }
@@ -444,6 +446,19 @@ internal sealed class QueueCycleOrderCoordinator
         CancelOrderRequested?.Invoke(leg.ClientOrderId);
     }
 
+    private void EnterClosingBlocked(OrderLeg? failedLeg = null)
+    {
+        if (failedLeg?.State == LegState.CancelPending)
+            failedLeg.State = LegState.Working;
+        if (failedLeg is not null)
+        {
+            failedLeg.PendingReplacementPrice = null;
+            failedLeg.CancelIntent = CancelIntent.None;
+        }
+        Phase = QueueCyclePhase.ClosingBlocked;
+        ReasonCode = "ClosingBlocked";
+    }
+
     private void FaultForRetiredFill(string clientOrderId)
     {
         if (!_retiredFilledClientOrderIds.Add(clientOrderId)) return;
@@ -464,7 +479,7 @@ internal sealed class QueueCycleOrderCoordinator
 
     private void UpdateWorkingPhase()
     {
-        if (Phase == QueueCyclePhase.Faulted) return;
+        if (Phase is QueueCyclePhase.Faulted or QueueCyclePhase.ClosingBlocked) return;
         if (_buy is null || _sell is null) return;
         if (_buy.HasFill || _sell.HasFill)
         {

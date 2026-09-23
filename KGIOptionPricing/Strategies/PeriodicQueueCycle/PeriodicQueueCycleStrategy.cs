@@ -108,6 +108,14 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
         bool currentBookHealthy = added && !IsHealthFailure(_lastAssessment.PrimaryReasonCode);
         if (currentBookHealthy) _lastHealthyBook = marketEvent;
 
+        if (_coordinator.IsClosingBlocked)
+        {
+            State = StrategyLifecycleState.Suspended;
+            _reason = _coordinator.ReasonCode;
+            Publish();
+            return;
+        }
+
         PositionSnapshot position = Position();
         if (position.NetQuantity != 0)
         {
@@ -148,18 +156,20 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
         {
             if (currentBookHealthy && ManagePreFillReversal(marketEvent.Timestamp))
             {
-                State = _coordinator.IsFaulted
-                    ? StrategyLifecycleState.Faulted
-                    : _paused ? StrategyLifecycleState.Suspended : StrategyLifecycleState.Running;
+                ApplyCoordinatorState();
+                if (State is not StrategyLifecycleState.Faulted and not StrategyLifecycleState.Suspended)
+                    State = _paused ? StrategyLifecycleState.Suspended : StrategyLifecycleState.Running;
                 _reason = _coordinator.ReasonCode;
                 Publish();
                 return;
             }
             if (currentBookHealthy) _coordinator.EvaluateReprices(marketEvent);
-            State = _coordinator.IsFaulted
-                ? StrategyLifecycleState.Faulted
-                : _paused ? StrategyLifecycleState.Suspended : StrategyLifecycleState.Running;
-            _reason = currentBookHealthy ? _coordinator.ReasonCode : _lastAssessment.PrimaryReasonCode;
+            ApplyCoordinatorState();
+            if (State is not StrategyLifecycleState.Faulted and not StrategyLifecycleState.Suspended)
+                State = _paused ? StrategyLifecycleState.Suspended : StrategyLifecycleState.Running;
+            _reason = _coordinator.IsClosingBlocked || currentBookHealthy
+                ? _coordinator.ReasonCode
+                : _lastAssessment.PrimaryReasonCode;
             Publish();
             return;
         }
@@ -201,7 +211,9 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
             _acceptDecisionPending = true;
             Publish();
             _coordinator.ActivatePreparedCycle();
-            State = _coordinator.IsFaulted ? StrategyLifecycleState.Faulted : StrategyLifecycleState.Running;
+            ApplyCoordinatorState();
+            if (State is not StrategyLifecycleState.Faulted and not StrategyLifecycleState.Suspended)
+                State = StrategyLifecycleState.Running;
             _reason = _coordinator.ReasonCode;
         }
         else
@@ -217,7 +229,7 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
         _coordinator?.OnExecution(execution);
         _oppositeDirectionSeconds = 0;
         _reason = _coordinator?.ReasonCode ?? _reason;
-        if (_coordinator?.IsFaulted == true) State = StrategyLifecycleState.Faulted;
+        ApplyCoordinatorState();
         if (execution.Role is PaperOrderRole.EntryLong or PaperOrderRole.EntryShort)
         {
             PositionSnapshot position = Position();
@@ -239,6 +251,14 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
         if (_context is null || _directionWindow is null || _coordinator is null ||
             State is StrategyLifecycleState.Stopped or StrategyLifecycleState.Faulted)
             return;
+
+        if (_coordinator.IsClosingBlocked)
+        {
+            State = StrategyLifecycleState.Suspended;
+            _reason = _coordinator.ReasonCode;
+            Publish();
+            return;
+        }
 
         if (_cooldownUntil.HasValue)
         {
@@ -298,7 +318,7 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
         if (!string.Equals(orderEvent.StrategyInstanceId, InstanceId, StringComparison.OrdinalIgnoreCase)) return;
         _coordinator?.OnOrderLifecycle(orderEvent);
         _reason = _coordinator?.ReasonCode ?? _reason;
-        if (_coordinator?.IsFaulted == true) State = StrategyLifecycleState.Faulted;
+        ApplyCoordinatorState();
         TryAdvanceRiskExit();
         TryCompleteCycle();
         TryCompleteStop();
@@ -310,11 +330,13 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
         if (State is StrategyLifecycleState.Stopped or StrategyLifecycleState.Faulted) return;
         _paused = true;
         string pauseReason = string.IsNullOrWhiteSpace(reason) ? "使用者暫停" : reason;
-        if (Position().NetQuantity == 0) _coordinator?.CancelAllWorking("Paused");
-        State = _coordinator?.IsFaulted == true
-            ? StrategyLifecycleState.Faulted
-            : StrategyLifecycleState.Suspended;
-        _reason = _coordinator?.IsFaulted == true ? _coordinator.ReasonCode : pauseReason;
+        if (Position().NetQuantity == 0 || _coordinator?.IsClosingBlocked == true)
+            _coordinator?.CancelAllWorking("Paused");
+        ApplyCoordinatorState();
+        if (State != StrategyLifecycleState.Faulted && State != StrategyLifecycleState.Suspended)
+            State = StrategyLifecycleState.Suspended;
+        if (_coordinator?.IsClosingBlocked != true && State != StrategyLifecycleState.Faulted)
+            _reason = pauseReason;
         Publish();
     }
 
@@ -346,20 +368,20 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
         _stopReason = string.IsNullOrWhiteSpace(reason) ? "策略已停止" : reason;
         if (Position().NetQuantity != 0)
             BeginRiskExit(PaperOrderRole.Flatten, "StopRequested", 0);
-        else
-            _coordinator?.CancelAllWorking("StopRequested");
-        if (_coordinator?.IsFaulted == true)
+        _coordinator?.CancelAllWorking("StopRequested");
+        ApplyCoordinatorState();
+        if (State == StrategyLifecycleState.Faulted)
         {
-            State = StrategyLifecycleState.Faulted;
-            _reason = _coordinator.ReasonCode;
+            Publish();
+            return;
         }
-        else
+        if (_coordinator?.IsClosingBlocked != true)
         {
             State = StrategyLifecycleState.Suspended;
             _reason = "StopPending";
-            TryAdvanceRiskExit();
-            TryCompleteStop();
         }
+        TryAdvanceRiskExit();
+        TryCompleteStop();
         Publish();
     }
 
@@ -426,7 +448,7 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
                 "InsufficientNearDepth" or "DepthImbalance" or "SpreadTooWide" or "VolatilityTooHigh" => StrategyDecision.Reject,
             "FixedStopLoss" or "OneLegTimeout" or "MarketDataRecoveryTimeout" or
                 "SignalReversedBeforeFill" => StrategyDecision.Exit,
-            "DailyLossLocked" => StrategyDecision.Halt,
+            "DailyLossLocked" or "ClosingBlocked" => StrategyDecision.Halt,
             _ when State is StrategyLifecycleState.Stopped or StrategyLifecycleState.Faulted => StrategyDecision.Halt,
             _ => StrategyDecision.Hold
         };
@@ -646,15 +668,34 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
 
     private void SetProtectedState()
     {
-        if (_coordinator?.IsFaulted == true)
+        ApplyCoordinatorState();
+        if (State == StrategyLifecycleState.Faulted)
         {
-            State = StrategyLifecycleState.Faulted;
+            return;
+        }
+        if (_coordinator?.IsClosingBlocked == true)
+        {
+            State = StrategyLifecycleState.Suspended;
             _reason = _coordinator.ReasonCode;
         }
         else
         {
             State = _paused ? StrategyLifecycleState.Suspended : StrategyLifecycleState.Running;
             if (_pendingExitReason is not null) _reason = _pendingExitReason;
+        }
+    }
+
+    private void ApplyCoordinatorState()
+    {
+        if (_coordinator?.IsFaulted == true)
+        {
+            State = StrategyLifecycleState.Faulted;
+            _reason = _coordinator.ReasonCode;
+        }
+        else if (_coordinator?.IsClosingBlocked == true)
+        {
+            State = StrategyLifecycleState.Suspended;
+            _reason = _coordinator.ReasonCode;
         }
     }
 

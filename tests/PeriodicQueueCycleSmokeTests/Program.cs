@@ -45,6 +45,7 @@ TestPeriodicStrategyStopsOnlyAfterOrdersAndPositionAreZero();
 TestPeriodicStrategySnapshotExposesFrozenCycleAndLegState();
 TestPeriodicStrategyFaultsWhenRunnerCannotRouteTargetedCancel();
 TestPeriodicStrategyPreservesFaultDuringReentrantStopCancelFailure();
+TestPeriodicStrategyRetriesClosingBlockedCancellation();
 TestPeriodicRunnerStopUsesTargetedManagedCancellation();
 TestPeriodicStrategyResumeStartsFreshCycleAfterFlatPause();
 TestPeriodicStrategyStopsRepriceEvaluationAfterFirstRouteFailure();
@@ -909,10 +910,10 @@ static void TestPeriodicStrategyHandlesRejectedAndCancelFailedLifecycle()
     PaperOrderRequest rejectedBuy = rejectedOrders.Single(x => x.Side == BuySell.Buy);
     PaperOrderRequest rejectedSell = rejectedOrders.Single(x => x.Side == BuySell.Sell);
     rejected.OnOrderLifecycle(Rejected(rejectedBuy.ClientOrderId, rejected.InstanceId, start.AddSeconds(2)));
-    Assert(rejected.State == StrategyLifecycleState.Faulted &&
-           rejected.GetSnapshot().Reason == "OrderRejected" &&
+    Assert(rejected.State == StrategyLifecycleState.Suspended &&
+           rejected.GetSnapshot().Reason == "ClosingBlocked" &&
            rejectedCancels.SequenceEqual(new[] { rejectedSell.ClientOrderId }, StringComparer.Ordinal),
-        "任一完成單被拒絕時必須進入 Faulted 並定向撤銷仍工作的另一側");
+        "任一完成單被拒絕時必須停止後續交易並定向撤銷另一側，但不得誤標 Faulted");
 
     (PeriodicQueueCycleStrategy cancelFailed, MutableClock clock, List<PaperOrderRequest> orders) =
         StartWorkingUpStrategy("cancel-failed", RepriceParameters(), start.AddMinutes(1));
@@ -1057,16 +1058,16 @@ static void TestPeriodicStrategyPreservesReentrantInitialRejection()
         clock.Now = start.AddSeconds(1);
         strategy.OnMarketEvent(StrategyBook(110m, 115m, 20, 10, 2, clock.Now));
 
-        Assert(strategy.State == StrategyLifecycleState.Faulted &&
-               strategy.GetSnapshot().Reason == "OrderRejected",
-            $"初始 {rejectedSide} 同步拒絕不得被 TryStart 覆寫 Faulted");
+        Assert(strategy.State == StrategyLifecycleState.Suspended &&
+               strategy.GetSnapshot().Reason == "ClosingBlocked",
+            $"初始 {rejectedSide} 同步拒絕不得被 TryStart 覆寫為繼續工作或 Faulted");
         Assert(decisions.Count(x => x.Decision == StrategyDecision.Accept &&
                                     x.PrimaryReasonCode == "SignalAccepted") == 1 &&
                causalEvents.IndexOf("decision:SignalAccepted") <
                causalEvents.FindIndex(x => x.StartsWith("submitted:", StringComparison.Ordinal)) &&
                decisions.Last().Decision == StrategyDecision.Halt &&
-               decisions.Last().PrimaryReasonCode == "OrderRejected",
-            $"初始 {rejectedSide} 必須先發布 SignalAccepted 意圖再送單；同步拒絕後最終決策保留 OrderRejected");
+               decisions.Last().PrimaryReasonCode == "ClosingBlocked",
+            $"初始 {rejectedSide} 必須先發布 SignalAccepted 意圖再送單；同步拒絕後最終決策轉為 ClosingBlocked");
         if (rejectedSide == BuySell.Buy)
             Assert(submitted.Count == 1 && cancels.Count == 0,
                 "第一張買單同步拒絕後不得再送出或撤銷尚未送出的賣單");
@@ -1097,10 +1098,10 @@ static void TestPeriodicStrategyFaultsWhenExitCancellationFails()
     string failedId = cancels[0];
     strategy.OnOrderLifecycle(CancelFailed(failedId, strategy.InstanceId, clock.Now));
 
-    Assert(strategy.State == StrategyLifecycleState.Faulted &&
-           strategy.GetSnapshot().Reason == "CancelFailedDuringExit" &&
+    Assert(strategy.State == StrategyLifecycleState.Suspended &&
+           strategy.GetSnapshot().Reason == "ClosingBlocked" &&
            orders.Count == 2,
-        "訊號反轉退出撤單失敗不得恢復工作或重掛，必須維持風險封鎖並 Faulted");
+        "訊號反轉退出撤單失敗不得恢復工作或重掛，必須維持可重試的關閉封鎖");
 }
 
 static void TestPeriodicStrategyPreservesSynchronousReplacementRejectionReason()
@@ -1118,8 +1119,8 @@ static void TestPeriodicStrategyPreservesSynchronousReplacementRejectionReason()
     string oldBuy = orders.Single(x => x.Side == BuySell.Buy).ClientOrderId;
     strategy.OnOrderLifecycle(Cancelled(oldBuy, strategy.InstanceId, clock.Now));
 
-    Assert(strategy.State == StrategyLifecycleState.Faulted &&
-           strategy.GetSnapshot().Reason == "OrderRejected",
+    Assert(strategy.State == StrategyLifecycleState.Suspended &&
+           strategy.GetSnapshot().Reason == "ClosingBlocked",
         "替代單同步拒絕的終端原因不得被外層 ReplacementSubmitted 覆寫");
 }
 
@@ -1188,13 +1189,13 @@ static void TestPeriodicStrategyPreservesFaultDuringReentrantExitCancelFailure()
         strategy.OnMarketEvent(item);
     }
 
-    Assert(cancels.Count == 2 && strategy.State == StrategyLifecycleState.Faulted &&
-           strategy.GetSnapshot().Reason == "CancelFailedDuringExit",
-        "退出撤單第一腿同步 CancelFailed 時仍須盡力撤第二腿，且最後不得覆寫 Faulted 與原因");
+    Assert(cancels.Count == 2 && strategy.State == StrategyLifecycleState.Suspended &&
+           strategy.GetSnapshot().Reason == "ClosingBlocked",
+        "退出撤單第一腿同步 CancelFailed 時仍須盡力撤第二腿，且最後維持可重試的關閉封鎖");
     strategy.OnOrderLifecycle(CancelFailed(cancels[0], strategy.InstanceId, clock.Now));
-    Assert(strategy.State == StrategyLifecycleState.Faulted &&
-           strategy.GetSnapshot().Reason == "CancelFailedDuringExit",
-        "重複 CancelFailed 不得讓 Faulted 退回工作狀態");
+    Assert(strategy.State == StrategyLifecycleState.Suspended &&
+           strategy.GetSnapshot().Reason == "ClosingBlocked",
+        "重複 CancelFailed 不得解除 ClosingBlocked 或重掛委託");
 }
 
 static void TestPeriodicStrategyDoesNotRepriceOnUnhealthyBook()
@@ -1296,9 +1297,9 @@ static void TestPeriodicStrategyFaultsWhenRunnerCannotRouteTargetedCancel()
 
     StrategySnapshot snapshot = runner.GetSnapshot();
     Assert(broker.CancelledClientOrderIds.Count == 1 &&
-           snapshot.State == StrategyLifecycleState.Faulted &&
-           snapshot.Reason == "CancelRequestNotRouted",
-        "真實 Runner 收到 targeted cancel=false 時必須把明確失敗回送 coordinator 並 Faulted");
+           snapshot.State == StrategyLifecycleState.Suspended &&
+           snapshot.Reason == "ClosingBlocked",
+        "真實 Runner 收到 targeted cancel=false 時必須封鎖策略並等待可重試關閉，不得誤標 Faulted");
 }
 
 static void TestPeriodicStrategyPreservesFaultDuringReentrantStopCancelFailure()
@@ -1315,9 +1316,34 @@ static void TestPeriodicStrategyPreservesFaultDuringReentrantStopCancelFailure()
     };
     strategy.Stop("同步失敗停止");
 
-    Assert(cancels.Count == 2 && strategy.State == StrategyLifecycleState.Faulted &&
-           strategy.GetSnapshot().Reason == "CancelFailedDuringExit",
-        "Stop 第一腿同步撤單失敗時仍須嘗試第二腿，且不得在 Stop 結尾覆寫 Faulted");
+    Assert(cancels.Count == 2 && strategy.State == StrategyLifecycleState.Suspended &&
+           strategy.GetSnapshot().Reason == "ClosingBlocked",
+        "Stop 第一腿同步撤單失敗時仍須嘗試第二腿，並維持可重試關閉封鎖");
+}
+
+static void TestPeriodicStrategyRetriesClosingBlockedCancellation()
+{
+    DateTimeOffset start = new(2026, 9, 23, 23, 30, 0, TimeSpan.Zero);
+    (PeriodicQueueCycleStrategy strategy, MutableClock clock, List<PaperOrderRequest> orders) =
+        StartWorkingUpStrategy("closing-blocked-retry", NoRepriceParameters(), start);
+    var cancels = new List<string>();
+    strategy.CancelOrderRequested += cancels.Add;
+
+    strategy.Stop("第一次關閉");
+    string first = orders[0].ClientOrderId;
+    string second = orders[1].ClientOrderId;
+    strategy.OnOrderLifecycle(CancelFailed(first, strategy.InstanceId, clock.Now));
+    Assert(strategy.State == StrategyLifecycleState.Suspended &&
+           strategy.GetSnapshot().Reason == "ClosingBlocked",
+        "撤單失敗後必須停在 ClosingBlocked，而不是 Faulted");
+
+    strategy.Stop("重試關閉");
+    Assert(cancels.Count(x => x == first) == 2 && cancels.Count(x => x == second) == 1,
+        "ClosingBlocked 的 Stop 重試只能再次撤銷失敗腿，不得重複取消已在 pending 的另一腿");
+    strategy.OnOrderLifecycle(Cancelled(first, strategy.InstanceId, clock.Now));
+    strategy.OnOrderLifecycle(Cancelled(second, strategy.InstanceId, clock.Now));
+    Assert(strategy.State == StrategyLifecycleState.Stopped,
+        "重試撤單收到全部終態且帳本為零後，策略必須安全停止");
 }
 
 static void TestPeriodicRunnerStopUsesTargetedManagedCancellation()
@@ -1409,9 +1435,9 @@ static void TestPeriodicStrategyStopsRepriceEvaluationAfterFirstRouteFailure()
     runner.OnMarketEvent(StrategyBook(110m, 115m, 20, 20, 3, clock.Now));
 
     StrategySnapshot snapshot = runner.GetSnapshot();
-    Assert(broker.CancelAttempts.Count == 1 && snapshot.State == StrategyLifecycleState.Faulted &&
-           snapshot.Reason == "CancelRequestNotRouted",
-        "第一腿 cancel=false 後必須立即停止評估第二腿，不得由後續成功路由覆寫 fail-closed 狀態");
+    Assert(broker.CancelAttempts.Count == 1 && snapshot.State == StrategyLifecycleState.Suspended &&
+           snapshot.Reason == "ClosingBlocked",
+        "第一腿 cancel=false 後必須立即停止評估第二腿，並轉為可重試的 ClosingBlocked");
 }
 
 static void TestPeriodicStrategyFaultsOnLateFillFromRetiredCycle()
