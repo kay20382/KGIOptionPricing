@@ -78,6 +78,7 @@ public sealed record PaperOrderRequest
 {
     public string ClientOrderId { get; init; } = string.Empty;
     public string CycleId { get; init; } = string.Empty;
+    public long StrategyRunGeneration { get; init; }
     public int Generation { get; init; }
     public string StrategyInstanceId { get; init; } = string.Empty;
     public string Symbol { get; init; } = string.Empty;
@@ -93,6 +94,7 @@ public sealed record PaperOrder
     public string OrderId { get; init; } = string.Empty;
     public string ClientOrderId { get; init; } = string.Empty;
     public string CycleId { get; init; } = string.Empty;
+    public long StrategyRunGeneration { get; init; }
     public int Generation { get; init; }
     public string StrategyInstanceId { get; init; } = string.Empty;
     public string Symbol { get; init; } = string.Empty;
@@ -112,6 +114,7 @@ public sealed record ExecutionEvent
     public string StrategyInstanceId { get; init; } = string.Empty;
     public string ClientOrderId { get; init; } = string.Empty;
     public string CycleId { get; init; } = string.Empty;
+    public long StrategyRunGeneration { get; init; }
     public int Generation { get; init; }
     public string OrderId { get; init; } = string.Empty;
     public string Symbol { get; init; } = string.Empty;
@@ -130,6 +133,7 @@ public sealed record OrderLifecycleEvent
     public string StrategyInstanceId { get; init; } = string.Empty;
     public string ClientOrderId { get; init; } = string.Empty;
     public string CycleId { get; init; } = string.Empty;
+    public long StrategyRunGeneration { get; init; }
     public int Generation { get; init; }
     public string OrderId { get; init; } = string.Empty;
     public string BrokerOrderId { get; init; } = string.Empty;

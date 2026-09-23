@@ -37,6 +37,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         public bool AwaitingSettlement { get; set; }
         public bool ProtocolViolation { get; set; }
         public bool ProtocolViolationPublished { get; set; }
+        public bool ManualCancellationReconciled { get; set; }
         public bool IsManaged => !string.IsNullOrWhiteSpace(Order.ClientOrderId);
     }
 
@@ -96,11 +97,33 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
     public int LocalConditionCount { get { lock (_sync) return _conditions.Count; } }
     public int QuarantinedBrokerOrderCount
     {
-        get { lock (_sync) return _realOrders.Values.Count(x => x.Terminal && x.AwaitingSettlement); }
+        get
+        {
+            lock (_sync)
+            {
+                PurgeExpiredTerminalsLocked(_now());
+                return _realOrders.Values.Count(x => x.Terminal && x.AwaitingSettlement);
+            }
+        }
     }
     public int ProtocolViolationCount
     {
         get { lock (_sync) return _realOrders.Values.Count(x => x.ProtocolViolation); }
+    }
+    public int ManualReconciliationObservationCount
+    {
+        get
+        {
+            lock (_sync)
+            {
+                // Pulse relies on this value to release the manual-reconciliation
+                // guard.  It must observe the same expiry boundary as the other
+                // order views; otherwise the close stays blocked until a separate
+                // read happens to purge the tombstone.
+                PurgeExpiredTerminalsLocked(_now());
+                return _realOrders.Values.Count(x => x.ManualCancellationReconciled && x.AwaitingSettlement);
+            }
+        }
     }
     internal int ClientOrderRegistryCount
     {
@@ -188,6 +211,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
             OrderId = orderId,
             ClientOrderId = request.ClientOrderId,
             CycleId = request.CycleId,
+            StrategyRunGeneration = request.StrategyRunGeneration,
             Generation = request.Generation,
             StrategyInstanceId = request.StrategyInstanceId,
             Symbol = request.Symbol,
@@ -306,6 +330,40 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         foreach (string realId in realIds) RequestCancel(realId);
         if (conditionCount > 0) StateChanged?.Invoke();
         return conditionCount + realIds.Length;
+        }
+        finally { ExitOperation(); }
+    }
+
+    /// <summary>
+    /// Applies an explicit operator reconciliation after the operator has
+    /// independently verified that every still-tracked broker order was
+    /// cancelled outside this process.  The resulting tombstones deliberately
+    /// remain available during the late-fill observation window.
+    /// </summary>
+    public int ReconcileExternallyCancelledOrders()
+    {
+        EnterOperation();
+        try
+        {
+            List<OrderLifecycleEvent> lifecycles = new();
+            lock (_sync)
+            {
+                PurgeExpiredTerminalsLocked(_now());
+                ThrowIfClosingLocked();
+                ThrowIfProtocolViolationLocked();
+                DateTimeOffset now = _now();
+                foreach (TrackedRealOrder tracked in _realOrders.Values.Where(x => !x.Terminal).ToArray())
+                {
+                    tracked.RemainingQuantity = 0;
+                    tracked.ManualCancellationReconciled = true;
+                    OrderLifecycleEvent? lifecycle = CreateTransitionLocked(
+                        tracked, OrderLifecycleState.Cancelled, null, "ManualBrokerReconciled", now);
+                    if (lifecycle != null) lifecycles.Add(lifecycle);
+                }
+            }
+            foreach (OrderLifecycleEvent lifecycle in lifecycles) OrderLifecycleChanged?.Invoke(lifecycle);
+            if (lifecycles.Count > 0) StateChanged?.Invoke();
+            return lifecycles.Count;
         }
         finally { ExitOperation(); }
     }
@@ -648,6 +706,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
                 StrategyInstanceId = _instanceId,
                 ClientOrderId = tracked.Order.ClientOrderId,
                 CycleId = tracked.Order.CycleId,
+                StrategyRunGeneration = tracked.Order.StrategyRunGeneration,
                 Generation = tracked.Order.Generation,
                 OrderId = brokerOrder.OrderId,
                 Symbol = _quoteSymbol,
@@ -910,6 +969,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
             StrategyInstanceId = _instanceId,
             ClientOrderId = tracked.Order.ClientOrderId,
             CycleId = tracked.Order.CycleId,
+            StrategyRunGeneration = tracked.Order.StrategyRunGeneration,
             Generation = tracked.Order.Generation,
             OrderId = tracked.Order.OrderId,
             BrokerOrderId = tracked.BrokerOrderId,
@@ -990,7 +1050,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
     private void PurgeExpiredTerminalsLocked(DateTimeOffset now)
     {
         string[] expired = _realOrders
-            .Where(x => x.Value.Terminal && !x.Value.AwaitingSettlement && x.Value.TerminalAt.HasValue &&
+            .Where(x => x.Value.Terminal && !x.Value.ProtocolViolation && x.Value.TerminalAt.HasValue &&
                         now - x.Value.TerminalAt.Value > TerminalRetention)
             .Select(x => x.Key)
             .ToArray();

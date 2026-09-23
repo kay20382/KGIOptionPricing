@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using KGIOptionPricing.StrategyFramework.Recovery;
 
 namespace KGIOptionPricing.StrategyFramework;
 
@@ -48,6 +49,13 @@ public interface IManagedOrderStrategy
 {
     event Action<string>? CancelOrderRequested;
     void OnOrderLifecycle(OrderLifecycleEvent orderEvent);
+}
+
+public interface IStrategyRecoveryParticipant
+{
+    string RecoverySchema { get; }
+    StrategyRecoveryCheckpoint CaptureRecoveryCheckpoint();
+    void RestoreRecoveryCheckpoint(StrategyRecoveryCheckpoint checkpoint);
 }
 
 public interface IStrategyHeartbeat

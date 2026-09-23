@@ -27,6 +27,7 @@ public sealed class StrategyInstanceRunner : IDisposable
     private readonly ResolvedStrategyUniverse _universe;
     private readonly decimal _commissionPerContract;
     private readonly IStrategyClock _clock;
+    private readonly long _strategyRunGeneration;
     private readonly IManagedOrderStrategy? _managedStrategy;
     private readonly IManagedStrategyExecutionService? _managedBroker;
     private readonly IStrategyDecisionSource? _decisionSource;
@@ -40,6 +41,7 @@ public sealed class StrategyInstanceRunner : IDisposable
     private bool _observationFaulted;
 
     public string InstanceId => _strategy.InstanceId;
+    public long StrategyRunGeneration => _strategyRunGeneration;
     internal bool IsDisposed { get { lock (_sync) return _disposed; } }
     public event Action<StrategySnapshot>? SnapshotChanged;
     public event Action<ExecutionEvent>? ExecutionOccurred;
@@ -53,12 +55,15 @@ public sealed class StrategyInstanceRunner : IDisposable
         IStrategyClock clock,
         decimal commissionPerContract,
         IStrategyExecutionService? executionService = null,
-        bool deferStart = false)
+        bool deferStart = false,
+        long? strategyRunGeneration = null)
     {
         _strategy = strategy;
         _universe = universe;
         _ledger = ledger;
         _clock = clock;
+        _strategyRunGeneration = strategyRunGeneration ?? 1L;
+        if (_strategyRunGeneration <= 0) throw new ArgumentOutOfRangeException(nameof(strategyRunGeneration));
         _commissionPerContract = Math.Max(0m, commissionPerContract);
         _broker = executionService ?? new CrossPricePaperExecutionService(commissionPerContract, clock);
         foreach (ResolvedProduct product in universe.AllProducts) ledger.RegisterProduct(strategy.InstanceId, product);
@@ -196,7 +201,12 @@ public sealed class StrategyInstanceRunner : IDisposable
         lock (_sync)
         {
             if (_observationFaulted || _disposed || _disposing) return;
-            try { _broker.Submit(request, _clock.Now); }
+            PaperOrderRequest ownedRequest = request with
+            {
+                StrategyInstanceId = _strategy.InstanceId,
+                StrategyRunGeneration = _strategyRunGeneration
+            };
+            try { _broker.Submit(ownedRequest, _clock.Now); }
             catch (BrokerReconciliationRequiredException)
             {
                 // The execution service already published the protocol failure.
@@ -232,6 +242,7 @@ public sealed class StrategyInstanceRunner : IDisposable
             {
                 Timestamp = _clock.Now,
                 StrategyInstanceId = _strategy.InstanceId,
+                StrategyRunGeneration = _strategyRunGeneration,
                 ClientOrderId = clientOrderId,
                 PreviousState = OrderLifecycleState.CancelPending,
                 State = OrderLifecycleState.CancelPending,
@@ -244,7 +255,8 @@ public sealed class StrategyInstanceRunner : IDisposable
 
     private void OnOrderLifecycleChanged(OrderLifecycleEvent orderEvent)
     {
-        if (!string.Equals(orderEvent.StrategyInstanceId, _strategy.InstanceId, StringComparison.OrdinalIgnoreCase))
+        if (!string.Equals(orderEvent.StrategyInstanceId, _strategy.InstanceId, StringComparison.OrdinalIgnoreCase) ||
+            (orderEvent.StrategyRunGeneration != 0 && orderEvent.StrategyRunGeneration != _strategyRunGeneration))
             return;
         lock (_sync)
         {
@@ -271,7 +283,8 @@ public sealed class StrategyInstanceRunner : IDisposable
         StrategySnapshot snapshot;
         lock (_sync)
         {
-            if (_disposed || !string.Equals(execution.StrategyInstanceId, _strategy.InstanceId, StringComparison.OrdinalIgnoreCase))
+            if (_disposed || !string.Equals(execution.StrategyInstanceId, _strategy.InstanceId, StringComparison.OrdinalIgnoreCase) ||
+                (execution.StrategyRunGeneration != 0 && execution.StrategyRunGeneration != _strategyRunGeneration))
                 return;
             // Applying the execution and notifying the strategy are one serialized
             // state transition. Broker callbacks may be concurrent with heartbeats.
