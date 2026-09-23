@@ -112,6 +112,7 @@ namespace KGIOptionPricing.OrderManagement.Core
                 OrderId = !string.IsNullOrEmpty(request.OrderId) ? request.OrderId : Guid.NewGuid().ToString("N"),
                 Source = OrderSource.Internal,
                 Instrument = request.Instrument ?? new InstrumentKey(),
+                StrategyRoute = request.StrategyRoute,
                 BuySell = request.BuySell,
                 OrderPrice = request.Price,
                 OrderQty = request.Quantity,

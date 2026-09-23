@@ -9,6 +9,8 @@ namespace KGIOptionPricing.OrderManagement.Core
         public OrderSource Source { get; set; } = OrderSource.Internal;
         public InstrumentKey Instrument { get; set; } = new InstrumentKey();
         public ExternalOrderIdentity Identity { get; set; } = new ExternalOrderIdentity();
+        public ForeignOrderContext? ForeignContext { get; set; }
+        public StrategyOrderRouteMetadata? StrategyRoute { get; set; }
         public BuySell BuySell { get; set; }
         
         public double OrderPrice { get; set; }
@@ -22,6 +24,7 @@ namespace KGIOptionPricing.OrderManagement.Core
         public OrderStatus PreviousStatus { get; set; }
         
         public List<OrderModifyRecord> ModifyHistory { get; set; } = new List<OrderModifyRecord>();
+        public List<OrderOperationRecord> OperationHistory { get; set; } = new List<OrderOperationRecord>();
         
         public DateTime SubmitTime { get; set; }
         public DateTime UpdateTime { get; set; }

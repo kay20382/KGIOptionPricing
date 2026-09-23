@@ -16,6 +16,7 @@ public interface ILiveOrderOwnershipStore : IDisposable
     FillAcceptance TryAcceptFill(LiveOrderOwnerKey owner, string? execId, int cumulativeQuantity);
     void MarkSubmissionUnknown(LiveOrderOwnerKey owner, string reason);
     void AppendCheckpoint(StrategyRecoveryCheckpoint checkpoint);
+    void AppendQuarantinedEvent(QuarantinedBrokerEvent quarantinedEvent);
     LiveOwnershipSnapshot Replay();
     IReadOnlyList<LiveOrderOwnership> LoadOpenRoutes(string account, string symbol);
 }
@@ -35,6 +36,7 @@ public sealed class LiveOrderOwnershipStore : ILiveOrderOwnershipStore
     private readonly Dictionary<LiveOrderOwnerKey, HashSet<string>> _execIds = new();
     private readonly Dictionary<LiveOrderOwnerKey, int> _watermarks = new();
     private readonly Dictionary<(string InstanceId, long RunGeneration), StrategyRecoveryCheckpoint> _checkpoints = new();
+    private readonly List<QuarantinedBrokerEvent> _quarantinedEvents = new();
     private long _sequence;
     private bool _disposed;
     private string _quarantineReason = string.Empty;
@@ -92,6 +94,8 @@ public sealed class LiveOrderOwnershipStore : ILiveOrderOwnershipStore
             ThrowIfUnavailable();
             if (!_routes.TryGetValue(owner, out LiveOrderOwnership? route))
                 throw new InvalidOperationException("Cannot accept a fill for an unknown owner.");
+            if (!string.IsNullOrWhiteSpace(execId) && _execIds.TryGetValue(owner, out HashSet<string>? seen) && seen.Contains(execId))
+                return new FillAcceptance(false, 0);
             if (cumulativeQuantity > route.Quantity)
                 throw new InvalidOperationException("Cumulative fill quantity exceeds the owned order quantity.");
             HashSet<string> ids = _execIds[owner];
@@ -145,6 +149,17 @@ public sealed class LiveOrderOwnershipStore : ILiveOrderOwnershipStore
         }
     }
 
+    public void AppendQuarantinedEvent(QuarantinedBrokerEvent quarantinedEvent)
+    {
+        ArgumentNullException.ThrowIfNull(quarantinedEvent);
+        lock (_sync)
+        {
+            ThrowIfUnavailable();
+            Append("Quarantine", quarantinedEvent);
+            _quarantinedEvents.Add(quarantinedEvent);
+        }
+    }
+
     public LiveOwnershipSnapshot Replay()
     {
         lock (_sync)
@@ -154,6 +169,7 @@ public sealed class LiveOrderOwnershipStore : ILiveOrderOwnershipStore
                 Routes = _routes.Values.ToArray(),
                 Aliases = new Dictionary<BrokerOrderAlias, LiveOrderOwnerKey>(_aliases),
                 Checkpoints = _checkpoints.Values.ToArray(),
+                QuarantinedEvents = _quarantinedEvents.ToArray(),
                 IsQuarantined = _quarantineReason.Length > 0,
                 QuarantineReason = _quarantineReason
             };
@@ -258,6 +274,13 @@ public sealed class LiveOrderOwnershipStore : ILiveOrderOwnershipStore
             {
                 StrategyRecoveryCheckpoint checkpoint = envelope.Payload.Deserialize<StrategyRecoveryCheckpoint>() ?? throw new JsonException("Missing checkpoint.");
                 _checkpoints[(checkpoint.StrategyInstanceId, checkpoint.StrategyRunGeneration)] = checkpoint;
+                break;
+            }
+            case "Quarantine":
+            {
+                QuarantinedBrokerEvent quarantined = envelope.Payload.Deserialize<QuarantinedBrokerEvent>()
+                    ?? throw new JsonException("Missing quarantine record.");
+                _quarantinedEvents.Add(quarantined);
                 break;
             }
             default:

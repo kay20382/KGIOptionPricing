@@ -16,7 +16,9 @@ namespace KGIOptionPricing.OrderManagement.Core
         // but often attached here if multiple accounts are used).
         public string Account { get; set; } = string.Empty;
         public string BrokerId { get; set; } = string.Empty;
+        public ForeignOrderContext? ForeignContext { get; set; }
         public string FCM { get; set; } = string.Empty;
+        public StrategyOrderRouteMetadata? StrategyRoute { get; set; }
     }
 
     public class ModifyOrderRequest
@@ -31,6 +33,7 @@ namespace KGIOptionPricing.OrderManagement.Core
         public int NewQuantity { get; set; }
         public string Account { get; set; } = string.Empty;
         public string BrokerId { get; set; } = string.Empty;
+        public ForeignOrderContext? ForeignContext { get; set; }
     }
 
     public class CancelOrderRequest
@@ -43,6 +46,7 @@ namespace KGIOptionPricing.OrderManagement.Core
         public BuySell BuySell { get; set; }
         public string Account { get; set; } = string.Empty;
         public string BrokerId { get; set; } = string.Empty;
+        public ForeignOrderContext? ForeignContext { get; set; }
         public ushort Qty { get; set; } = 1;
     }
 }

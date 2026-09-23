@@ -604,7 +604,14 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
                 TimeInForce = TimeInForce.IOC,
                 PositionEffect = PositionEffect.Auto,
                 BrokerId = _gateway.BrokerId,
-                Account = _gateway.Account
+                Account = _gateway.Account,
+                StrategyRoute = new StrategyOrderRouteMetadata(
+                    condition.StrategyInstanceId,
+                    condition.StrategyRunGeneration,
+                    condition.ClientOrderId,
+                    condition.CycleId,
+                    condition.Symbol,
+                    condition.Role.ToString())
             });
         }
         catch (BrokerReconciliationRequiredException)
@@ -1162,6 +1169,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         _gateway.OrderFailed -= OnOrderFailed;
         _gateway.CancelFailed -= OnCancelFailed;
         _gateway.OrderStateChanged -= OnOrderChanged;
+        if (_gateway is IDisposable disposableGateway) disposableGateway.Dispose();
         bool changed;
         lock (_sync)
         {

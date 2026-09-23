@@ -32,11 +32,14 @@ public sealed class LiveStrategyService : IDisposable
     private readonly object _disposeSync = new();
     private DisposeAttempt? _disposeAttempt;
     private readonly OrderManager _orders;
+    private readonly LiveOrderOwnershipStore? _routeStore;
+    private readonly LiveStrategyOrderRouter? _orderRouter;
     private readonly Func<bool> _isLoggedIn;
     private readonly Func<string> _account;
     private readonly Func<StrategyDefinition, ResolvedStrategyUniverse> _resolve;
     private readonly Func<StrategyDefinition, ISimulationStrategy> _createStrategy;
     private readonly Func<StrategyDefinition, ResolvedStrategyUniverse, decimal, KgiLiveStrategyExecutionService> _createExecution;
+    private readonly Func<StrategyDefinition, ResolvedStrategyUniverse, decimal, long, KgiLiveStrategyExecutionService>? _createExecutionWithGeneration;
     private readonly Action? _afterHostAddFailure;
     private readonly ConcurrentDictionary<string, KgiLiveStrategyExecutionService> _executions = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, decimal> _dailyLossLimits = new(StringComparer.OrdinalIgnoreCase);
@@ -46,11 +49,14 @@ public sealed class LiveStrategyService : IDisposable
     private readonly ConcurrentDictionary<string, long> _activeGenerations = new(StringComparer.OrdinalIgnoreCase);
     private long _generationSequence;
     private readonly ConcurrentDictionary<string, byte> _pendingClose = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, byte> _manualCloseReconciliationInProgress = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, byte> _manualCloseObservationPending = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, byte> _closeFlattenAuthorized = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, FlattenAttempt> _flattenPending = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, byte> _closeRetryNeeded = new(StringComparer.OrdinalIgnoreCase);
     private long _flattenToken;
     private readonly ConcurrentDictionary<string, AddReservation> _addReservations = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, StrategySnapshot> _deferredAddSnapshots = new(StringComparer.OrdinalIgnoreCase);
     private bool _disposed;
 
     public event Action<StrategySnapshot>? SnapshotChanged;
@@ -93,6 +99,13 @@ public sealed class LiveStrategyService : IDisposable
         _orders = orders;
         _isLoggedIn = () => trade.IsLoggedIn;
         _account = () => trade.Account;
+        string routeAccountKey = string.Join("_", new[] { trade.BrokerID, trade.Account }
+            .Select(value => string.Concat((value ?? string.Empty).Select(character =>
+                Path.GetInvalidFileNameChars().Contains(character) ? '_' : character))));
+        string routeDirectory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "KGIOptionPricing", "Strategy_Routes", routeAccountKey);
+        _routeStore = new LiveOrderOwnershipStore(routeDirectory);
+        _orderRouter = new LiveStrategyOrderRouter(new OrderManagerLiveStrategyOrderGateway(orders, trade), _routeStore);
         _resolve = definition => _resolver.Resolve(definition.Universe);
         _createStrategy = definition => _registry.Get(definition.StrategyType).Create(definition);
         _createExecution = (definition, universe, commission) =>
@@ -100,7 +113,16 @@ public sealed class LiveStrategyService : IDisposable
             ContractInfo contract = SymbolRepository.Instance.GetHotMonthContract(definition.Universe.Tradable.ProductId)
                 ?? throw new InvalidOperationException("找不到 225MC 熱門月合約，禁止實盤啟動。");
             return new KgiLiveStrategyExecutionService(
-                _orders, trade, definition.InstanceId, universe.Tradable, contract, commission);
+                _orderRouter.Register(definition.InstanceId, _activeGenerations.GetValueOrDefault(definition.InstanceId, 1L)),
+                definition.InstanceId, universe.Tradable, contract, commission);
+        };
+        _createExecutionWithGeneration = (definition, universe, commission, runGeneration) =>
+        {
+            ContractInfo contract = SymbolRepository.Instance.GetHotMonthContract(definition.Universe.Tradable.ProductId)
+                ?? throw new InvalidOperationException("找不到 225MC 熱門月合約，禁止實盤啟動。");
+            return new KgiLiveStrategyExecutionService(
+                _orderRouter.Register(definition.InstanceId, runGeneration), definition.InstanceId,
+                universe.Tradable, contract, commission);
         };
         _afterHostAddFailure = null;
         foreach (IStrategyFactory factory in CreateDefaultFactories()) _registry.Register(factory);
@@ -127,6 +149,7 @@ public sealed class LiveStrategyService : IDisposable
         _resolve = resolve ?? throw new ArgumentNullException(nameof(resolve));
         _createStrategy = createStrategy ?? throw new ArgumentNullException(nameof(createStrategy));
         _createExecution = createExecution ?? throw new ArgumentNullException(nameof(createExecution));
+        _createExecutionWithGeneration = null;
         _afterHostAddFailure = afterHostAddFailure;
         _host.SnapshotChanged += OnSnapshot;
         _host.ExecutionOccurred += execution => ExecutionOccurred?.Invoke(execution);
@@ -141,6 +164,8 @@ public sealed class LiveStrategyService : IDisposable
         if (!string.Equals(definition.Universe.Tradable.ProductId, "225MC", StringComparison.OrdinalIgnoreCase))
             throw new InvalidOperationException("實盤策略第一版僅允許交易商品 225MC。");
         var reservation = new AddReservation(Environment.CurrentManagedThreadId, Interlocked.Increment(ref _generationSequence));
+        bool added = false;
+        bool retainedAfterFailedAdd = false;
         if (!_addReservations.TryAdd(definition.InstanceId, reservation))
             throw new InvalidOperationException($"實盤策略實例正在加入：{definition.InstanceId}");
         try
@@ -150,7 +175,8 @@ public sealed class LiveStrategyService : IDisposable
                 throw new InvalidOperationException($"實盤策略實例已存在：{definition.InstanceId}");
 
             ResolvedStrategyUniverse universe = _resolve(definition);
-            var execution = _createExecution(definition, universe, commissionPerContract);
+            var execution = _createExecutionWithGeneration?.Invoke(definition, universe, commissionPerContract, reservation.Generation)
+                ?? _createExecution(definition, universe, commissionPerContract);
             execution.Failed += reason => QueueRiskStop(definition.InstanceId, reservation.Generation, reason);
             execution.StateChanged += () => OnExecutionStateChanged(definition.InstanceId, execution);
             execution.OrderLifecycleChanged += state => OnExecutionLifecycleChanged(definition.InstanceId, state);
@@ -163,7 +189,8 @@ public sealed class LiveStrategyService : IDisposable
             _activeGenerations[definition.InstanceId] = reservation.Generation;
             try
             {
-                _host.Add(_createStrategy(definition), universe, commissionPerContract, execution);
+                _host.Add(_createStrategy(definition), universe, commissionPerContract, execution, reservation.Generation);
+                added = true;
             }
             catch (Exception addError)
             {
@@ -172,9 +199,9 @@ public sealed class LiveStrategyService : IDisposable
                 catch (Exception exception) { hookError = exception; }
                 // Host retaining the runner is the single owner of this executor.
                 // Never race an independent cleanup against its ledger/routes.
-                bool retainedByHost = _host.GetSnapshots().Any(x =>
+                retainedAfterFailedAdd = _host.GetSnapshots().Any(x =>
                     string.Equals(x.InstanceId, definition.InstanceId, StringComparison.OrdinalIgnoreCase));
-                if (retainedByHost)
+                if (retainedAfterFailedAdd)
                 {
                     if (hookError != null) throw new AggregateException(addError, hookError);
                     throw;
@@ -205,6 +232,11 @@ public sealed class LiveStrategyService : IDisposable
         {
             _addReservations.TryRemove(definition.InstanceId, out _);
             reservation.Completed.Set();
+            if ((added || retainedAfterFailedAdd) &&
+                _deferredAddSnapshots.TryRemove(definition.InstanceId, out StrategySnapshot? snapshot))
+                PublishSnapshot(snapshot);
+            else if (!added)
+                _deferredAddSnapshots.TryRemove(definition.InstanceId, out _);
             TryProcessPendingRisk(definition.InstanceId, reservation.Generation);
         }
     }
@@ -287,6 +319,62 @@ public sealed class LiveStrategyService : IDisposable
         return closed;
     }
 
+    public bool ReconcileExternallyCancelledOrders(string instanceId, out string message)
+    {
+        LiveStrategyCloseStatus status = GetCloseStatus(instanceId);
+        if (!status.Exists)
+        {
+            message = "找不到實盤策略實例。";
+            return false;
+        }
+        if (!status.ClosePending)
+        {
+            message = "請先使用「關閉／平倉」停止策略訊號並進入關閉流程，再執行人工核對。";
+            return false;
+        }
+        if (status.ManualReconciliationRequired)
+        {
+            message = "偵測到成交數量協定異常；不得以人工刪單同步取代券商成交／部位核對。";
+            return false;
+        }
+        if (!_executions.TryGetValue(instanceId, out KgiLiveStrategyExecutionService? execution))
+        {
+            message = "找不到實盤執行器，無法同步人工刪單。";
+            return false;
+        }
+
+        if (!_manualCloseReconciliationInProgress.TryAdd(instanceId, 0))
+        {
+            message = "人工刪單同步正在進行，請等待本次核對完成。";
+            return false;
+        }
+        try
+        {
+            int reconciled;
+            try { reconciled = execution.ReconcileExternallyCancelledOrders(); }
+            catch (BrokerReconciliationRequiredException exception)
+            {
+                message = exception.Message;
+                return false;
+            }
+            if (reconciled == 0)
+            {
+                message = "本機已無待同步的市場委託；請重新確認券商委託與實際部位。";
+                return false;
+            }
+
+            _manualCloseObservationPending.TryAdd(instanceId, 0);
+            LiveStrategyCloseStatus after = GetCloseStatus(instanceId);
+            message = after.Position != 0
+                ? $"已依人工核對同步 {reconciled} 筆刪單；仍有部位 {after.Position} 口，先進入 late-fill 觀察，完成後才會送出平倉單。"
+                : after.QuarantinedBrokerOrders != 0
+                    ? $"已依人工核對同步 {reconciled} 筆刪單；需等待 late-fill 觀察期完成後才可關閉。"
+                    : "已同步人工刪單，策略已完成安全關閉。";
+            return true;
+        }
+        finally { _manualCloseReconciliationInProgress.TryRemove(instanceId, out _); }
+    }
+
     public bool Remove(string instanceId)
     {
         WaitForAdd(instanceId);
@@ -303,6 +391,8 @@ public sealed class LiveStrategyService : IDisposable
             _activeGenerations.TryRemove(instanceId, out _);
             _pendingRisk.TryRemove(instanceId, out _);
             _pendingClose.TryRemove(instanceId, out _);
+            _manualCloseReconciliationInProgress.TryRemove(instanceId, out _);
+            _manualCloseObservationPending.TryRemove(instanceId, out _);
             _closeFlattenAuthorized.TryRemove(instanceId, out _);
             _flattenPending.TryRemove(instanceId, out _);
         }
@@ -314,6 +404,15 @@ public sealed class LiveStrategyService : IDisposable
     public void Pulse(DateTimeOffset now)
     {
         _host.Pulse(now);
+        foreach (string instanceId in _manualCloseObservationPending.Keys.ToArray())
+        {
+            if (_executions.TryGetValue(instanceId, out KgiLiveStrategyExecutionService? execution) &&
+                execution.ManualReconciliationObservationCount == 0)
+            {
+                _manualCloseObservationPending.TryRemove(instanceId, out _);
+                TryFinalizeClose(instanceId);
+            }
+        }
         foreach (string instanceId in _closeRetryNeeded.Keys.ToArray())
         {
             if (_closeRetryNeeded.TryRemove(instanceId, out _)) TryFinalizeClose(instanceId);
@@ -339,6 +438,19 @@ public sealed class LiveStrategyService : IDisposable
         string.Equals(x.InstanceId, instanceId, StringComparison.OrdinalIgnoreCase));
 
     private void OnSnapshot(StrategySnapshot snapshot)
+    {
+        // Strategy.Start publishes snapshots while Add owns a lifecycle lease.
+        // Subscribers such as the live grid are not allowed to query a partial
+        // instance, so retain only the latest initial state until Add completes.
+        if (_addReservations.ContainsKey(snapshot.InstanceId))
+        {
+            _deferredAddSnapshots[snapshot.InstanceId] = snapshot;
+            return;
+        }
+        PublishSnapshot(snapshot);
+    }
+
+    private void PublishSnapshot(StrategySnapshot snapshot)
     {
         foreach (Action<StrategySnapshot> handler in (SnapshotChanged?.GetInvocationList() ?? Array.Empty<Delegate>())
                      .Cast<Action<StrategySnapshot>>())
@@ -404,6 +516,12 @@ public sealed class LiveStrategyService : IDisposable
     {
         if (!_pendingClose.ContainsKey(instanceId) || !_executions.TryGetValue(instanceId, out KgiLiveStrategyExecutionService? execution))
             return false;
+        if (_manualCloseReconciliationInProgress.ContainsKey(instanceId)) return false;
+        if (_manualCloseObservationPending.ContainsKey(instanceId))
+        {
+            if (execution.ManualReconciliationObservationCount > 0) return false;
+            _manualCloseObservationPending.TryRemove(instanceId, out _);
+        }
         StrategySnapshot? snapshot = Find(instanceId);
         if (snapshot == null) return false;
         if (execution.ProtocolViolationCount > 0) return false;
@@ -443,7 +561,8 @@ public sealed class LiveStrategyService : IDisposable
 
     private void OnExecutionStateChanged(string instanceId, KgiLiveStrategyExecutionService execution)
     {
-        if (_pendingClose.ContainsKey(instanceId) && execution.ActiveBrokerOrderCount == 0)
+        if (_pendingClose.ContainsKey(instanceId) && execution.ActiveBrokerOrderCount == 0 &&
+            execution.ManualReconciliationObservationCount == 0)
             _closeRetryNeeded.TryAdd(instanceId, 0);
     }
 
@@ -490,6 +609,8 @@ public sealed class LiveStrategyService : IDisposable
             _heartbeat?.Dispose();
             timerDrained = true;
             _host.Dispose();
+            _orderRouter?.Dispose();
+            _routeStore?.Dispose();
             _host.SnapshotChanged -= OnSnapshot;
             _disposed = true;
         }

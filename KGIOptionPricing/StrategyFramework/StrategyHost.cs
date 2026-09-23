@@ -432,7 +432,8 @@ public sealed class StrategyHost : IDisposable
         ISimulationStrategy strategy,
         ResolvedStrategyUniverse universe,
         decimal commissionPerContract = 0m,
-        IStrategyExecutionService? executionService = null)
+        IStrategyExecutionService? executionService = null,
+        long? strategyRunGeneration = null)
     {
         lock (_sync)
         {
@@ -449,7 +450,8 @@ public sealed class StrategyHost : IDisposable
         try
         {
             _source.Subscribe(universe.AllProducts);
-            runner = new StrategyInstanceRunner(strategy, universe, _ledger, _clock, commissionPerContract, executionService, deferStart: true);
+            runner = new StrategyInstanceRunner(strategy, universe, _ledger, _clock, commissionPerContract,
+                executionService, deferStart: true, strategyRunGeneration: strategyRunGeneration);
             lock (_sync) _startingRunners[strategy.InstanceId] = runner;
             runner.SnapshotChanged += PublishSnapshotSafely;
             runner.ExecutionOccurred += execution => ExecutionOccurred?.Invoke(execution);

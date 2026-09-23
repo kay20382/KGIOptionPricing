@@ -137,6 +137,118 @@ finally
 }
 Console.WriteLine("PASS Task 2 ownership journal persistence, idempotency and corruption handling");
 
+string routerDirectory = Path.Combine(Path.GetTempPath(), "kgi-live-router-" + Guid.NewGuid().ToString("N"));
+Directory.CreateDirectory(routerDirectory);
+try
+{
+    using var routeStore = new LiveOrderOwnershipStore(routerDirectory);
+    var rawGateway = new CountingLiveGateway();
+    using var router = new LiveStrategyOrderRouter(rawGateway, routeStore);
+    ILiveStrategyOrderGateway facadeA = router.Register("ROUTER-A", 8);
+    ILiveStrategyOrderGateway facadeB = router.Register("ROUTER-B", 8);
+    Assert(rawGateway.OrderStateSubscriberCount == 1 && rawGateway.OrderFilledSubscriberCount == 1 &&
+           rawGateway.OrderFailedSubscriberCount == 1 && rawGateway.CancelFailedSubscriberCount == 1,
+        "multiple strategy facades installed multiple broker event subscribers");
+
+    int fillsA = 0;
+    int fillsB = 0;
+    facadeA.OrderFilled += (_, _, _) => fillsA++;
+    facadeB.OrderFilled += (_, _, _) => fillsB++;
+    bool routeWasDurableAtGatewayBoundary = false;
+    rawGateway.OnPlaceOrder = request => routeWasDurableAtGatewayBoundary = routeStore.Replay().Routes.Any(route =>
+        route.Key.ClientOrderId == request.StrategyRoute?.ClientOrderId);
+    var owner = new StrategyOrderRouteMetadata("ROUTER-A", 8, "same-client", "cycle-a", "225MC-Z26", "EntryLong");
+    facadeA.PlaceOrder(new OrderRequest
+    {
+        OrderId = "LOCAL-A",
+        Account = "ACC",
+        BrokerId = "KGI",
+        Quantity = 1,
+        StrategyRoute = owner
+    });
+    Assert(rawGateway.PlaceOrderCalls == 1, "central router did not submit exactly once");
+    Assert(routeWasDurableAtGatewayBoundary, "gateway was called before ownership had been durably journaled");
+    Assert(routeStore.Replay().Routes.Single().Key == new LiveOrderOwnerKey("ROUTER-A", 8, "same-client"),
+        "ownership was not durable before broker submission");
+    rawGateway.RaiseFilled(new OrderInfo
+    {
+        OrderId = "LOCAL-A",
+        Account = "ACC",
+        Identity = new ExternalOrderIdentity { OrdNo = "BRK-A", ExecID = "EXEC-A" },
+        FilledQty = 1,
+        StrategyRoute = owner
+    });
+    rawGateway.RaiseFilled(new OrderInfo
+    {
+        OrderId = "LOCAL-A",
+        Account = "ACC",
+        Identity = new ExternalOrderIdentity { OrdNo = "BRK-A", ExecID = "EXEC-A" },
+        FilledQty = 1,
+        StrategyRoute = owner
+    });
+    Assert(fillsA == 1 && fillsB == 0, "broker fill was not delivered only to its precise owner facade");
+
+    rawGateway.ThrowOnPlace = true;
+    var unknownOwner = new StrategyOrderRouteMetadata("ROUTER-B", 8, "timeout-client", "cycle-b", "225MC-Z26", "EntryShort");
+    try
+    {
+        facadeB.PlaceOrder(new OrderRequest
+        {
+            OrderId = "LOCAL-B", Account = "ACC", BrokerId = "KGI", Quantity = 1, StrategyRoute = unknownOwner
+        });
+        throw new InvalidOperationException("gateway timeout was hidden");
+    }
+    catch (BrokerReconciliationRequiredException) { }
+    Assert(routeStore.LoadOpenRoutes("ACC", "225MC-Z26").Single(x => x.Key.StrategyInstanceId == "ROUTER-B").SubmissionState == StrategySubmissionState.Unknown,
+        "uncertain gateway response did not retain the owner in SubmissionUnknown");
+
+    routeStore.BindAlias(new LiveOrderOwnerKey("ROUTER-B", 8, "timeout-client"),
+        new BrokerOrderAlias("ACC", "20260923", "RequestId", "REQUEST-B"));
+    rawGateway.RaiseState(new OrderInfo
+    {
+        OrderId = "LOCAL-A",
+        Account = "ACC",
+        Instrument = new InstrumentKey { Symbol = "225MC-Z26" },
+        Identity = new ExternalOrderIdentity { RequestId = "REQUEST-B" }
+    });
+    Assert(router.GetQuarantine().Any(item => item.EventType == "OrderStateChanged"),
+        "broker event matching two distinct owners was not quarantined");
+    try
+    {
+        facadeA.PlaceOrder(new OrderRequest
+        {
+            OrderId = "LOCAL-A2", Account = "ACC", Quantity = 1,
+            StrategyRoute = new StrategyOrderRouteMetadata("ROUTER-A", 8, "another-client", "cycle-a2", "225MC-Z26", "EntryLong")
+        });
+        throw new InvalidOperationException("quarantined account/product accepted a new order");
+    }
+    catch (BrokerReconciliationRequiredException) { }
+
+    var closedStore = new LiveOrderOwnershipStore(Path.Combine(routerDirectory, "closed"));
+    closedStore.Dispose();
+    var closedGateway = new CountingLiveGateway();
+    using (var closedRouter = new LiveStrategyOrderRouter(closedGateway, closedStore))
+    {
+        ILiveStrategyOrderGateway closedFacade = closedRouter.Register("CLOSED", 9);
+        try
+        {
+            closedFacade.PlaceOrder(new OrderRequest
+            {
+                OrderId = "LOCAL-C", Account = "ACC", Quantity = 1,
+                StrategyRoute = new StrategyOrderRouteMetadata("CLOSED", 9, "client-c", "cycle-c", "225MC-Z26", "EntryLong")
+            });
+            throw new InvalidOperationException("journal failure did not block broker submission");
+        }
+        catch (ObjectDisposedException) { }
+    }
+    Assert(closedGateway.PlaceOrderCalls == 0, "broker order escaped after ownership persistence failed");
+}
+finally
+{
+    Directory.Delete(routerDirectory, recursive: true);
+}
+Console.WriteLine("PASS Task 3 single-subscription exact route dispatch");
+
 sealed class FakeRecoveryParticipant : IStrategyRecoveryParticipant
 {
     public string StrategyType => "Fake";
@@ -193,4 +305,58 @@ sealed class CapturingExecutionService : IStrategyExecutionService
     public int CancelAll(string strategyInstanceId) => 0;
     public IReadOnlyList<PaperOrder> GetWorkingOrders(string strategyInstanceId) => Array.Empty<PaperOrder>();
     public void OnMarketEvent(MarketEvent marketEvent) { }
+}
+
+sealed class CountingLiveGateway : ILiveStrategyOrderGateway
+{
+    private Action<OrderInfo>? _orderStateChanged;
+    private Action<OrderInfo, int, double>? _orderFilled;
+    private Action<OrderInfo, string>? _orderFailed;
+    private Action<OrderInfo, string>? _cancelFailed;
+    public bool IsLoggedIn => true;
+    public string BrokerId => "KGI";
+    public string Account => "ACC";
+    public int OrderStateSubscriberCount { get; private set; }
+    public int OrderFilledSubscriberCount { get; private set; }
+    public int OrderFailedSubscriberCount { get; private set; }
+    public int CancelFailedSubscriberCount { get; private set; }
+    public int PlaceOrderCalls { get; private set; }
+    public bool ThrowOnPlace { get; set; }
+    public Action<OrderRequest>? OnPlaceOrder { get; set; }
+    public event Action<OrderInfo>? OrderStateChanged
+    {
+        add { OrderStateSubscriberCount++; _orderStateChanged += value; }
+        remove { OrderStateSubscriberCount--; _orderStateChanged -= value; }
+    }
+    public event Action<OrderInfo, int, double>? OrderFilled
+    {
+        add { OrderFilledSubscriberCount++; _orderFilled += value; }
+        remove { OrderFilledSubscriberCount--; _orderFilled -= value; }
+    }
+    public event Action<OrderInfo, string>? OrderFailed
+    {
+        add { OrderFailedSubscriberCount++; _orderFailed += value; }
+        remove { OrderFailedSubscriberCount--; _orderFailed -= value; }
+    }
+    public event Action<OrderInfo, string>? CancelFailed
+    {
+        add { CancelFailedSubscriberCount++; _cancelFailed += value; }
+        remove { CancelFailedSubscriberCount--; _cancelFailed -= value; }
+    }
+    public void PlaceOrder(OrderRequest request)
+    {
+        PlaceOrderCalls++;
+        OnPlaceOrder?.Invoke(request);
+        if (ThrowOnPlace) throw new IOException("uncertain gateway response");
+        _orderStateChanged?.Invoke(new OrderInfo
+        {
+            OrderId = request.OrderId,
+            Account = request.Account,
+            StrategyRoute = request.StrategyRoute,
+            Status = OrderStatus.Submitted
+        });
+    }
+    public void CancelOrder(string orderId) { }
+    public void RaiseFilled(OrderInfo order) => _orderFilled?.Invoke(order, 1, 100d);
+    public void RaiseState(OrderInfo order) => _orderStateChanged?.Invoke(order);
 }

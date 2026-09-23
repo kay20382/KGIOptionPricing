@@ -25,12 +25,25 @@ public sealed record LiveOrderOwnership
 
 public sealed record FillAcceptance(bool Accepted, int AcceptedQuantity);
 
+public sealed record QuarantinedBrokerEvent(
+    string EventType,
+    string Account,
+    string Symbol,
+    string OrderId,
+    string RequestId,
+    string Cnt,
+    string OrdNo,
+    string ClientOrderId,
+    DateTimeOffset OccurredAt,
+    string Reason);
+
 public sealed record LiveOwnershipSnapshot
 {
     public IReadOnlyList<LiveOrderOwnership> Routes { get; init; } = Array.Empty<LiveOrderOwnership>();
     public IReadOnlyDictionary<BrokerOrderAlias, LiveOrderOwnerKey> Aliases { get; init; } =
         new Dictionary<BrokerOrderAlias, LiveOrderOwnerKey>();
     public IReadOnlyList<StrategyRecoveryCheckpoint> Checkpoints { get; init; } = Array.Empty<StrategyRecoveryCheckpoint>();
+    public IReadOnlyList<QuarantinedBrokerEvent> QuarantinedEvents { get; init; } = Array.Empty<QuarantinedBrokerEvent>();
     public bool IsQuarantined { get; init; }
     public string QuarantineReason { get; init; } = string.Empty;
 }

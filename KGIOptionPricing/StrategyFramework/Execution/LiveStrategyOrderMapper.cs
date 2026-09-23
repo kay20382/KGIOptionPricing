@@ -94,7 +94,14 @@ public static class LiveStrategyOrderMapper
             TimeInForce = TimeInForce.ROD,
             PositionEffect = PositionEffect.Auto,
             BrokerId = brokerId,
-            Account = account
+            Account = account,
+            StrategyRoute = new StrategyOrderRouteMetadata(
+                request.StrategyInstanceId,
+                request.StrategyRunGeneration,
+                request.ClientOrderId,
+                request.CycleId,
+                request.Symbol,
+                request.Role.ToString())
         };
     }
 
