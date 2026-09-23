@@ -23,6 +23,33 @@
 
 本次不修改 MR、PQC 或其他策略的交易參數，也不在測試中送出真實委託。
 
+### 2.1 適用策略與一致性要求
+
+本架構不是 PQC 專用功能，必須一次套用到目前已註冊的全部六種策略：
+
+- `MeanReversionScalper`
+- `WaveletScalper`
+- `NikkeiMicrostructureAlpha`
+- `MiniLeadMicro`
+- `OrderBookTrend`
+- `PeriodicQueueCycle`
+
+上述六種策略以及未來新增策略，都必須走相同的 `StrategyHost → StrategyInstanceRunner → 中央實盤委託路由器 → OrderManager` 管線，使用相同的 ownership、策略帳本、帳戶帳本、成交去重、隔離與重啟回補規則。每個實例可以保留同型別的輕量 facade，但 facade 不得直接訂閱券商事件、持有獨立 ownership 儲存或另算損益；不得為某一策略建立不同的券商路徑或回補捷徑。
+
+目前六種策略都已使用共用主機與策略帳本，但只有 `PeriodicQueueCycle` 已實作 `IManagedOrderStrategy` 並自行提供 `ClientOrderId`、`CycleId` 與 generation。其餘五種策略仍使用整批 `CancelAllRequested`，且委託未提供完整 managed identity；因此現況只算部分符合，實作計畫必須將六種策略全部遷移完成，不能只修改 PQC 或中央服務後宣稱完成。
+
+遷移完成後，每種策略都必須：
+
+- 實作共用的 managed-order 生命週期契約，接收屬於自己的接受、部分成交、成交、撤單中、撤單完成、撤單失敗與拒單；
+- 每筆委託在離開策略前具備非空且穩定的 `ClientOrderId`、`CycleId`、strategy generation、`PaperOrderRole` 與 `StrategyInstanceId`；
+- 只以精確 `ClientOrderId` 撤銷特定委託；`CancelAll` 僅能表示「取消本策略 ownership 下的全部委託」，不能擴大到同商品其他策略；
+- 實作版本化策略復原 checkpoint，保存該策略安全恢復所需的最小狀態；
+- 從 `IStrategyPerformanceView.GetPosition(StrategyInstanceId, Symbol)` 讀取自己的虛擬部位，不得讀取帳戶淨部位作為策略持倉；
+- 在模擬、重播與實盤使用同一組策略委託識別與生命週期語意，只有底層執行轉接不同。
+- 實盤一律通過同一組登入、帳號、商品白名單、單筆一口、每日虧損、持久化及隔離檢查；策略不能繞過中央驗證。
+
+`LiveStrategyService` 註冊工廠時必須驗證這些能力；缺少 managed-order 或 recovery 能力的策略可以保留模擬／重播，但不得啟動實盤。
+
 ## 3. 核心不變條件
 
 1. `StrategyInstanceId` 在存續及回補期間唯一；重建同一實例時沿用原 ID，重新開始的新一代使用遞增的 `StrategyGeneration`。
@@ -205,6 +232,7 @@ PositionDifference = BrokerAccountNet - ExpectedAccountNet
 - 策略 A 多一口、策略 B 空一口後，兩個策略各自部位非零，帳戶淨部位為零。
 - 策略 A 平倉、停損或撤單不改變策略 B 的委託、部位、成本及損益。
 - 策略績效使用各自實際成交及費用；帳戶總經濟損益與策略加人工外部桶可對帳。
+- 對六個已註冊 factory 執行參數化測試，確認每一種策略皆走相同中央路由、策略分帳與精確取消契約。
 
 ### 11.2 精確路由
 
@@ -233,6 +261,8 @@ PositionDifference = BrokerAccountNet - ExpectedAccountNet
 
 - 模擬／重播仍以 `StrategyInstanceId + Symbol` 獨立分帳，不依賴券商路由器。
 - 既有 MR、Wavelet、Nikkei Alpha、Mini Lead、Order Book Trend、PQC 的生命週期與關閉測試持續通過。
+- 六種策略建立的每筆委託都有完整 ownership 欄位；任一 factory 缺少 managed-order 或 recovery 能力時，實盤註冊測試必須失敗並指出策略類型。
+- 六種策略各自接受只屬於自己的亂序生命週期與成交；同商品另一策略的事件不得改變其狀態或帳本。
 - OrderManagement、StrategyFramework、各策略 smoke tests 與 Release 建置通過。
 - 所有測試使用 fake gateway；不得為驗證送出真實券商委託。
 
