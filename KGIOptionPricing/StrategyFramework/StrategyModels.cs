@@ -149,6 +149,7 @@ public sealed record OrderLifecycleEvent
     public int Quantity { get; init; }
     public int FilledQuantity { get; init; }
     public int RemainingQuantity { get; init; }
+    public bool HasFinalCumulativeFillWatermark { get; init; }
     public string ReasonCode { get; init; } = string.Empty;
 }
 

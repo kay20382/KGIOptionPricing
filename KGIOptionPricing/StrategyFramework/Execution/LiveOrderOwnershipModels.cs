@@ -6,6 +6,37 @@ namespace KGIOptionPricing.StrategyFramework.Execution;
 
 public sealed record LiveOrderOwnerKey(string StrategyInstanceId, long StrategyRunGeneration, string ClientOrderId);
 
+public sealed record LiveStrategyOcoKey(string StrategyInstanceId, long StrategyRunGeneration, string CycleId);
+
+public enum LiveStrategyOcoPhase
+{
+    EntryWorking,
+    EntryCancelPending,
+    PositionProtected,
+    StopPending,
+    StopSubmitted,
+    Completed,
+    ReconciliationRequired,
+    Quarantined
+}
+
+public sealed record LiveStrategyOcoGroupState
+{
+    public LiveStrategyOcoKey Key { get; init; } = new(string.Empty, 0, string.Empty);
+    public LiveStrategyOcoPhase Phase { get; init; }
+    public string EntryLongClientOrderId { get; init; } = string.Empty;
+    public string EntryShortClientOrderId { get; init; } = string.Empty;
+    public string TakeProfitClientOrderId { get; init; } = string.Empty;
+    public string StopClientOrderId { get; init; } = string.Empty;
+    public string PendingCancelClientOrderId { get; init; } = string.Empty;
+    public string StopMarketClientOrderId { get; init; } = string.Empty;
+    public long TriggerMarketSequence { get; init; }
+    public int? BrokerFinalCumulativeFilledQuantity { get; init; }
+    public int DeliveredFilledQuantity { get; init; }
+    public DateTimeOffset UpdatedAt { get; init; }
+    public string Reason { get; init; } = string.Empty;
+}
+
 public sealed record BrokerOrderAlias(string Account, string TradingDay, string Kind, string Value);
 
 public enum StrategySubmissionState { Prepared, Working, Unknown, Filled, Cancelled, Rejected }
@@ -40,6 +71,7 @@ public sealed record QuarantinedBrokerEvent(
 public sealed record LiveOwnershipSnapshot
 {
     public IReadOnlyList<LiveOrderOwnership> Routes { get; init; } = Array.Empty<LiveOrderOwnership>();
+    public IReadOnlyList<LiveStrategyOcoGroupState> OcoGroups { get; init; } = Array.Empty<LiveStrategyOcoGroupState>();
     public IReadOnlyDictionary<BrokerOrderAlias, LiveOrderOwnerKey> Aliases { get; init; } =
         new Dictionary<BrokerOrderAlias, LiveOrderOwnerKey>();
     public IReadOnlyList<StrategyRecoveryCheckpoint> Checkpoints { get; init; } = Array.Empty<StrategyRecoveryCheckpoint>();

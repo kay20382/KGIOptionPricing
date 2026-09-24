@@ -16,6 +16,7 @@ public interface ILiveOrderOwnershipStore : IDisposable
     FillAcceptance TryAcceptFill(LiveOrderOwnerKey owner, string? execId, int cumulativeQuantity);
     void MarkSubmissionUnknown(LiveOrderOwnerKey owner, string reason);
     void AppendCheckpoint(StrategyRecoveryCheckpoint checkpoint);
+    void AppendOcoState(LiveStrategyOcoGroupState state);
     void AppendQuarantinedEvent(QuarantinedBrokerEvent quarantinedEvent);
     LiveOwnershipSnapshot Replay();
     IReadOnlyList<LiveOrderOwnership> LoadOpenRoutes(string account, string symbol);
@@ -36,6 +37,7 @@ public sealed class LiveOrderOwnershipStore : ILiveOrderOwnershipStore
     private readonly Dictionary<LiveOrderOwnerKey, HashSet<string>> _execIds = new();
     private readonly Dictionary<LiveOrderOwnerKey, int> _watermarks = new();
     private readonly Dictionary<(string InstanceId, long RunGeneration), StrategyRecoveryCheckpoint> _checkpoints = new();
+    private readonly Dictionary<LiveStrategyOcoKey, LiveStrategyOcoGroupState> _ocoGroups = new();
     private readonly List<QuarantinedBrokerEvent> _quarantinedEvents = new();
     private long _sequence;
     private bool _disposed;
@@ -149,6 +151,18 @@ public sealed class LiveOrderOwnershipStore : ILiveOrderOwnershipStore
         }
     }
 
+    public void AppendOcoState(LiveStrategyOcoGroupState state)
+    {
+        ArgumentNullException.ThrowIfNull(state);
+        lock (_sync)
+        {
+            ThrowIfUnavailable();
+            ValidateOcoState(state);
+            Append("OcoState", state);
+            _ocoGroups[state.Key] = state;
+        }
+    }
+
     public void AppendQuarantinedEvent(QuarantinedBrokerEvent quarantinedEvent)
     {
         ArgumentNullException.ThrowIfNull(quarantinedEvent);
@@ -167,6 +181,7 @@ public sealed class LiveOrderOwnershipStore : ILiveOrderOwnershipStore
             return new LiveOwnershipSnapshot
             {
                 Routes = _routes.Values.ToArray(),
+                OcoGroups = _ocoGroups.Values.ToArray(),
                 Aliases = new Dictionary<BrokerOrderAlias, LiveOrderOwnerKey>(_aliases),
                 Checkpoints = _checkpoints.Values.ToArray(),
                 QuarantinedEvents = _quarantinedEvents.ToArray(),
@@ -276,6 +291,14 @@ public sealed class LiveOrderOwnershipStore : ILiveOrderOwnershipStore
                 _checkpoints[(checkpoint.StrategyInstanceId, checkpoint.StrategyRunGeneration)] = checkpoint;
                 break;
             }
+            case "OcoState":
+            {
+                LiveStrategyOcoGroupState state = envelope.Payload.Deserialize<LiveStrategyOcoGroupState>()
+                    ?? throw new JsonException("Missing OCO state.");
+                ValidateOcoState(state);
+                _ocoGroups[state.Key] = state;
+                break;
+            }
             case "Quarantine":
             {
                 QuarantinedBrokerEvent quarantined = envelope.Payload.Deserialize<QuarantinedBrokerEvent>()
@@ -294,7 +317,10 @@ public sealed class LiveOrderOwnershipStore : ILiveOrderOwnershipStore
         using JsonDocument payloadDocument = JsonDocument.Parse(payloadJson);
         JsonElement payloadElement = payloadDocument.RootElement.Clone();
         long sequence = _sequence + 1;
-        var envelope = new JournalEnvelope(sequence, eventType, payloadElement, ComputeChecksum(sequence, eventType, payloadElement));
+        var unsignedEnvelope = new JournalEnvelope(sequence, eventType, payloadElement, string.Empty);
+        using JsonDocument encodedEnvelope = JsonDocument.Parse(JsonSerializer.Serialize(unsignedEnvelope));
+        JsonElement storedPayload = encodedEnvelope.RootElement.GetProperty(nameof(JournalEnvelope.Payload));
+        var envelope = new JournalEnvelope(sequence, eventType, payloadElement, ComputeChecksum(sequence, eventType, storedPayload));
         byte[] line = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(envelope) + "\n");
         using var stream = new FileStream(_journalPath, FileMode.Append, FileAccess.Write, FileShare.Read, 4096, FileOptions.WriteThrough);
         stream.Write(line);
@@ -314,6 +340,15 @@ public sealed class LiveOrderOwnershipStore : ILiveOrderOwnershipStore
             string.IsNullOrWhiteSpace(ownership.Key.ClientOrderId) || string.IsNullOrWhiteSpace(ownership.Account) ||
             string.IsNullOrWhiteSpace(ownership.Symbol) || ownership.Quantity <= 0)
             throw new ArgumentException("Strategy ownership identity, account, symbol and quantity are required.", nameof(ownership));
+    }
+
+    private static void ValidateOcoState(LiveStrategyOcoGroupState state)
+    {
+        if (string.IsNullOrWhiteSpace(state.Key.StrategyInstanceId) || state.Key.StrategyRunGeneration <= 0 ||
+            string.IsNullOrWhiteSpace(state.Key.CycleId) || !Enum.IsDefined(state.Phase) ||
+            state.UpdatedAt == default || state.TriggerMarketSequence < 0 || state.DeliveredFilledQuantity < 0 ||
+            state.BrokerFinalCumulativeFilledQuantity < 0)
+            throw new ArgumentException("OCO identity, phase, timestamp and non-negative fill watermarks are required.", nameof(state));
     }
 
     private static void ValidateAlias(BrokerOrderAlias alias)
