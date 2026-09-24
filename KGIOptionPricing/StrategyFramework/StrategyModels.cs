@@ -152,6 +152,7 @@ public sealed record OrderLifecycleEvent
     public int Quantity { get; init; }
     public int FilledQuantity { get; init; }
     public int DeliveredFilledQuantity { get; init; }
+    public int? BrokerFinalCumulativeFilledQuantity { get; init; }
     public int RemainingQuantity { get; init; }
     public bool HasFinalCumulativeFillWatermark { get; init; }
     public string ReasonCode { get; init; } = string.Empty;
@@ -179,6 +180,7 @@ public sealed record StrategySnapshot
     public long StrategyRunGeneration { get; init; }
     public string RecoveryState { get; init; } = string.Empty;
     public string RecoveryReason { get; init; } = string.Empty;
+    public string OcoStatusSummary { get; init; } = string.Empty;
     public string ParameterSummary { get; init; } = string.Empty;
     public string TradableProductId { get; init; } = string.Empty;
     public string TradableSymbol { get; init; } = string.Empty;

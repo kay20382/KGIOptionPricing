@@ -308,7 +308,7 @@ public sealed class LiveStrategyCenterForm : Form
         _types[s.InstanceId] = s.StrategyType; var grid = s.StrategyType == PeriodicQueueCycleFactory.TypeName ? _pqcGrid : s.StrategyType == OrderBookTrendFactory.TypeName ? _obtGrid : s.StrategyType == MiniLeadMicroFactory.TypeName ? _mlGrid : s.StrategyType == NikkeiMicrostructureAlphaFactory.TypeName ? _naGrid : s.StrategyType == WaveletScalperFactory.TypeName ? _wsGrid : _mrGrid;
         var row = grid.Rows.Cast<DataGridViewRow>().FirstOrDefault(x => Equals(x.Cells["Instance"].Value, s.InstanceId)); if (row == null) row = grid.Rows[grid.Rows.Add()];
         var close = _service.GetCloseStatus(s.InstanceId);
-        object[] values = { s.InstanceId, s.StrategyRunGeneration, s.RecoveryState, s.RecoveryReason, s.StrategyType, s.ParameterSummary, s.TradableProductId, s.TradableSymbol, s.ReferenceSummary, _service.Account, s.State,
+        object[] values = { s.InstanceId, s.StrategyRunGeneration, s.RecoveryState, s.RecoveryReason, s.OcoStatusSummary, s.StrategyType, s.ParameterSummary, s.TradableProductId, s.TradableSymbol, s.ReferenceSummary, _service.Account, s.State,
             close.ClosePending ? "關閉中／" + s.Reason : s.Reason, close.ActiveBrokerOrders, close.LocalConditions, s.Position, s.LastPrice, s.RealizedPnl, s.UnrealizedPnl, s.NetPnl, s.CommissionPerContract, s.CompletedTrades, s.UpdatedAt.ToString("HH:mm:ss.fff") };
         for (int i = 0; i < values.Length; i++) row.Cells[i].Value = values[i]; row.DefaultCellStyle.BackColor = close.ClosePending ? Color.LemonChiffon : Color.White;
     }
@@ -323,7 +323,7 @@ public sealed class LiveStrategyCenterForm : Form
 
     private void BuildGrids()
     {
-        foreach (var g in new[] { _mrGrid, _wsGrid, _naGrid, _mlGrid, _obtGrid, _pqcGrid }) { Col(g,"Instance","實例",170); Col(g,"RunGeneration","執行世代",80); Col(g,"RecoveryState","回補狀態",105); Col(g,"RecoveryReason","回補／隔離原因",240); Col(g,"Strategy","策略",170); Col(g,"Parameters","實際參數",520); Col(g,"Product","商品",72); Col(g,"Symbol","合約",120); Col(g,"References","參考商品",150); Col(g,"Account","實盤帳號",115); Col(g,"State","狀態",90); Col(g,"Reason","原因／風控",300); Col(g,"BrokerOrders","市場委託",75); Col(g,"LocalOrders","待觸發",65); Col(g,"Position","部位",55); Col(g,"Last","成交價",75); Col(g,"Realized","已實現",85); Col(g,"Unrealized","未實現",85); Col(g,"Net","淨損益",85); Col(g,"Fee","每口費用",75); Col(g,"Trades","完成交易",70); Col(g,"Updated","更新時間",105); }
+        foreach (var g in new[] { _mrGrid, _wsGrid, _naGrid, _mlGrid, _obtGrid, _pqcGrid }) { Col(g,"Instance","實例",170); Col(g,"RunGeneration","執行世代",80); Col(g,"RecoveryState","回補狀態",105); Col(g,"RecoveryReason","回補／隔離原因",240); Col(g,"OcoStatus","OCO 狀態／原因",320); Col(g,"Strategy","策略",170); Col(g,"Parameters","實際參數",520); Col(g,"Product","商品",72); Col(g,"Symbol","合約",120); Col(g,"References","參考商品",150); Col(g,"Account","實盤帳號",115); Col(g,"State","狀態",90); Col(g,"Reason","原因／風控",300); Col(g,"BrokerOrders","市場委託",75); Col(g,"LocalOrders","待觸發",65); Col(g,"Position","部位",55); Col(g,"Last","成交價",75); Col(g,"Realized","已實現",85); Col(g,"Unrealized","未實現",85); Col(g,"Net","淨損益",85); Col(g,"Fee","每口費用",75); Col(g,"Trades","完成交易",70); Col(g,"Updated","更新時間",105); }
         foreach (var g in new[] { _mrFills, _wsFills, _naFills, _mlFills, _obtFills, _pqcFills }) { Col(g,"Time","時間",105); Col(g,"Instance","實例",170); Col(g,"Symbol","合約",125); Col(g,"Side","買賣",65); Col(g,"Role","角色",105); Col(g,"Price","真實成交價",95); Col(g,"Qty","口數",55); Col(g,"Trigger","觸發行情",85); Col(g,"Cost","費用",75); Col(g,"MarketSequence","行情序號",95); }
     }
 

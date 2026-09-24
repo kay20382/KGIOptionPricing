@@ -36,6 +36,7 @@ public sealed class LiveStrategyService : IDisposable
     private readonly OrderManager _orders;
     private readonly LiveOrderOwnershipStore? _routeStore;
     private readonly LiveStrategyOrderRouter? _orderRouter;
+    private readonly Func<string, IReadOnlyList<LiveStrategyOcoGroupState>> _getOcoStates;
     private readonly Func<bool> _isLoggedIn;
     private readonly Func<string> _account;
     private readonly Func<StrategyDefinition, ResolvedStrategyUniverse> _resolve;
@@ -111,15 +112,21 @@ public sealed class LiveStrategyService : IDisposable
             "KGIOptionPricing", "Strategy_Routes", routeAccountKey);
         _routeStore = new LiveOrderOwnershipStore(routeDirectory);
         _orderRouter = new LiveStrategyOrderRouter(new OrderManagerLiveStrategyOrderGateway(orders, trade), _routeStore);
+        _getOcoStates = instanceId => _routeStore.Replay().OcoGroups
+            .Where(state => string.Equals(state.Key.StrategyInstanceId, instanceId, StringComparison.OrdinalIgnoreCase))
+            .OrderByDescending(state => state.UpdatedAt).ToArray();
         LiveOwnershipSnapshot startupJournal = _routeStore.Replay();
         _generationSequence = startupJournal.Routes.Select(route => route.Key.StrategyRunGeneration)
             .Concat(startupJournal.Checkpoints.Select(checkpoint => checkpoint.StrategyRunGeneration))
             .DefaultIfEmpty(0L).Max();
+        bool hasUnresolvedStartupOco = startupJournal.OcoGroups.Any(state => state.Phase != LiveStrategyOcoPhase.Completed);
         _recoveryState = startupJournal.IsQuarantined ? LiveRecoveryState.Quarantined :
-            startupJournal.Routes.Count > 0 || startupJournal.QuarantinedEvents.Count > 0
+            startupJournal.Routes.Count > 0 || startupJournal.QuarantinedEvents.Count > 0 || hasUnresolvedStartupOco
                 ? LiveRecoveryState.Recovering : LiveRecoveryState.RecoveredPaused;
         _recoveryReason = startupJournal.QuarantineReason.Length > 0 ? startupJournal.QuarantineReason :
-            _recoveryState == LiveRecoveryState.Recovering ? "Persisted strategy orders/checkpoints require broker snapshot recovery." : _recoveryReason;
+            hasUnresolvedStartupOco
+                ? $"{startupJournal.OcoGroups.Count(state => state.Phase != LiveStrategyOcoPhase.Completed)} persisted OCO group(s) are unsettled; explicit broker reconciliation is required before resume."
+                : _recoveryState == LiveRecoveryState.Recovering ? "Persisted strategy orders/checkpoints require broker snapshot recovery." : _recoveryReason;
         _resolve = definition => _resolver.Resolve(definition.Universe);
         _createStrategy = definition => _registry.Get(definition.StrategyType).Create(definition);
         _createExecution = (definition, universe, commission) =>
@@ -155,7 +162,8 @@ public sealed class LiveStrategyService : IDisposable
         Func<StrategyDefinition, ISimulationStrategy> createStrategy,
         Func<StrategyDefinition, ResolvedStrategyUniverse, decimal, KgiLiveStrategyExecutionService> createExecution,
         bool enableHeartbeat,
-        Action? afterHostAddFailure = null)
+        Action? afterHostAddFailure = null,
+        Func<string, IReadOnlyList<LiveStrategyOcoGroupState>>? getOcoStates = null)
     {
         _orders = null!;
         _host = host ?? throw new ArgumentNullException(nameof(host));
@@ -164,6 +172,7 @@ public sealed class LiveStrategyService : IDisposable
         _resolve = resolve ?? throw new ArgumentNullException(nameof(resolve));
         _createStrategy = createStrategy ?? throw new ArgumentNullException(nameof(createStrategy));
         _createExecution = createExecution ?? throw new ArgumentNullException(nameof(createExecution));
+        _getOcoStates = getOcoStates ?? (_ => Array.Empty<LiveStrategyOcoGroupState>());
         _createExecutionWithGeneration = null;
         _afterHostAddFailure = afterHostAddFailure;
         _host.SnapshotChanged += OnSnapshot;
@@ -270,6 +279,14 @@ public sealed class LiveStrategyService : IDisposable
     public bool Resume(string instanceId)
     {
         WaitForAdd(instanceId);
+        if (Find(instanceId) is null) return false;
+        if (HasUnresolvedOcoState(instanceId))
+        {
+            _recoveryState = LiveRecoveryState.Recovering;
+            _recoveryReason = "Persisted OCO state is not terminal; reconcile broker orders and fills before resuming.";
+            foreach (StrategySnapshot snapshot in _host.GetSnapshots()) PublishSnapshot(snapshot);
+            return false;
+        }
         if (_recoveryState != LiveRecoveryState.RecoveredPaused) return false;
         return _isLoggedIn() && _host.Resume(instanceId);
     }
@@ -287,6 +304,16 @@ public sealed class LiveStrategyService : IDisposable
         PositionSnapshot[] strategyPositions = brokerSnapshot.Positions
             .SelectMany(position => _host.Ledger.GetAllPositions(position.Symbol)).ToArray();
         LiveRecoveryResult result = coordinator.Recover(account, brokerSnapshot, strategyPositions);
+        LiveStrategyOcoGroupState[] unresolvedOco = _routeStore.Replay().OcoGroups
+            .Where(state => state.Phase != LiveStrategyOcoPhase.Completed).ToArray();
+        if (unresolvedOco.Length > 0)
+        {
+            result = result with
+            {
+                State = LiveRecoveryState.Recovering,
+                Reason = $"{unresolvedOco.Length} persisted OCO group(s) remain unsettled; broker orders/fills require explicit reconciliation before resume."
+            };
+        }
         if (result.State == LiveRecoveryState.RecoveredPaused && _routeStore.Replay().Routes.Count > 0)
         {
             result = result with
@@ -452,6 +479,11 @@ public sealed class LiveStrategyService : IDisposable
 
     public IReadOnlyList<StrategySnapshot> GetSnapshots() => _host.GetSnapshots();
 
+    public IReadOnlyList<LiveStrategyOcoGroupState> GetOcoStates(string instanceId) => _getOcoStates(instanceId);
+
+    public bool HasUnresolvedOcoState(string instanceId) => GetOcoStates(instanceId)
+        .Any(state => state.Phase != LiveStrategyOcoPhase.Completed);
+
     public void Pulse(DateTimeOffset now)
     {
         _host.Pulse(now);
@@ -507,7 +539,13 @@ public sealed class LiveStrategyService : IDisposable
         {
             StrategyRunGeneration = _activeGenerations.GetValueOrDefault(snapshot.InstanceId),
             RecoveryState = _recoveryState.ToString(),
-            RecoveryReason = _recoveryReason
+            RecoveryReason = _recoveryReason,
+            OcoStatusSummary = string.Join(" | ", GetOcoStates(snapshot.InstanceId).Take(4).Select(state =>
+                $"g{state.Key.StrategyRunGeneration}/{state.Key.CycleId}:{state.Phase}" +
+                (state.PendingCancelClientOrderId.Length > 0 ? $" cancel={state.PendingCancelClientOrderId}" : string.Empty) +
+                (state.StopMarketClientOrderId.Length > 0 ? $" stop={state.StopMarketClientOrderId}" : string.Empty) +
+                $" fill={state.DeliveredFilledQuantity}/{state.BrokerFinalCumulativeFilledQuantity?.ToString() ?? "?"}" +
+                (state.Reason.Length > 0 ? $" {state.Reason}" : string.Empty)))
         };
         foreach (Action<StrategySnapshot> handler in (SnapshotChanged?.GetInvocationList() ?? Array.Empty<Delegate>())
                      .Cast<Action<StrategySnapshot>>())
@@ -641,6 +679,8 @@ public sealed class LiveStrategyService : IDisposable
 
     private void OnExecutionStateChanged(string instanceId, KgiLiveStrategyExecutionService execution)
     {
+        StrategySnapshot? current = Find(instanceId);
+        if (current != null) PublishSnapshot(current);
         if (_pendingClose.ContainsKey(instanceId) && execution.ActiveBrokerOrderCount == 0 &&
             execution.ManualReconciliationObservationCount == 0)
             _closeRetryNeeded.TryAdd(instanceId, 0);

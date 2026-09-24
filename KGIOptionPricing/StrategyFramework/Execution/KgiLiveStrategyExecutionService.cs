@@ -1037,6 +1037,9 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
             Quantity = tracked.Order.Quantity,
             FilledQuantity = filled,
             DeliveredFilledQuantity = tracked.DeliveredFilledQuantity,
+            BrokerFinalCumulativeFilledQuantity = terminal && brokerOrder != null &&
+                brokerOrder.Status is OrderStatus.Filled or OrderStatus.Cancelled or OrderStatus.Rejected
+                    ? brokerOrder.FilledQty : null,
             RemainingQuantity = remaining,
             ReasonCode = reasonCode,
             HasFinalCumulativeFillWatermark = terminal && brokerOrder != null &&

@@ -325,6 +325,7 @@ public sealed class SimulationRunRecorder : IDisposable
                 StrategyInstanceId = orderEvent.StrategyInstanceId,
                 CycleId = cycleId,
                 ClientOrderId = orderEvent.ClientOrderId,
+                OcoGroupId = orderEvent.OcoGroupId,
                 OrderId = orderEvent.OrderId,
                 BrokerOrderId = orderEvent.BrokerOrderId,
                 Symbol = orderEvent.Symbol,
@@ -337,7 +338,10 @@ public sealed class SimulationRunRecorder : IDisposable
                 Price = orderEvent.Price,
                 Quantity = orderEvent.Quantity,
                 FilledQuantity = orderEvent.FilledQuantity,
+                DeliveredFilledQuantity = orderEvent.DeliveredFilledQuantity,
+                BrokerFinalCumulativeFilledQuantity = orderEvent.BrokerFinalCumulativeFilledQuantity,
                 RemainingQuantity = orderEvent.RemainingQuantity,
+                HasFinalCumulativeFillWatermark = orderEvent.HasFinalCumulativeFillWatermark,
                 ReasonCode = orderEvent.ReasonCode,
                 SubmittedAt = timeline.SubmittedAt,
                 AcceptedAt = timeline.AcceptedAt,
@@ -353,7 +357,9 @@ public sealed class SimulationRunRecorder : IDisposable
                 observation.PreviousState, observation.State,
                 observation.Price.ToString(CultureInfo.InvariantCulture), observation.Quantity,
                 observation.FilledQuantity, observation.RemainingQuantity, observation.ReasonCode,
-                observation.CycleId, observation.Symbol, observation.Side, observation.Role,
+                observation.CycleId, observation.OcoGroupId, observation.Symbol, observation.Side, observation.Role,
+                observation.DeliveredFilledQuantity, observation.BrokerFinalCumulativeFilledQuantity,
+                observation.HasFinalCumulativeFillWatermark,
                 observation.Generation, observation.TriggerMarketSequence);
             if (!_lifecycleTransitions.Add(transitionKey)) return;
             string serialized = JsonSerializer.Serialize(observation, _json);

@@ -231,6 +231,9 @@ public sealed class CrossPricePaperExecutionService : IPaperExecutionService, IM
             Price = order.Price,
             Quantity = order.Quantity,
             FilledQuantity = filledQuantity,
+            DeliveredFilledQuantity = filledQuantity,
+            BrokerFinalCumulativeFilledQuantity = state is OrderLifecycleState.Filled or OrderLifecycleState.Cancelled or OrderLifecycleState.Rejected
+                ? filledQuantity : null,
             RemainingQuantity = order.Quantity - filledQuantity,
             HasFinalCumulativeFillWatermark = state is OrderLifecycleState.Filled or OrderLifecycleState.Cancelled or OrderLifecycleState.Rejected,
             ReasonCode = reasonCode
