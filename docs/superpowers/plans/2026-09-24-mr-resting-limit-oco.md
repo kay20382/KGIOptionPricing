@@ -237,7 +237,7 @@ public IReadOnlyList<ManagedStrategyOcoAction> Apply(ManagedStrategyOcoEvent inp
 
 Expected：三個 smoke projects 全 PASS；fake gateway 的 place/cancel 次序 assertions 證明沒有真實送單。
 - [x] **Step 5: Release build**：`dotnet build KGIOptionPricing.sln -c Release --no-restore -p:BaseOutputPath=bin_task6_release/` 成功，0 errors、3 NU1701 warnings（legacy OpenTK/SkiaSharp WindowsForms target compatibility）。
-- [ ] **Step 6: Commit**：只提交 paper adapter 與此 task 進度紀錄，訊息 `test: verify MR OCO paper replay behavior`。測試檔原本即含大量使用者修改，不納入 commit。
+- [x] **Step 6: Commit**：paper adapter 與 Task 6 進度已提交 `eaf8ff4 test: verify MR OCO paper replay behavior`。測試檔原本即含大量使用者修改，不納入 commit；新增 smoke assertions 保留在 working tree 並已執行。
 
 ## Plan Self-Review
 
