@@ -124,7 +124,7 @@ public sealed class CrossPricePaperExecutionService : IPaperExecutionService, IM
         if (marketEvent.Kind != MarketEventKind.Trade || marketEvent.LastPrice <= 0m) return;
         List<ExecutionEvent> fills = new();
         List<PaperOrder> filledOrders = new();
-        List<PaperOrder> cancelledEntrySiblings = new();
+        List<PaperOrder> cancelledOcoSiblings = new();
         lock (_sync)
         {
             PaperOrder[] candidates = _orders.Values
@@ -132,8 +132,13 @@ public sealed class CrossPricePaperExecutionService : IPaperExecutionService, IM
                             string.Equals(x.Symbol, marketEvent.Symbol, StringComparison.OrdinalIgnoreCase))
                 .OrderBy(x => x.CreatedAt).ThenBy(x => x.OrderId).ToArray();
 
-            foreach (PaperOrder order in candidates)
+            foreach (PaperOrder candidateOrder in candidates)
             {
+                // A prior fill in this same market event may already have cancelled
+                // this candidate as its OCO sibling. Re-read authoritative paper state.
+                if (!_orders.TryGetValue(candidateOrder.OrderId, out PaperOrder? current) || current.State != PaperOrderState.Working)
+                    continue;
+                PaperOrder order = current;
                 bool crossed = order.Type switch
                 {
                     PaperOrderType.Market => true,
@@ -149,10 +154,11 @@ public sealed class CrossPricePaperExecutionService : IPaperExecutionService, IM
 
                 _orders[order.OrderId] = order with { State = PaperOrderState.Filled };
                 filledOrders.Add(order with { State = PaperOrderState.Filled });
-                if (!string.IsNullOrWhiteSpace(order.OcoGroupId) &&
-                    order.Role is PaperOrderRole.EntryLong or PaperOrderRole.EntryShort)
+                if (!string.IsNullOrWhiteSpace(order.OcoGroupId))
                 {
-                    PaperOrderRole siblingRole = order.Role == PaperOrderRole.EntryLong
+                    bool isEntry = order.Role is PaperOrderRole.EntryLong or PaperOrderRole.EntryShort;
+                    bool isExit = order.Role is PaperOrderRole.TakeProfit or PaperOrderRole.StopLoss or PaperOrderRole.Flatten;
+                    PaperOrderRole oppositeEntryRole = order.Role == PaperOrderRole.EntryLong
                         ? PaperOrderRole.EntryShort : PaperOrderRole.EntryLong;
                     PaperOrder[] siblings = _orders.Values.Where(candidate =>
                         candidate.State == PaperOrderState.Working &&
@@ -160,12 +166,14 @@ public sealed class CrossPricePaperExecutionService : IPaperExecutionService, IM
                         candidate.StrategyRunGeneration == order.StrategyRunGeneration &&
                         string.Equals(candidate.CycleId, order.CycleId, StringComparison.Ordinal) &&
                         string.Equals(candidate.OcoGroupId, order.OcoGroupId, StringComparison.Ordinal) &&
-                        candidate.Role == siblingRole).ToArray();
+                        candidate.OrderId != order.OrderId &&
+                        (isEntry && candidate.Role == oppositeEntryRole ||
+                         isExit && candidate.Role is PaperOrderRole.TakeProfit or PaperOrderRole.StopLoss or PaperOrderRole.Flatten)).ToArray();
                     foreach (PaperOrder sibling in siblings)
                     {
                         PaperOrder cancelled = sibling with { State = PaperOrderState.Cancelled };
                         _orders[sibling.OrderId] = cancelled;
-                        cancelledEntrySiblings.Add(cancelled);
+                        cancelledOcoSiblings.Add(cancelled);
                     }
                 }
                 fills.Add(new ExecutionEvent
@@ -195,7 +203,7 @@ public sealed class CrossPricePaperExecutionService : IPaperExecutionService, IM
             PublishLifecycle(filledOrders[i], OrderLifecycleState.Working, OrderLifecycleState.Filled,
                 marketEvent.Timestamp, "Filled", filledOrders[i].Quantity, marketEvent.Sequence);
         }
-        foreach (PaperOrder sibling in cancelledEntrySiblings)
+        foreach (PaperOrder sibling in cancelledOcoSiblings)
         {
             PublishLifecycle(sibling, OrderLifecycleState.Working, OrderLifecycleState.CancelPending,
                 marketEvent.Timestamp, "CancelRequested", triggerMarketSequence: marketEvent.Sequence);

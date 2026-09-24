@@ -227,17 +227,17 @@ public IReadOnlyList<ManagedStrategyOcoAction> Apply(ManagedStrategyOcoEvent inp
 - Consumes: Tasks 1–5 OCO roles, persisted transition model, final-watermark live release rule, MR broker-limit intent.
 - Produces: `BrokerLimit` 在模擬／重播沿用嚴格穿價及委託價成交；同週期 entry sibling／TP-stop OCO 只觸發一次、只以當前策略剩餘部位平倉；真實 gateway call count 維持為零。
 
-- [ ] **Step 1: 寫 failing paper assertions**：驗證觸及 `BrokerLimit` 不成交、嚴格穿價依限價成交；MR first fill 後只保留 stop，對側終結後加入 TP；停損觸發時不重複產生 exit execution，其他策略同商品工作單保持有效。
-- [ ] **Step 2: 執行 RED**：執行 StrategyFramework smoke command。Expected：新增的 paper bracket transition assertions 失敗。
-- [ ] **Step 3: 最小實作**：讓 paper adapter 依 cycle OCO 取消精確互斥單，對紙上終態事件設定 `HasFinalCumulativeFillWatermark = true`（paper adapter 能權威知道自己的完整累積量），確保同一市場事件不重複觸發；成交價仍為限價、保留目前手續費及嚴格穿價慣例。
-- [ ] **Step 4: 執行所有 focused tests**：依序執行：
+- [x] **Step 1: 寫 failing paper assertions**：沿用觸價不成交／穿價限價成交案例，新增同一 OCO 週期 TP 與 StopLoss 同時可觸發時只成交一側、另一策略同商品獨立成交、重複行情不重複成交及終態水位 assertion。
+- [x] **Step 2: 執行 RED**：暫時停用紙上 exit OCO 邏輯後執行隔離 build/DLL；測試依預期於同策略週期 OCO assertion 失敗，隨即恢復程式碼。
+- [x] **Step 3: 最小實作**：paper adapter 每個候選成交前重讀委託目前狀態；填成 entry 時只撤精確反側進場，填成 TP/StopLoss/Flatten 時撤同 owner/generation/cycle/OCO 的其餘 exit roles；紙上終態 lifecycle 保留 authoritative 最終累積成交量，限價成交價及 strict-cross 慣例不變。
+- [x] **Step 4: 執行所有 focused tests**：依序執行：
   - `dotnet run --project tests/LiveStrategyRecoverySmokeTests/LiveStrategyRecoverySmokeTests.csproj -c Release --no-restore`
   - `dotnet run --project tests/OrderManagementSmokeTests/OrderManagementSmokeTests.csproj -c Release --no-restore`
   - `dotnet run --project tests/StrategyFrameworkSmokeTests/StrategyFrameworkSmokeTests.csproj -c Release --no-restore -- --skip-windows-ui-regression`
 
 Expected：三個 smoke projects 全 PASS；fake gateway 的 place/cancel 次序 assertions 證明沒有真實送單。
-- [ ] **Step 5: Release build**：執行 `dotnet build KGIOptionPricing.sln -c Release --no-restore`。Expected：成功且 0 errors；逐項記錄已有 warnings，不得當作全零警告。
-- [ ] **Step 6: Commit**：只提交 paper adapter 與此 task 測試，訊息 `test: verify MR OCO paper replay behavior`。
+- [x] **Step 5: Release build**：`dotnet build KGIOptionPricing.sln -c Release --no-restore -p:BaseOutputPath=bin_task6_release/` 成功，0 errors、3 NU1701 warnings（legacy OpenTK/SkiaSharp WindowsForms target compatibility）。
+- [ ] **Step 6: Commit**：只提交 paper adapter 與此 task 進度紀錄，訊息 `test: verify MR OCO paper replay behavior`。測試檔原本即含大量使用者修改，不納入 commit。
 
 ## Plan Self-Review
 
