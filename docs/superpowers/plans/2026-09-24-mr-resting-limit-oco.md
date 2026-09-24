@@ -213,7 +213,7 @@ public IReadOnlyList<ManagedStrategyOcoAction> Apply(ManagedStrategyOcoEvent inp
 - [x] **Step 3: 執行 RED**：未保留獨立行為 RED 執行紀錄；本次接續時先完成 gate 的最後缺口和測試，再執行 GREEN。測試 harness 初次建置只因缺少 `LiveRecoveryState` namespace 而失敗，修正 using 後才是有效 GREEN。
 - [x] **Step 4: 最小實作**：啟動與 recover 對任何非 Completed OCO 維持全域 recovery lock；每個 snapshot 顯示 generation/cycle/phase、pending ids、成交水位與 reason；lifecycle 共用 observation 加入 broker 最終累積成交量。
 - [x] **Step 5: 執行 GREEN**：隔離輸出 build + direct DLL execution：StrategyFramework smoke PASS（明確略過 unattended WinForms STA-only regression），LiveStrategyRecovery smoke 8 groups PASS；無 broker gateway 呼叫。
-- [ ] **Step 6: Commit**：只提交 service/models/recorder/UI 與 OCO lifecycle projection production files，訊息 `feat: expose and recover strategy OCO state safely`。測試檔有既存使用者修改，因此保留新增測試在 working tree、不納入本次 commit。
+- [x] **Step 6: Commit**：production 與計畫進度已提交 `6c6145b feat: expose and recover strategy OCO state safely`；後續完整 OrderManagement regression 揭露 host disposal callback 邊界，另以 `fix: ignore executor callbacks during strategy host disposal` 獨立修正。測試檔有既存使用者修改，因此保留新增測試在 working tree、不納入 commit。
 
 ## Task 6: 模擬與歷史重播一致性及完整驗收
 

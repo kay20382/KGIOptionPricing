@@ -679,7 +679,9 @@ public sealed class LiveStrategyService : IDisposable
 
     private void OnExecutionStateChanged(string instanceId, KgiLiveStrategyExecutionService execution)
     {
-        StrategySnapshot? current = Find(instanceId);
+        StrategySnapshot? current = null;
+        try { current = Find(instanceId); }
+        catch (ObjectDisposedException) { /* Host disposal can raise a final executor state callback. */ }
         if (current != null) PublishSnapshot(current);
         if (_pendingClose.ContainsKey(instanceId) && execution.ActiveBrokerOrderCount == 0 &&
             execution.ManualReconciliationObservationCount == 0)
