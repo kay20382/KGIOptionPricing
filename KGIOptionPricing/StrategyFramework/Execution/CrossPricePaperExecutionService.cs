@@ -37,6 +37,7 @@ public sealed class CrossPricePaperExecutionService : IPaperExecutionService, IM
             OrderId = $"SIM-{request.StrategyInstanceId}-{System.Threading.Interlocked.Increment(ref _orderSequence)}",
             ClientOrderId = request.ClientOrderId,
             CycleId = request.CycleId,
+            OcoGroupId = request.OcoGroupId,
             StrategyRunGeneration = request.StrategyRunGeneration,
             Generation = request.Generation,
             StrategyInstanceId = request.StrategyInstanceId,
@@ -123,6 +124,7 @@ public sealed class CrossPricePaperExecutionService : IPaperExecutionService, IM
         if (marketEvent.Kind != MarketEventKind.Trade || marketEvent.LastPrice <= 0m) return;
         List<ExecutionEvent> fills = new();
         List<PaperOrder> filledOrders = new();
+        List<PaperOrder> cancelledEntrySiblings = new();
         lock (_sync)
         {
             PaperOrder[] candidates = _orders.Values
@@ -147,6 +149,25 @@ public sealed class CrossPricePaperExecutionService : IPaperExecutionService, IM
 
                 _orders[order.OrderId] = order with { State = PaperOrderState.Filled };
                 filledOrders.Add(order with { State = PaperOrderState.Filled });
+                if (!string.IsNullOrWhiteSpace(order.OcoGroupId) &&
+                    order.Role is PaperOrderRole.EntryLong or PaperOrderRole.EntryShort)
+                {
+                    PaperOrderRole siblingRole = order.Role == PaperOrderRole.EntryLong
+                        ? PaperOrderRole.EntryShort : PaperOrderRole.EntryLong;
+                    PaperOrder[] siblings = _orders.Values.Where(candidate =>
+                        candidate.State == PaperOrderState.Working &&
+                        string.Equals(candidate.StrategyInstanceId, order.StrategyInstanceId, StringComparison.OrdinalIgnoreCase) &&
+                        candidate.StrategyRunGeneration == order.StrategyRunGeneration &&
+                        string.Equals(candidate.CycleId, order.CycleId, StringComparison.Ordinal) &&
+                        string.Equals(candidate.OcoGroupId, order.OcoGroupId, StringComparison.Ordinal) &&
+                        candidate.Role == siblingRole).ToArray();
+                    foreach (PaperOrder sibling in siblings)
+                    {
+                        PaperOrder cancelled = sibling with { State = PaperOrderState.Cancelled };
+                        _orders[sibling.OrderId] = cancelled;
+                        cancelledEntrySiblings.Add(cancelled);
+                    }
+                }
                 fills.Add(new ExecutionEvent
                 {
                     Sequence = ++_executionSequence,
@@ -173,6 +194,13 @@ public sealed class CrossPricePaperExecutionService : IPaperExecutionService, IM
             Filled?.Invoke(fills[i]);
             PublishLifecycle(filledOrders[i], OrderLifecycleState.Working, OrderLifecycleState.Filled,
                 marketEvent.Timestamp, "Filled", filledOrders[i].Quantity, marketEvent.Sequence);
+        }
+        foreach (PaperOrder sibling in cancelledEntrySiblings)
+        {
+            PublishLifecycle(sibling, OrderLifecycleState.Working, OrderLifecycleState.CancelPending,
+                marketEvent.Timestamp, "CancelRequested", triggerMarketSequence: marketEvent.Sequence);
+            PublishLifecycle(sibling, OrderLifecycleState.CancelPending, OrderLifecycleState.Cancelled,
+                marketEvent.Timestamp, "OcoSiblingCancelled", triggerMarketSequence: marketEvent.Sequence);
         }
     }
 
@@ -204,6 +232,7 @@ public sealed class CrossPricePaperExecutionService : IPaperExecutionService, IM
             Quantity = order.Quantity,
             FilledQuantity = filledQuantity,
             RemainingQuantity = order.Quantity - filledQuantity,
+            HasFinalCumulativeFillWatermark = state is OrderLifecycleState.Filled or OrderLifecycleState.Cancelled or OrderLifecycleState.Rejected,
             ReasonCode = reasonCode
         });
     }

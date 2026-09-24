@@ -78,6 +78,7 @@ public sealed record PaperOrderRequest
 {
     public string ClientOrderId { get; init; } = string.Empty;
     public string CycleId { get; init; } = string.Empty;
+    public string OcoGroupId { get; init; } = string.Empty;
     public long StrategyRunGeneration { get; init; }
     public int Generation { get; init; }
     public string StrategyInstanceId { get; init; } = string.Empty;
@@ -94,6 +95,7 @@ public sealed record PaperOrder
     public string OrderId { get; init; } = string.Empty;
     public string ClientOrderId { get; init; } = string.Empty;
     public string CycleId { get; init; } = string.Empty;
+    public string OcoGroupId { get; init; } = string.Empty;
     public long StrategyRunGeneration { get; init; }
     public int Generation { get; init; }
     public string StrategyInstanceId { get; init; } = string.Empty;
