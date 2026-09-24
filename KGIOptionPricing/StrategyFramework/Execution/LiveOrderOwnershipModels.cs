@@ -34,6 +34,7 @@ public sealed record LiveStrategyOcoGroupState
     public string StopClientOrderId { get; init; } = string.Empty;
     public string PendingCancelClientOrderId { get; init; } = string.Empty;
     public string StopMarketClientOrderId { get; init; } = string.Empty;
+    public int StopMarketRequestedQuantity { get; init; }
     public long TriggerMarketSequence { get; init; }
     public int? BrokerFinalCumulativeFilledQuantity { get; init; }
     public int DeliveredFilledQuantity { get; init; }

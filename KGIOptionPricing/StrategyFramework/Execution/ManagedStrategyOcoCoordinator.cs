@@ -53,6 +53,10 @@ public sealed class ManagedStrategyOcoCoordinator
         {
             _states.TryGetValue(input.Key, out LiveStrategyOcoGroupState? current);
             current ??= new LiveStrategyOcoGroupState { Key = input.Key, Phase = LiveStrategyOcoPhase.EntryWorking };
+            if (current.Phase == LiveStrategyOcoPhase.Completed &&
+                input.Kind == ManagedStrategyOcoEventKind.StopMarketResult &&
+                current.StopMarketClientOrderId == input.ClientOrderId)
+                return Array.Empty<ManagedStrategyOcoAction>();
             LiveStrategyOcoGroupState next = current with { UpdatedAt = input.EventTime };
             var actions = new List<ManagedStrategyOcoAction>();
             switch (input.Kind)
@@ -108,7 +112,8 @@ public sealed class ManagedStrategyOcoCoordinator
                         next = next with { EntryCancelSettled = true, PendingCancelClientOrderId = string.Empty,
                             BrokerFinalCumulativeFilledQuantity = input.BrokerFinalCumulativeFilledQuantity,
                             Phase = residual > 0 ? LiveStrategyOcoPhase.StopSubmitted : LiveStrategyOcoPhase.Completed,
-                            StopMarketClientOrderId = residual > 0 ? StopClientOrderId(input.Key) : string.Empty };
+                            StopMarketClientOrderId = residual > 0 ? StopClientOrderId(input.Key) : string.Empty,
+                            StopMarketRequestedQuantity = residual };
                         if (residual > 0) actions.Add(Action(ManagedStrategyOcoActionKind.SubmitStopMarket, next,
                             next.StopMarketClientOrderId, residual, "Opposite entry cancel settled before stop."));
                     }
@@ -142,7 +147,8 @@ public sealed class ManagedStrategyOcoCoordinator
                         next = next with { StopRequestedQuantity = input.DeliveredFilledQuantity,
                             StopClientOrderId = input.ClientOrderId, TriggerMarketSequence = input.TriggerMarketSequence,
                             Phase = residual > 0 ? LiveStrategyOcoPhase.StopSubmitted : LiveStrategyOcoPhase.Completed,
-                            StopMarketClientOrderId = residual > 0 ? "stop-" + input.Key.StrategyInstanceId + "-" + input.Key.StrategyRunGeneration + "-" + input.Key.CycleId : string.Empty };
+                            StopMarketClientOrderId = residual > 0 ? StopClientOrderId(input.Key) : string.Empty,
+                            StopMarketRequestedQuantity = residual };
                         if (residual > 0) actions.Add(Action(ManagedStrategyOcoActionKind.SubmitStopMarket, next,
                             next.StopMarketClientOrderId, residual, "Take-profit is already terminal."));
                     }
@@ -169,7 +175,8 @@ public sealed class ManagedStrategyOcoCoordinator
                         next = next with { StopRequestedQuantity = input.DeliveredFilledQuantity,
                             StopClientOrderId = input.ClientOrderId, TriggerMarketSequence = input.TriggerMarketSequence,
                             Phase = residual > 0 ? LiveStrategyOcoPhase.StopSubmitted : LiveStrategyOcoPhase.Completed,
-                            StopMarketClientOrderId = residual > 0 ? StopClientOrderId(input.Key) : string.Empty };
+                            StopMarketClientOrderId = residual > 0 ? StopClientOrderId(input.Key) : string.Empty,
+                            StopMarketRequestedQuantity = residual };
                         if (residual > 0) actions.Add(Action(ManagedStrategyOcoActionKind.SubmitStopMarket, next,
                             next.StopMarketClientOrderId, residual, "Opposite entry cancel was already settled."));
                     }
@@ -190,7 +197,8 @@ public sealed class ManagedStrategyOcoCoordinator
                             TakeProfitTerminal = true,
                             TakeProfitFinalCumulativeFilledQuantity = input.BrokerFinalCumulativeFilledQuantity.Value,
                             PendingCancelClientOrderId = string.Empty,
-                            StopMarketClientOrderId = residual > 0 ? "stop-" + input.Key.StrategyInstanceId + "-" + input.Key.StrategyRunGeneration + "-" + input.Key.CycleId : string.Empty };
+                            StopMarketClientOrderId = residual > 0 ? StopClientOrderId(input.Key) : string.Empty,
+                            StopMarketRequestedQuantity = residual };
                         if (residual > 0) actions.Add(Action(ManagedStrategyOcoActionKind.SubmitStopMarket, next,
                             next.StopMarketClientOrderId, residual, "OCO cancel settled."));
                     }
@@ -199,7 +207,15 @@ public sealed class ManagedStrategyOcoCoordinator
                     next = next with { Phase = LiveStrategyOcoPhase.ReconciliationRequired, Reason = "OCO cancel rejected; manual reconciliation required." };
                     break;
                 case ManagedStrategyOcoEventKind.StopMarketResult:
-                    next = next with { Phase = LiveStrategyOcoPhase.ReconciliationRequired, Reason = "Stop-market result requires broker reconciliation." };
+                    if (current.Phase != LiveStrategyOcoPhase.StopSubmitted || current.StopMarketClientOrderId != input.ClientOrderId ||
+                        !input.HasFinalCumulativeFillWatermark || input.BrokerFinalCumulativeFilledQuantity is null ||
+                        input.BrokerFinalCumulativeFilledQuantity != input.DeliveredFilledQuantity ||
+                        input.BrokerFinalCumulativeFilledQuantity != current.StopMarketRequestedQuantity)
+                        next = next with { Phase = LiveStrategyOcoPhase.ReconciliationRequired,
+                            Reason = "Stop-market result is unknown, rejected or not fully settled; do not retry automatically." };
+                    else next = next with { Phase = LiveStrategyOcoPhase.Completed,
+                        BrokerFinalCumulativeFilledQuantity = input.BrokerFinalCumulativeFilledQuantity,
+                        Reason = "Stop-market fully settled." };
                     break;
             }
             _states[input.Key] = next;

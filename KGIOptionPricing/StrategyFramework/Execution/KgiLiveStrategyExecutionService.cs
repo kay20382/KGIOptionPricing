@@ -1092,6 +1092,15 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
                     lifecycle.FilledQuantity, lifecycle.HasFinalCumulativeFillWatermark, lifecycle.TriggerMarketSequence,
                     lifecycle.Timestamp));
         }
+        else if (lifecycle.Role == PaperOrderRole.StopLoss && state?.Phase == LiveStrategyOcoPhase.StopSubmitted &&
+                 state.StopMarketClientOrderId == lifecycle.ClientOrderId &&
+                 lifecycle.State is OrderLifecycleState.Filled or OrderLifecycleState.Cancelled or OrderLifecycleState.Rejected)
+        {
+            ApplyManagedOcoEvent(new ManagedStrategyOcoEvent(key, ManagedStrategyOcoEventKind.StopMarketResult,
+                lifecycle.ClientOrderId, lifecycle.BrokerOrderId, lifecycle.Role.Value, lifecycle.DeliveredFilledQuantity,
+                lifecycle.FilledQuantity, lifecycle.HasFinalCumulativeFillWatermark, lifecycle.TriggerMarketSequence,
+                lifecycle.Timestamp));
+        }
     }
 
     private void ApplyManagedOcoEvent(ManagedStrategyOcoEvent input)
