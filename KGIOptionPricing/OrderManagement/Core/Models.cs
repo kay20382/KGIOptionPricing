@@ -8,7 +8,8 @@ namespace KGIOptionPricing.OrderManagement.Core
         string ClientOrderId,
         string CycleId,
         string Symbol,
-        string OrderRole);
+        string OrderRole,
+        string OcoGroupId = "");
 
     public class InstrumentKey
     {

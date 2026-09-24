@@ -137,6 +137,7 @@ public sealed record OrderLifecycleEvent
     public string StrategyInstanceId { get; init; } = string.Empty;
     public string ClientOrderId { get; init; } = string.Empty;
     public string CycleId { get; init; } = string.Empty;
+    public string OcoGroupId { get; init; } = string.Empty;
     public long StrategyRunGeneration { get; init; }
     public int Generation { get; init; }
     public string OrderId { get; init; } = string.Empty;
@@ -150,6 +151,7 @@ public sealed record OrderLifecycleEvent
     public decimal Price { get; init; }
     public int Quantity { get; init; }
     public int FilledQuantity { get; init; }
+    public int DeliveredFilledQuantity { get; init; }
     public int RemainingQuantity { get; init; }
     public bool HasFinalCumulativeFillWatermark { get; init; }
     public string ReasonCode { get; init; } = string.Empty;

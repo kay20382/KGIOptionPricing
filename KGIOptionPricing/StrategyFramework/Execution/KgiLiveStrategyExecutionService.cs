@@ -65,6 +65,8 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
     private readonly Dictionary<long, BrokerMutationLease> _brokerMutationLeases = new();
     private readonly Dictionary<string, PaperOrder> _conditions = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, TrackedRealOrder> _realOrders = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ManagedStrategyOcoCoordinator _ocoCoordinator = new();
+    private readonly Dictionary<LiveStrategyOcoKey, PaperOrder> _pendingOcoStops = new();
     private readonly HashSet<string> _ownedClientOrderIds = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _clientOrderReservations = new(StringComparer.OrdinalIgnoreCase);
     private long _localSequence;
@@ -211,6 +213,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
             OrderId = orderId,
             ClientOrderId = request.ClientOrderId,
             CycleId = request.CycleId,
+            OcoGroupId = request.OcoGroupId,
             StrategyRunGeneration = request.StrategyRunGeneration,
             Generation = request.Generation,
             StrategyInstanceId = request.StrategyInstanceId,
@@ -361,7 +364,11 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
                     if (lifecycle != null) lifecycles.Add(lifecycle);
                 }
             }
-            foreach (OrderLifecycleEvent lifecycle in lifecycles) OrderLifecycleChanged?.Invoke(lifecycle);
+            foreach (OrderLifecycleEvent lifecycle in lifecycles)
+            {
+                ApplyManagedOcoLifecycle(lifecycle);
+                OrderLifecycleChanged?.Invoke(lifecycle);
+            }
             if (lifecycles.Count > 0) StateChanged?.Invoke();
             return lifecycles.Count;
         }
@@ -411,7 +418,21 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
                 _conditions.Clear(); // Existing local OCO behavior.
             }
         }
-        if (triggered != null) SendMarket(triggered, marketEvent.LastPrice);
+        if (triggered != null)
+        {
+            if (!string.IsNullOrWhiteSpace(triggered.OcoGroupId) && triggered.Role == PaperOrderRole.StopLoss)
+            {
+                var key = new LiveStrategyOcoKey(triggered.StrategyInstanceId, triggered.StrategyRunGeneration, triggered.OcoGroupId);
+                lock (_sync) _pendingOcoStops[key] = triggered;
+                ApplyManagedOcoEvent(new ManagedStrategyOcoEvent(key, ManagedStrategyOcoEventKind.StopTriggered,
+                    triggered.ClientOrderId, string.Empty, triggered.Role, triggered.Quantity, null, false,
+                    marketEvent.Sequence, marketEvent.Timestamp));
+                if (_ocoCoordinator.GetStates(key.StrategyInstanceId, key.StrategyRunGeneration)
+                    .SingleOrDefault(item => item.Key == key)?.Phase == LiveStrategyOcoPhase.Completed)
+                    lock (_sync) _pendingOcoStops.Remove(key);
+            }
+            else SendMarket(triggered, marketEvent.LastPrice);
+        }
         }
         finally { ExitOperation(); }
     }
@@ -522,6 +543,14 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
 
     private void SendBrokerLimit(PaperOrderRequest request, PaperOrder order, DateTimeOffset now)
     {
+        bool ocoEntry = !string.IsNullOrWhiteSpace(request.OcoGroupId) &&
+            request.Role is PaperOrderRole.EntryLong or PaperOrderRole.EntryShort;
+        bool ocoTakeProfit = !string.IsNullOrWhiteSpace(request.OcoGroupId) && request.Role == PaperOrderRole.TakeProfit;
+        if (ocoTakeProfit)
+            EnsureTakeProfitMayBeSubmitted(new ManagedStrategyOcoEvent(
+                new LiveStrategyOcoKey(request.StrategyInstanceId, request.StrategyRunGeneration, request.OcoGroupId),
+                ManagedStrategyOcoEventKind.TakeProfitSubmitted, request.ClientOrderId, string.Empty,
+                request.Role, 0, null, false, 0, now));
         OrderRequest brokerRequest = LiveStrategyOrderMapper.CreateBrokerLimit(
             request, _instrument, _gateway.BrokerId, _gateway.Account, order.OrderId);
         lock (_sync)
@@ -546,10 +575,20 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         bool gatewayCallStarted = false;
         try
         {
+            if (ocoTakeProfit)
+                ApplyManagedOcoEvent(new ManagedStrategyOcoEvent(
+                    new LiveStrategyOcoKey(request.StrategyInstanceId, request.StrategyRunGeneration, request.OcoGroupId),
+                    ManagedStrategyOcoEventKind.TakeProfitSubmitted, request.ClientOrderId, string.Empty,
+                    request.Role, 0, null, false, 0, now));
             mutation = CommitBrokerMutationLease();
             TransitionBrokerMutationToCall(mutation);
             gatewayCallStarted = true;
             _gateway.PlaceOrder(brokerRequest);
+            if (ocoEntry)
+                ApplyManagedOcoEvent(new ManagedStrategyOcoEvent(
+                    new LiveStrategyOcoKey(request.StrategyInstanceId, request.StrategyRunGeneration, request.OcoGroupId),
+                    ManagedStrategyOcoEventKind.EntrySubmitted, request.ClientOrderId, string.Empty,
+                    request.Role, 0, null, false, 0, now));
         }
         catch (BrokerReconciliationRequiredException)
         {
@@ -558,6 +597,11 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         }
         catch (Exception ex)
         {
+            if (!gatewayCallStarted)
+            {
+                RemoveNeverSubmittedOrder(order.OrderId);
+                throw;
+            }
             PublishTransition(order.OrderId, OrderLifecycleState.Rejected, null, "SubmitException", _now());
             PublishFailureOnce(order.OrderId, "實盤限價單送單例外：" + ex.GetBaseException().Message);
         }
@@ -611,7 +655,8 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
                     condition.ClientOrderId,
                     condition.CycleId,
                     condition.Symbol,
-                    condition.Role.ToString())
+                    condition.Role.ToString(),
+                    condition.OcoGroupId)
             });
         }
         catch (BrokerReconciliationRequiredException)
@@ -757,7 +802,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
             _beforeFilledPublished?.Invoke();
             Filled?.Invoke(execution);
         }
-        if (lifecycle != null) OrderLifecycleChanged?.Invoke(lifecycle);
+        if (lifecycle != null) { ApplyManagedOcoLifecycle(lifecycle); OrderLifecycleChanged?.Invoke(lifecycle); }
         if (protocolFailure != null) Failed?.Invoke(protocolFailure);
         if (execution != null || lifecycle != null || legacyTerminal || protocolFailure != null) StateChanged?.Invoke();
         }
@@ -797,7 +842,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
                 failure = $"實盤委託失敗：{reason}";
             }
         }
-        if (lifecycle != null) OrderLifecycleChanged?.Invoke(lifecycle);
+        if (lifecycle != null) { ApplyManagedOcoLifecycle(lifecycle); OrderLifecycleChanged?.Invoke(lifecycle); }
         if (failure != null) Failed?.Invoke(failure);
         if (lifecycle != null || legacyRemoved) StateChanged?.Invoke();
         }
@@ -819,7 +864,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
                 lifecycle = CreateTransitionLocked(tracked, OrderLifecycleState.Working, brokerOrder,
                     "CancelFailed", _now(), allowCancelFailureRecovery: true);
         }
-        if (lifecycle != null) OrderLifecycleChanged?.Invoke(lifecycle);
+        if (lifecycle != null) { ApplyManagedOcoLifecycle(lifecycle); OrderLifecycleChanged?.Invoke(lifecycle); }
         if (owned) Failed?.Invoke($"實盤刪單失敗：{reason}");
         if (lifecycle != null) StateChanged?.Invoke();
         }
@@ -902,7 +947,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
                 }
             }
         }
-        if (lifecycle != null) OrderLifecycleChanged?.Invoke(lifecycle);
+        if (lifecycle != null) { ApplyManagedOcoLifecycle(lifecycle); OrderLifecycleChanged?.Invoke(lifecycle); }
         if (failure != null) Failed?.Invoke(failure);
         if (lifecycle != null || legacyChanged || failure != null) StateChanged?.Invoke();
         }
@@ -978,6 +1023,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
             StrategyInstanceId = _instanceId,
             ClientOrderId = tracked.Order.ClientOrderId,
             CycleId = tracked.Order.CycleId,
+            OcoGroupId = tracked.Order.OcoGroupId,
             StrategyRunGeneration = tracked.Order.StrategyRunGeneration,
             Generation = tracked.Order.Generation,
             OrderId = tracked.Order.OrderId,
@@ -990,16 +1036,107 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
             Price = tracked.Order.Price,
             Quantity = tracked.Order.Quantity,
             FilledQuantity = filled,
+            DeliveredFilledQuantity = tracked.DeliveredFilledQuantity,
             RemainingQuantity = remaining,
-            ReasonCode = reasonCode
+            ReasonCode = reasonCode,
+            HasFinalCumulativeFillWatermark = terminal && brokerOrder != null &&
+                brokerOrder.Status is OrderStatus.Filled or OrderStatus.Cancelled or OrderStatus.Rejected
         };
     }
 
     private void PublishLifecycle(OrderLifecycleEvent? lifecycle)
     {
         if (lifecycle == null) return;
+        ApplyManagedOcoLifecycle(lifecycle);
         OrderLifecycleChanged?.Invoke(lifecycle);
         StateChanged?.Invoke();
+    }
+
+    private void ApplyManagedOcoLifecycle(OrderLifecycleEvent lifecycle)
+    {
+        if (string.IsNullOrWhiteSpace(lifecycle.OcoGroupId) || lifecycle.Role is null) return;
+        var key = new LiveStrategyOcoKey(lifecycle.StrategyInstanceId, lifecycle.StrategyRunGeneration, lifecycle.OcoGroupId);
+        LiveStrategyOcoGroupState? state = _ocoCoordinator.GetStates(lifecycle.StrategyInstanceId,
+            lifecycle.StrategyRunGeneration).SingleOrDefault(item => item.Key == key);
+        if (state?.Phase == LiveStrategyOcoPhase.StopPending &&
+            state.PendingCancelClientOrderId == lifecycle.ClientOrderId && lifecycle.ReasonCode == "CancelFailed")
+        {
+            ApplyManagedOcoEvent(new ManagedStrategyOcoEvent(key, ManagedStrategyOcoEventKind.CancelRejected,
+                lifecycle.ClientOrderId, lifecycle.BrokerOrderId, lifecycle.Role.Value, lifecycle.FilledQuantity,
+                null, false, lifecycle.TriggerMarketSequence, lifecycle.Timestamp));
+            return;
+        }
+        if (lifecycle.Role is PaperOrderRole.EntryLong or PaperOrderRole.EntryShort)
+        {
+            if (lifecycle.State is OrderLifecycleState.PartiallyFilled or OrderLifecycleState.Filled)
+                ApplyManagedOcoEvent(new ManagedStrategyOcoEvent(key, ManagedStrategyOcoEventKind.EntryFill,
+                    lifecycle.ClientOrderId, lifecycle.BrokerOrderId, lifecycle.Role.Value, lifecycle.DeliveredFilledQuantity,
+                    null, false, lifecycle.TriggerMarketSequence, lifecycle.Timestamp));
+            if (lifecycle.State is OrderLifecycleState.Filled or OrderLifecycleState.Cancelled or OrderLifecycleState.Rejected)
+                ApplyManagedOcoEvent(new ManagedStrategyOcoEvent(key, ManagedStrategyOcoEventKind.EntryTerminal,
+                    lifecycle.ClientOrderId, lifecycle.BrokerOrderId, lifecycle.Role.Value, lifecycle.FilledQuantity,
+                    lifecycle.DeliveredFilledQuantity, lifecycle.HasFinalCumulativeFillWatermark, lifecycle.TriggerMarketSequence,
+                    lifecycle.Timestamp));
+        }
+        else if (lifecycle.Role == PaperOrderRole.TakeProfit &&
+                 lifecycle.State is OrderLifecycleState.Filled or OrderLifecycleState.Cancelled or OrderLifecycleState.Rejected)
+        {
+            if (state?.Phase == LiveStrategyOcoPhase.StopPending && state.PendingCancelClientOrderId == lifecycle.ClientOrderId)
+                ApplyManagedOcoEvent(new ManagedStrategyOcoEvent(key, ManagedStrategyOcoEventKind.CancelAccepted,
+                    lifecycle.ClientOrderId, lifecycle.BrokerOrderId, lifecycle.Role.Value, lifecycle.FilledQuantity,
+                    lifecycle.DeliveredFilledQuantity, lifecycle.HasFinalCumulativeFillWatermark, lifecycle.TriggerMarketSequence,
+                    lifecycle.Timestamp));
+            else
+                ApplyManagedOcoEvent(new ManagedStrategyOcoEvent(key, ManagedStrategyOcoEventKind.TakeProfitTerminal,
+                    lifecycle.ClientOrderId, lifecycle.BrokerOrderId, lifecycle.Role.Value, lifecycle.DeliveredFilledQuantity,
+                    lifecycle.FilledQuantity, lifecycle.HasFinalCumulativeFillWatermark, lifecycle.TriggerMarketSequence,
+                    lifecycle.Timestamp));
+        }
+    }
+
+    private void ApplyManagedOcoEvent(ManagedStrategyOcoEvent input)
+    {
+        if (input.Kind == ManagedStrategyOcoEventKind.TakeProfitSubmitted)
+            EnsureTakeProfitMayBeSubmitted(input);
+        IReadOnlyList<ManagedStrategyOcoAction> actions = _ocoCoordinator.Apply(input);
+        foreach (ManagedStrategyOcoAction action in actions)
+        {
+            switch (action.Kind)
+            {
+                case ManagedStrategyOcoActionKind.PersistState:
+                    try { _gateway.AppendOcoState(action.State); }
+                    catch (Exception exception)
+                    {
+                        lock (_sync) RequestProtocolGateLocked();
+                        throw new BrokerReconciliationRequiredException(
+                            "OCO journal persistence failed; broker actions are blocked pending reconciliation: " + exception.GetBaseException().Message);
+                    }
+                    break;
+                case ManagedStrategyOcoActionKind.CancelBrokerOrder:
+                    string? realId;
+                    lock (_sync)
+                        realId = _realOrders.Values.SingleOrDefault(item => string.Equals(item.Order.ClientOrderId,
+                            action.ClientOrderId, StringComparison.OrdinalIgnoreCase) && !item.Terminal)?.Order.OrderId;
+                    if (!string.IsNullOrWhiteSpace(realId)) RequestCancel(realId);
+                    break;
+                case ManagedStrategyOcoActionKind.SubmitStopMarket:
+                    PaperOrder? stop;
+                    lock (_sync) _pendingOcoStops.Remove(action.State.Key, out stop);
+                    if (stop != null && action.Quantity > 0)
+                        SendMarket(stop with { ClientOrderId = action.ClientOrderId, Quantity = action.Quantity }, stop.Price);
+                    break;
+            }
+        }
+        if (actions.Count > 0 && actions[0].State.Phase == LiveStrategyOcoPhase.Completed)
+            lock (_sync) _pendingOcoStops.Remove(actions[0].State.Key);
+    }
+
+    private void EnsureTakeProfitMayBeSubmitted(ManagedStrategyOcoEvent input)
+    {
+        LiveStrategyOcoGroupState? current = _ocoCoordinator.GetStates(input.Key.StrategyInstanceId,
+            input.Key.StrategyRunGeneration).SingleOrDefault(state => state.Key == input.Key);
+        if (current?.Phase != LiveStrategyOcoPhase.PositionProtected || !current.EntryCancelSettled)
+            throw new BrokerReconciliationRequiredException("Take-profit submission is blocked until both entry orders have authoritative terminal settlement.");
     }
 
     private void PublishFailureOnce(string realId, string message)

@@ -26,13 +26,18 @@ public sealed record LiveStrategyOcoGroupState
     public LiveStrategyOcoPhase Phase { get; init; }
     public string EntryLongClientOrderId { get; init; } = string.Empty;
     public string EntryShortClientOrderId { get; init; } = string.Empty;
+    public string FilledEntryClientOrderId { get; init; } = string.Empty;
+    public bool EntryCancelSettled { get; init; }
     public string TakeProfitClientOrderId { get; init; } = string.Empty;
+    public bool TakeProfitTerminal { get; init; }
+    public int TakeProfitFinalCumulativeFilledQuantity { get; init; }
     public string StopClientOrderId { get; init; } = string.Empty;
     public string PendingCancelClientOrderId { get; init; } = string.Empty;
     public string StopMarketClientOrderId { get; init; } = string.Empty;
     public long TriggerMarketSequence { get; init; }
     public int? BrokerFinalCumulativeFilledQuantity { get; init; }
     public int DeliveredFilledQuantity { get; init; }
+    public int StopRequestedQuantity { get; init; }
     public DateTimeOffset UpdatedAt { get; init; }
     public string Reason { get; init; } = string.Empty;
 }
@@ -47,6 +52,7 @@ public sealed record LiveOrderOwnership
     public string Account { get; init; } = string.Empty;
     public string Symbol { get; init; } = string.Empty;
     public string CycleId { get; init; } = string.Empty;
+    public string OcoGroupId { get; init; } = string.Empty;
     public PaperOrderRole Role { get; init; }
     public int Quantity { get; init; }
     public StrategySubmissionState SubmissionState { get; init; } = StrategySubmissionState.Prepared;

@@ -14,6 +14,8 @@ public interface ILiveStrategyOrderGateway
     event Action<OrderInfo, string>? CancelFailed;
     void PlaceOrder(OrderRequest request);
     void CancelOrder(string orderId);
+    void AppendOcoState(LiveStrategyOcoGroupState state) => throw new NotSupportedException("此 gateway 未支援持久化 OCO 狀態。");
+    IReadOnlyList<LiveStrategyOcoGroupState> GetOcoStates(string strategyInstanceId, long strategyRunGeneration) => Array.Empty<LiveStrategyOcoGroupState>();
 }
 
 internal sealed class OrderManagerLiveStrategyOrderGateway : ILiveStrategyOrderGateway
@@ -103,7 +105,8 @@ public static class LiveStrategyOrderMapper
                 request.ClientOrderId,
                 request.CycleId,
                 request.Symbol,
-                request.Role.ToString())
+                request.Role.ToString(),
+                request.OcoGroupId)
         };
     }
 

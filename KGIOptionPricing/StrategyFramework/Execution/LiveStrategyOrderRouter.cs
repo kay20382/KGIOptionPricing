@@ -71,6 +71,8 @@ public sealed class LiveStrategyOrderRouter : IDisposable
             string.IsNullOrWhiteSpace(metadata.CycleId) || string.IsNullOrWhiteSpace(metadata.Symbol) ||
             string.IsNullOrWhiteSpace(metadata.OrderRole))
             throw new InvalidOperationException("Live strategy route metadata is incomplete or belongs to another strategy instance.");
+        if (!string.IsNullOrEmpty(metadata.OcoGroupId) && !string.Equals(metadata.OcoGroupId, metadata.CycleId, StringComparison.Ordinal))
+            throw new InvalidOperationException("An opted-in OCO group must use its exact strategy cycle id.");
         if (!string.Equals(request.Account, _gateway.Account, StringComparison.OrdinalIgnoreCase))
             throw new InvalidOperationException("Live strategy request account differs from the routed broker account.");
         LiveOwnershipSnapshot current = _store.Replay();
@@ -94,6 +96,7 @@ public sealed class LiveStrategyOrderRouter : IDisposable
             Account = request.Account,
             Symbol = metadata.Symbol,
             CycleId = metadata.CycleId,
+            OcoGroupId = metadata.OcoGroupId,
             Role = role,
             Quantity = request.Quantity,
             SubmissionState = StrategySubmissionState.Prepared
@@ -199,7 +202,8 @@ public sealed class LiveStrategyOrderRouter : IDisposable
             if (route == null ||
                 !string.Equals(route.Symbol, metadata.Symbol, StringComparison.OrdinalIgnoreCase) ||
                 !string.Equals(route.CycleId, metadata.CycleId, StringComparison.Ordinal) ||
-                !string.Equals(route.Role.ToString(), metadata.OrderRole, StringComparison.Ordinal))
+                !string.Equals(route.Role.ToString(), metadata.OrderRole, StringComparison.Ordinal) ||
+                !string.Equals(route.OcoGroupId, metadata.OcoGroupId, StringComparison.Ordinal))
                 return null;
             LiveOrderOwnerKey[] indexed = FindOwnersByOrder(order, snapshot).Distinct().ToArray();
             return indexed.Length == 0 || indexed.Length == 1 && indexed[0] == direct ? direct : null;
@@ -333,6 +337,27 @@ public sealed class LiveStrategyOrderRouter : IDisposable
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
             _owner.Cancel(this, orderId);
+        }
+
+        public void AppendOcoState(LiveStrategyOcoGroupState state)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            ArgumentNullException.ThrowIfNull(state);
+            if (!string.Equals(state.Key.StrategyInstanceId, StrategyInstanceId, StringComparison.OrdinalIgnoreCase) ||
+                state.Key.StrategyRunGeneration != StrategyRunGeneration)
+                throw new InvalidOperationException("A strategy facade may persist only its own OCO state.");
+            _owner._store.AppendOcoState(state);
+        }
+
+        public IReadOnlyList<LiveStrategyOcoGroupState> GetOcoStates(string strategyInstanceId, long strategyRunGeneration)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (!string.Equals(strategyInstanceId, StrategyInstanceId, StringComparison.OrdinalIgnoreCase) ||
+                strategyRunGeneration != StrategyRunGeneration)
+                throw new InvalidOperationException("A strategy facade may read only its own OCO state.");
+            return _owner._store.Replay().OcoGroups.Where(state =>
+                string.Equals(state.Key.StrategyInstanceId, StrategyInstanceId, StringComparison.OrdinalIgnoreCase) &&
+                state.Key.StrategyRunGeneration == StrategyRunGeneration).ToArray();
         }
 
         internal void PublishOrderStateChanged(OrderInfo order) => OrderStateChanged?.Invoke(order);
