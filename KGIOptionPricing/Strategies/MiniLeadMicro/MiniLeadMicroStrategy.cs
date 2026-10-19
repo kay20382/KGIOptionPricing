@@ -1,8 +1,6 @@
 using System.Globalization;
-using System.Text.Json;
 using KGIOptionPricing.OrderManagement.Core;
 using KGIOptionPricing.StrategyFramework;
-using KGIOptionPricing.StrategyFramework.Recovery;
 
 namespace KGIOptionPricing.Strategies.MiniLeadMicro;
 
@@ -24,17 +22,9 @@ internal enum LargeConfirmationState { Neutral, ConfirmedUp, ConfirmedDown, Dive
 /// intentionally not a fitted or look-ahead model.
 /// </summary>
 public sealed class MiniLeadMicroStrategy : ISimulationStrategy, IManagedOrderStrategy,
-    IManagedOrderSubmissionObserver, IStrategyRecoveryParticipant
+    IManagedOrderSubmissionObserver
 {
     private sealed record Sample(DateTimeOffset Time, decimal Mid);
-    private sealed record RecoveryState(KeyValuePair<string, MarketEvent>[] Books, Sample[] Mini, Sample[] Large,
-        Sample[] Micro, DateTimeOffset[] MiniTrades, DateTimeOffset? FirstValidBookAt, DateTimeOffset? SignalCrossedAt,
-        DateTimeOffset EntryAt, DateTimeOffset CooldownUntil, decimal EntryPrice, decimal StopPrice,
-        decimal MiniExtreme, decimal LargeExtreme, decimal LeaderMove, decimal LargeMove, decimal FollowerMove,
-        decimal PathEfficiency, decimal LargeEfficiency, decimal TradeIntensity, decimal CatchUpRatio,
-        decimal ExecutableGap, decimal ExpectedMove, string Reason, int SignalDirection, int CompletedTrades,
-        int ConsecutiveLosses, bool EntryWorking, bool ExitWorking, bool Paused, StrategyLifecycleState State,
-        int CycleSequence, string CurrentCycleId, ManagedOrderBookCheckpoint OrderBook);
     private readonly StrategyDefinition _definition;
     private readonly Dictionary<string, MarketEvent> _books = new(StringComparer.OrdinalIgnoreCase);
     private readonly Queue<Sample> _mini = new();
@@ -64,7 +54,6 @@ public sealed class MiniLeadMicroStrategy : ISimulationStrategy, IManagedOrderSt
     private long _strategyRunGeneration;
     private int _cycleSequence;
     private string _currentCycleId = string.Empty;
-    private bool _restoredBeforeStart;
 
     public string StrategyType => MiniLeadMicroFactory.TypeName;
     public string InstanceId => _definition.InstanceId;
@@ -73,7 +62,6 @@ public sealed class MiniLeadMicroStrategy : ISimulationStrategy, IManagedOrderSt
     public event Action? CancelAllRequested;
     public event Action<StrategySnapshot>? SnapshotChanged;
     public event Action<string>? CancelOrderRequested;
-    public string RecoverySchema => "mini-lead-micro/v1";
 
     public MiniLeadMicroStrategy(StrategyDefinition definition)
     {
@@ -113,21 +101,16 @@ public sealed class MiniLeadMicroStrategy : ISimulationStrategy, IManagedOrderSt
 
     public void Start(StrategyRuntimeContext context)
     {
-        if (State != StrategyLifecycleState.Created && !_restoredBeforeStart) throw new InvalidOperationException("策略已啟動。");
+        if (State != StrategyLifecycleState.Created) throw new InvalidOperationException("策略已啟動。");
         if (!string.Equals(context.Universe.Tradable.ProductId, "225MC", StringComparison.OrdinalIgnoreCase) ||
             !context.Universe.References.Any(x => string.Equals(x.ProductId, "225M", StringComparison.OrdinalIgnoreCase)) ||
             !context.Universe.References.Any(x => string.Equals(x.ProductId, "225", StringComparison.OrdinalIgnoreCase)))
             throw new InvalidOperationException("Mini 領先策略需要交易 225MC，並以 225M、225 為參考商品。");
         _context = context;
-        if (_orderBook == null)
-        {
-            _strategyRunGeneration = context.StrategyRunGeneration;
-            _orderBook = new ManagedStrategyOrderBook(InstanceId, _strategyRunGeneration);
-        }
-        else if (_strategyRunGeneration != context.StrategyRunGeneration)
-            throw new InvalidOperationException("Mini Lead recovery run generation does not match runtime.");
-        if (_restoredBeforeStart) { _restoredBeforeStart = false; _paused = true; State = StrategyLifecycleState.Suspended; _reason = "RecoveryAwaitingResume"; }
-        else { State = StrategyLifecycleState.WarmingUp; _reason = $"等待三商品有效第一檔並暖機 {_warmupSeconds} 秒"; }
+        _strategyRunGeneration = context.StrategyRunGeneration;
+        _orderBook = new ManagedStrategyOrderBook(InstanceId, _strategyRunGeneration);
+        State = StrategyLifecycleState.WarmingUp;
+        _reason = $"等待三商品有效第一檔並暖機 {_warmupSeconds} 秒";
         Publish();
     }
 
@@ -443,45 +426,6 @@ public sealed class MiniLeadMicroStrategy : ISimulationStrategy, IManagedOrderSt
         { _exitWorking = false; State = StrategyLifecycleState.Suspended; _reason = "保護／平倉委託已撤銷／拒絕，需人工處理"; Publish(); }
     }
 
-    public StrategyRecoveryCheckpoint CaptureRecoveryCheckpoint()
-    {
-        if (_orderBook == null) throw new InvalidOperationException("Mini Lead has not initialized its managed order book.");
-        var state = new RecoveryState(_books.ToArray(), _mini.ToArray(), _large.ToArray(), _micro.ToArray(), _miniTrades.ToArray(),
-            _firstValidBookAt, _signalCrossedAt, _entryAt, _cooldownUntil, _entryPrice, _stopPrice, _miniExtreme, _largeExtreme,
-            _leaderMove, _largeMove, _followerMove, _pathEfficiency, _largeEfficiency, _tradeIntensity, _catchUpRatio,
-            _executableGap, _expectedMove, _reason, _signalDirection, _completedTrades, _consecutiveLosses,
-            _entryWorking, _exitWorking, _paused, State, _cycleSequence, _currentCycleId, _orderBook.Capture());
-        return new StrategyRecoveryCheckpoint(StrategyType, InstanceId, _strategyRunGeneration, RecoverySchema,
-            DateTimeOffset.UtcNow, JsonSerializer.Serialize(state));
-    }
-
-    public void RestoreRecoveryCheckpoint(StrategyRecoveryCheckpoint checkpoint)
-    {
-        StrategyRecoveryCheckpointValidator.EnsureCompatible(checkpoint, StrategyType, InstanceId,
-            checkpoint.StrategyRunGeneration, RecoverySchema);
-        RecoveryState state = JsonSerializer.Deserialize<RecoveryState>(checkpoint.PayloadJson)
-            ?? throw new InvalidOperationException("Mini Lead recovery payload is empty.");
-        if (_strategyRunGeneration != 0 && _strategyRunGeneration != checkpoint.StrategyRunGeneration)
-            throw new InvalidOperationException("Mini Lead checkpoint generation conflicts with runtime.");
-        _strategyRunGeneration = checkpoint.StrategyRunGeneration;
-        _orderBook ??= new ManagedStrategyOrderBook(InstanceId, _strategyRunGeneration);
-        _orderBook.Restore(state.OrderBook);
-        _books.Clear(); foreach (var item in state.Books) _books[item.Key] = item.Value;
-        _mini.Clear(); foreach (Sample item in state.Mini) _mini.Enqueue(item);
-        _large.Clear(); foreach (Sample item in state.Large) _large.Enqueue(item);
-        _micro.Clear(); foreach (Sample item in state.Micro) _micro.Enqueue(item);
-        _miniTrades.Clear(); foreach (DateTimeOffset item in state.MiniTrades) _miniTrades.Enqueue(item);
-        _firstValidBookAt = state.FirstValidBookAt; _signalCrossedAt = state.SignalCrossedAt;
-        _entryAt = state.EntryAt; _cooldownUntil = state.CooldownUntil;
-        _entryPrice = state.EntryPrice; _stopPrice = state.StopPrice; _miniExtreme = state.MiniExtreme; _largeExtreme = state.LargeExtreme;
-        _leaderMove = state.LeaderMove; _largeMove = state.LargeMove; _followerMove = state.FollowerMove;
-        _pathEfficiency = state.PathEfficiency; _largeEfficiency = state.LargeEfficiency; _tradeIntensity = state.TradeIntensity;
-        _catchUpRatio = state.CatchUpRatio; _executableGap = state.ExecutableGap; _expectedMove = state.ExpectedMove;
-        _reason = state.Reason; _signalDirection = state.SignalDirection; _completedTrades = state.CompletedTrades;
-        _consecutiveLosses = state.ConsecutiveLosses; _entryWorking = state.EntryWorking; _exitWorking = state.ExitWorking; _paused = state.Paused;
-        State = state.State; _cycleSequence = state.CycleSequence; _currentCycleId = state.CurrentCycleId;
-        _restoredBeforeStart = _context == null;
-    }
 
     private void CancelActiveOrders()
     {

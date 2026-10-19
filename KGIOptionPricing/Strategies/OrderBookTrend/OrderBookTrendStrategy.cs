@@ -1,8 +1,6 @@
 using System.Globalization;
-using System.Text.Json;
 using KGIOptionPricing.OrderManagement.Core;
 using KGIOptionPricing.StrategyFramework;
-using KGIOptionPricing.StrategyFramework.Recovery;
 
 namespace KGIOptionPricing.Strategies.OrderBookTrend;
 
@@ -21,18 +19,8 @@ public sealed class OrderBookTrendFactory : IStrategyFactory
 /// only; execution, positions, PnL, multipliers, and costs remain framework-owned.
 /// </summary>
 public sealed class OrderBookTrendStrategy : ISimulationStrategy, IManagedOrderStrategy,
-    IManagedOrderSubmissionObserver, IStrategyRecoveryParticipant
+    IManagedOrderSubmissionObserver
 {
-    private sealed record RecoveryState(decimal[] MidHistory, decimal[] MidChanges, decimal[] OfiEvents,
-        int[] TradeDirections, bool[] Confirmations, MarketEvent? PreviousBook, DateTimeOffset LastValidAt,
-        DateTimeOffset EntryAt, DateTimeOffset CooldownUntil, decimal PreviousTradePrice, decimal EntryPrice,
-        decimal FixedStop, decimal ActiveStop, decimal BestMid, decimal EntryNetPnl, decimal MomentumTicks,
-        decimal Obi, decimal OfiRaw, decimal OfiZ, decimal Ti, decimal Microprice, decimal MicropriceEdgeTicks,
-        decimal RvTicks, decimal WeightedDepth, decimal BuyEntry, decimal SellEntry, int LastTradeDirection,
-        int CandidateDirection, int EntryWorkingEvents, int HoldingEvents, long LastSequence, int CompletedTrades,
-        int TradesToday, int ConsecutiveLosses, DateOnly TradingDate, bool EntryWorking, bool ExitWorking,
-        bool Paused, string Reason, StrategyLifecycleState State, int CycleSequence, string CurrentCycleId,
-        ManagedOrderBookCheckpoint OrderBook);
     private static readonly decimal[] DepthWeights = { 1m, .70m, .50m, .35m, .25m };
     private readonly StrategyDefinition _definition;
     private readonly Queue<decimal> _midHistory = new();
@@ -67,7 +55,6 @@ public sealed class OrderBookTrendStrategy : ISimulationStrategy, IManagedOrderS
     private long _strategyRunGeneration;
     private int _cycleSequence;
     private string _currentCycleId = string.Empty;
-    private bool _restoredBeforeStart;
 
     public string StrategyType => OrderBookTrendFactory.TypeName;
     public string InstanceId => _definition.InstanceId;
@@ -76,7 +63,6 @@ public sealed class OrderBookTrendStrategy : ISimulationStrategy, IManagedOrderS
     public event Action? CancelAllRequested;
     public event Action<StrategySnapshot>? SnapshotChanged;
     public event Action<string>? CancelOrderRequested;
-    public string RecoverySchema => "order-book-trend/v1";
 
     public OrderBookTrendStrategy(StrategyDefinition definition)
     {
@@ -121,23 +107,12 @@ public sealed class OrderBookTrendStrategy : ISimulationStrategy, IManagedOrderS
 
     public void Start(StrategyRuntimeContext context)
     {
-        if (State != StrategyLifecycleState.Created && !_restoredBeforeStart) throw new InvalidOperationException("策略已啟動。");
+        if (State != StrategyLifecycleState.Created) throw new InvalidOperationException("策略已啟動。");
         _context = context;
-        if (_orderBook == null)
-        {
-            _strategyRunGeneration = context.StrategyRunGeneration;
-            _orderBook = new ManagedStrategyOrderBook(InstanceId, _strategyRunGeneration);
-        }
-        else if (_strategyRunGeneration != context.StrategyRunGeneration)
-            throw new InvalidOperationException("Order Book Trend recovery run generation does not match runtime.");
-        if (_restoredBeforeStart)
-        {
-            _restoredBeforeStart = false;
-            _paused = true;
-            State = StrategyLifecycleState.Suspended;
-            _reason = "RecoveryAwaitingResume";
-        }
-        else { State = StrategyLifecycleState.WarmingUp; _reason = WarmupReason(); }
+        _strategyRunGeneration = context.StrategyRunGeneration;
+        _orderBook = new ManagedStrategyOrderBook(InstanceId, _strategyRunGeneration);
+        State = StrategyLifecycleState.WarmingUp;
+        _reason = WarmupReason();
         Publish();
     }
 
@@ -557,50 +532,6 @@ public sealed class OrderBookTrendStrategy : ISimulationStrategy, IManagedOrderS
         { _exitWorking = false; State = StrategyLifecycleState.Suspended; _reason = "保護／平倉委託已撤銷／拒絕，需人工處理"; Publish(); }
     }
 
-    public StrategyRecoveryCheckpoint CaptureRecoveryCheckpoint()
-    {
-        if (_orderBook == null) throw new InvalidOperationException("Order Book Trend has not initialized its managed order book.");
-        var state = new RecoveryState(_midHistory.ToArray(), _midChanges.ToArray(), _ofiEvents.ToArray(),
-            _tradeDirections.ToArray(), _confirmations.ToArray(), _previousBook, _lastValidAt, _entryAt, _cooldownUntil,
-            _previousTradePrice, _entryPrice, _fixedStop, _activeStop, _bestMid, _entryNetPnl, _momentumTicks,
-            _obi, _ofiRaw, _ofiZ, _ti, _microprice, _micropriceEdgeTicks, _rvTicks, _weightedDepth, _buyEntry,
-            _sellEntry, _lastTradeDirection, _candidateDirection, _entryWorkingEvents, _holdingEvents,
-            _lastSequence, _completedTrades, _tradesToday, _consecutiveLosses, _tradingDate, _entryWorking,
-            _exitWorking, _paused, _reason, State, _cycleSequence, _currentCycleId, _orderBook.Capture());
-        return new StrategyRecoveryCheckpoint(StrategyType, InstanceId, _strategyRunGeneration, RecoverySchema,
-            DateTimeOffset.UtcNow, JsonSerializer.Serialize(state));
-    }
-
-    public void RestoreRecoveryCheckpoint(StrategyRecoveryCheckpoint checkpoint)
-    {
-        StrategyRecoveryCheckpointValidator.EnsureCompatible(checkpoint, StrategyType, InstanceId,
-            checkpoint.StrategyRunGeneration, RecoverySchema);
-        RecoveryState state = JsonSerializer.Deserialize<RecoveryState>(checkpoint.PayloadJson)
-            ?? throw new InvalidOperationException("Order Book Trend recovery payload is empty.");
-        if (_strategyRunGeneration != 0 && _strategyRunGeneration != checkpoint.StrategyRunGeneration)
-            throw new InvalidOperationException("Order Book Trend checkpoint generation conflicts with runtime.");
-        _strategyRunGeneration = checkpoint.StrategyRunGeneration;
-        _orderBook ??= new ManagedStrategyOrderBook(InstanceId, _strategyRunGeneration);
-        _orderBook.Restore(state.OrderBook);
-        _midHistory.Clear(); foreach (decimal x in state.MidHistory) _midHistory.Enqueue(x);
-        _midChanges.Clear(); foreach (decimal x in state.MidChanges) _midChanges.Enqueue(x);
-        _ofiEvents.Clear(); foreach (decimal x in state.OfiEvents) _ofiEvents.Enqueue(x);
-        _tradeDirections.Clear(); foreach (int x in state.TradeDirections) _tradeDirections.Enqueue(x);
-        _confirmations.Clear(); foreach (bool x in state.Confirmations) _confirmations.Enqueue(x);
-        _previousBook = state.PreviousBook; _lastValidAt = state.LastValidAt; _entryAt = state.EntryAt; _cooldownUntil = state.CooldownUntil;
-        _previousTradePrice = state.PreviousTradePrice; _entryPrice = state.EntryPrice; _fixedStop = state.FixedStop;
-        _activeStop = state.ActiveStop; _bestMid = state.BestMid; _entryNetPnl = state.EntryNetPnl;
-        _momentumTicks = state.MomentumTicks; _obi = state.Obi; _ofiRaw = state.OfiRaw; _ofiZ = state.OfiZ;
-        _ti = state.Ti; _microprice = state.Microprice; _micropriceEdgeTicks = state.MicropriceEdgeTicks;
-        _rvTicks = state.RvTicks; _weightedDepth = state.WeightedDepth; _buyEntry = state.BuyEntry; _sellEntry = state.SellEntry;
-        _lastTradeDirection = state.LastTradeDirection; _candidateDirection = state.CandidateDirection;
-        _entryWorkingEvents = state.EntryWorkingEvents; _holdingEvents = state.HoldingEvents; _lastSequence = state.LastSequence;
-        _completedTrades = state.CompletedTrades; _tradesToday = state.TradesToday; _consecutiveLosses = state.ConsecutiveLosses;
-        _tradingDate = state.TradingDate; _entryWorking = state.EntryWorking; _exitWorking = state.ExitWorking;
-        _paused = state.Paused; _reason = state.Reason; State = state.State;
-        _cycleSequence = state.CycleSequence; _currentCycleId = state.CurrentCycleId;
-        _restoredBeforeStart = _context == null;
-    }
 
     private void CancelActiveOrders()
     {

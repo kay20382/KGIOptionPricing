@@ -17,3 +17,20 @@ obj/
 *_hex.txt
 *_part_*.txt
 temp_package.zip
+
+# Local vendor DLL backups created by compatibility patching tools
+*.dll.bak*
+
+# Local credentials and generated research/build output
+/KGIOptionPricing/config.json
+**/.testout/
+**/__pycache__/
+/.artifacts/
+/.rl-nuget/
+/.rl-ort-packages/
+/.venv-rl/
+/releases/
+/NetworkHealthLogs/
+/KGIOptionPricing/Research/Analysis/
+**/bin_*/
+**/obj_*/

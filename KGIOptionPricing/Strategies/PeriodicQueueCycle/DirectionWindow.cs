@@ -19,7 +19,10 @@ public sealed record DirectionAssessment(
     decimal VolatilityTicks,
     string PrimaryReasonCode,
     IReadOnlyList<string> OtherFailedReasonCodes,
-    IReadOnlyList<ThresholdResult> Thresholds);
+    IReadOnlyList<ThresholdResult> Thresholds)
+{
+    public MicrostructureAssessment? Microstructure {get;init;}
+}
 
 internal sealed record DirectionWindowSample(long UtcSecond, long Sequence, DateTimeOffset Timestamp,
     decimal MidPrice, decimal DepthObi, decimal BidDepth, decimal AskDepth, decimal BidNearDepth,
@@ -28,8 +31,6 @@ internal sealed record DirectionWindowObservation(long UtcSecond, DateTimeOffset
 internal sealed record DirectionWindowRejection(DateTimeOffset Timestamp, long Sequence, string PrimaryReasonCode,
     IReadOnlyList<string> OtherFailedReasonCodes, IReadOnlyList<ThresholdResult> Thresholds,
     decimal SpreadTicks, decimal VolatilityTicks);
-internal sealed record DirectionWindowCheckpoint(IReadOnlyList<DirectionWindowSample> Samples,
-    IReadOnlyList<DirectionWindowObservation> Observations, DirectionWindowRejection? LastRejection);
 
 public sealed class DirectionWindow
 {
@@ -38,45 +39,25 @@ public sealed class DirectionWindow
     private readonly SortedDictionary<long, Sample> _samples = new();
     private readonly SortedDictionary<long, ObservedIdentity> _observedIdentities = new();
     private Rejection? _lastRejection;
+    private readonly MicrostructureWindow? _microstructure;
 
     public DirectionWindow(decimal tickSize, PeriodicQueueCycleParameters parameters)
     {
         if (tickSize <= 0m) throw new ArgumentOutOfRangeException(nameof(tickSize));
         _tickSize = tickSize;
         _parameters = parameters ?? throw new ArgumentNullException(nameof(parameters));
+        if(parameters.MicrostructureEnabled)
+            _microstructure=new MicrostructureWindow(tickSize,parameters.MicrostructureWindowSeconds,parameters.QuoteFreshnessSeconds);
     }
 
     public int SampleCount => _samples.Count;
     public long LatestSequence => _samples.Count == 0 ? 0L : _samples.Values.Last().Sequence;
 
-    internal DirectionWindowCheckpoint Capture() => new(
-        _samples.Select(x => new DirectionWindowSample(x.Key, x.Value.Sequence, x.Value.Timestamp,
-            x.Value.MidPrice, x.Value.DepthObi, x.Value.BidDepth, x.Value.AskDepth,
-            x.Value.BidNearDepth, x.Value.AskNearDepth, x.Value.SpreadPrice)).ToArray(),
-        _observedIdentities.Select(x => new DirectionWindowObservation(x.Key, x.Value.Timestamp, x.Value.Sequence)).ToArray(),
-        _lastRejection is null ? null : new DirectionWindowRejection(_lastRejection.Timestamp,
-            _lastRejection.Sequence, _lastRejection.PrimaryReasonCode, _lastRejection.OtherFailedReasonCodes,
-            _lastRejection.Thresholds, _lastRejection.SpreadTicks, _lastRejection.VolatilityTicks));
-
-    internal void Restore(DirectionWindowCheckpoint checkpoint)
-    {
-        ArgumentNullException.ThrowIfNull(checkpoint);
-        _samples.Clear(); _observedIdentities.Clear();
-        foreach (DirectionWindowSample x in checkpoint.Samples)
-            _samples[x.UtcSecond] = new Sample(x.UtcSecond, x.Sequence, x.Timestamp, x.MidPrice,
-                x.DepthObi, x.BidDepth, x.AskDepth, x.BidNearDepth, x.AskNearDepth, x.SpreadPrice);
-        foreach (DirectionWindowObservation x in checkpoint.Observations)
-            _observedIdentities[x.UtcSecond] = new ObservedIdentity(x.Timestamp, x.Sequence);
-        _lastRejection = checkpoint.LastRejection is null ? null : new Rejection(
-            checkpoint.LastRejection.Timestamp, checkpoint.LastRejection.Sequence,
-            checkpoint.LastRejection.PrimaryReasonCode, checkpoint.LastRejection.OtherFailedReasonCodes,
-            checkpoint.LastRejection.Thresholds, checkpoint.LastRejection.SpreadTicks,
-            checkpoint.LastRejection.VolatilityTicks);
-    }
 
     public bool TryAdd(MarketEvent item, DateTimeOffset now)
     {
         ArgumentNullException.ThrowIfNull(item);
+        if (item.Kind == MarketEventKind.Book && HasMissingTopThreeDepth(item)) return false;
         if (!TryObserveIdentity(item)) return false;
 
         if (!TryCreateSample(item, out Sample? candidate))
@@ -109,6 +90,7 @@ public sealed class DirectionWindow
             return false;
         }
 
+        _microstructure?.TryAdd(item,now);
         _samples[next.UtcSecond] = next;
         long oldestSecond = next.UtcSecond - _parameters.DirectionWindowSeconds + 1L;
         foreach (long key in _samples.Keys.Where(key => key < oldestSecond).ToArray())
@@ -242,16 +224,16 @@ public sealed class DirectionWindow
 
         if (upMovePassed && efficiencyPassed && upObiPassed)
         {
-            return new DirectionAssessment(
+            return ApplyMicrostructure(new DirectionAssessment(
                 CycleDirection.Up, netMoveTicks, pathTicks, efficiency, averageObi,
-                latest.SpreadPrice / tickSize, volatilityTicks, "SignalAccepted", Array.Empty<string>(), thresholds);
+                latest.SpreadPrice / tickSize, volatilityTicks, "SignalAccepted", Array.Empty<string>(), thresholds),now,parameters);
         }
 
         if (downMovePassed && efficiencyPassed && downObiPassed)
         {
-            return new DirectionAssessment(
+            return ApplyMicrostructure(new DirectionAssessment(
                 CycleDirection.Down, netMoveTicks, pathTicks, efficiency, averageObi,
-                latest.SpreadPrice / tickSize, volatilityTicks, "SignalAccepted", Array.Empty<string>(), thresholds);
+                latest.SpreadPrice / tickSize, volatilityTicks, "SignalAccepted", Array.Empty<string>(), thresholds),now,parameters);
         }
 
         var directionFailures = new List<string>();
@@ -259,9 +241,34 @@ public sealed class DirectionWindow
         if (!efficiencyPassed) directionFailures.Add("TrendEfficiencyBelowThreshold");
         bool obiForObservedMovePassed = netMoveTicks < 0m ? downObiPassed : upObiPassed;
         if (!obiForObservedMovePassed) directionFailures.Add("DepthObiBelowThreshold");
-        return new DirectionAssessment(
+        return ApplyMicrostructure(new DirectionAssessment(
             CycleDirection.Neutral, netMoveTicks, pathTicks, efficiency, averageObi,
-            latest.SpreadPrice / tickSize, volatilityTicks, "NeutralDirection", directionFailures, thresholds);
+            latest.SpreadPrice / tickSize, volatilityTicks, "NeutralDirection", directionFailures, thresholds),now,parameters);
+    }
+
+    private DirectionAssessment ApplyMicrostructure(DirectionAssessment original,DateTimeOffset now,PeriodicQueueCycleParameters p)
+    {
+        if(_microstructure is null)return original;
+        var micro=_microstructure.Evaluate(now);
+        var thresholds=original.Thresholds.ToList();
+        if(p.MicrostructureLeadDirection)
+            thresholds.RemoveAll(x=>x.Name is "UpNetMoveTicks" or "DownNetMoveTicks" or "MinTrendEfficiency" or "UpMinDepthObi" or "DownMinDepthObi");
+        CycleDirection direction=p.MicrostructureLeadDirection
+            ? micro.NormalizedOfi>0?CycleDirection.Up:micro.NormalizedOfi<0?CycleDirection.Down:CycleDirection.Neutral
+            : original.Direction;
+        decimal sign=direction==CycleDirection.Down?-1:1;
+        thresholds.Add(new("MicrostructureWindowSeconds",micro.Seconds,p.MicrostructureWindowSeconds,micro.Ready));
+        if(p.MinNormalizedOfi>0)thresholds.Add(new("NormalizedOfi",micro.NormalizedOfi*sign,p.MinNormalizedOfi,
+            direction!=CycleDirection.Neutral && micro.NormalizedOfi*sign>=p.MinNormalizedOfi));
+        if(p.MinQueueImbalance>0)thresholds.Add(new("QueueImbalance",micro.QueueImbalance*sign,p.MinQueueImbalance,
+            direction!=CycleDirection.Neutral && micro.QueueImbalance*sign>=p.MinQueueImbalance));
+        if(p.MinDepthResilience>0)thresholds.Add(new("DepthResilience",micro.DepthResilience,p.MinDepthResilience,micro.DepthResilience>=p.MinDepthResilience));
+        if(p.MaxAbsNormalizedOfi>0)thresholds.Add(new("MaxAbsNormalizedOfi",Math.Abs(micro.NormalizedOfi),p.MaxAbsNormalizedOfi,Math.Abs(micro.NormalizedOfi)<=p.MaxAbsNormalizedOfi));
+        var failures=thresholds.Where(x=>!x.Passed && x.Name is "MicrostructureWindowSeconds" or "NormalizedOfi" or "QueueImbalance" or "DepthResilience" or "MaxAbsNormalizedOfi").Select(x=>x.Name).ToArray();
+        string reason=!micro.Ready?"MicrostructureWarmup":failures.Length>0?"MicrostructureFiltered":direction==CycleDirection.Neutral?"NeutralDirection":"SignalAccepted";
+        return original with {Direction=failures.Length>0?CycleDirection.Neutral:direction,PrimaryReasonCode=reason,
+            OtherFailedReasonCodes=failures.Length>0?failures:p.MicrostructureLeadDirection?Array.Empty<string>():original.OtherFailedReasonCodes,
+            Thresholds=thresholds,Microstructure=micro};
     }
 
     private List<ThresholdResult> HealthThresholds(
@@ -342,8 +349,7 @@ public sealed class DirectionWindow
     {
         sample = null;
         if (item.Kind != MarketEventKind.Book ||
-            item.BidPrices.Length < 10 || item.AskPrices.Length < 10 ||
-            item.BidQuantities.Length < 10 || item.AskQuantities.Length < 10)
+            HasMissingTopThreeDepth(item))
         {
             return false;
         }
@@ -354,7 +360,7 @@ public sealed class DirectionWindow
         decimal askNear = 0m;
         decimal weightedBid = 0m;
         decimal weightedAsk = 0m;
-        for (int level = 0; level < 10; level++)
+        for (int level = 0; level < 3; level++)
         {
             decimal bidPrice = item.BidPrices[level];
             decimal askPrice = item.AskPrices[level];
@@ -366,7 +372,7 @@ public sealed class DirectionWindow
 
             bidDepth += bidQuantity;
             askDepth += askQuantity;
-            if (level < 3)
+            if (level == 0)
             {
                 bidNear += bidQuantity;
                 askNear += askQuantity;
@@ -376,6 +382,11 @@ public sealed class DirectionWindow
             weightedBid += bidQuantity * weight;
             weightedAsk += askQuantity * weight;
         }
+
+        // The side-depth/imbalance health gate uses up to ten visible levels.
+        // Keep OBI and near-depth on their existing three-level/first-level inputs.
+        bidDepth += AdditionalSideDepth(item.BidPrices, item.BidQuantities, isBid: true);
+        askDepth += AdditionalSideDepth(item.AskPrices, item.AskQuantities, isBid: false);
 
         decimal bestBid = item.BidPrices[0];
         decimal bestAsk = item.AskPrices[0];
@@ -396,6 +407,33 @@ public sealed class DirectionWindow
             askNear,
             bestAsk - bestBid);
         return true;
+    }
+
+    private static decimal AdditionalSideDepth(decimal[] prices, int[] quantities, bool isBid)
+    {
+        decimal total = 0m;
+        int limit = Math.Min(10, Math.Min(prices.Length, quantities.Length));
+        for (int level = 3; level < limit; level++)
+        {
+            if (prices[level] <= 0m || quantities[level] <= 0 ||
+                (isBid ? prices[level] >= prices[level - 1] : prices[level] <= prices[level - 1])) break;
+            total += quantities[level];
+        }
+        return total;
+    }
+
+    internal static bool HasMissingTopThreeDepth(MarketEvent item)
+    {
+        if (item.BidPrices.Length < 3 || item.AskPrices.Length < 3 ||
+            item.BidQuantities.Length < 3 || item.AskQuantities.Length < 3)
+            return true;
+
+        for (int level = 0; level < 3; level++)
+            if (item.BidPrices[level] == 0m || item.AskPrices[level] == 0m ||
+                item.BidQuantities[level] == 0 || item.AskQuantities[level] == 0)
+                return true;
+
+        return false;
     }
 
     private DirectionAssessment Rejected(Rejection rejection) => Assessment(

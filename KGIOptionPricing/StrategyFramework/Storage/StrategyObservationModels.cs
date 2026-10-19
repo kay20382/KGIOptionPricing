@@ -1,10 +1,11 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 
 namespace KGIOptionPricing.StrategyFramework;
 
-public enum StrategyRunMode { LiveShadow, Simulation, HistoricalReplay }
+public enum StrategyRunMode { LiveShadow, Simulation, HistoricalReplay, LiveTrading }
 public enum StrategyDecision { Warmup, Reject, Accept, Hold, Exit, Halt }
+public enum StrategyObservationKind { Decision, FeatureSample, RiClosed }
 public enum ParameterExperimentStatus { Valid, Rejected, Incomplete }
 
 public sealed record ThresholdObservation(
@@ -16,6 +17,8 @@ public sealed record ThresholdObservation(
 
 public sealed record StrategyDecisionObservation
 {
+    public StrategyObservationKind Kind { get; init; }
+    public string SampleKey { get; init; } = string.Empty;
     public long Sequence { get; init; }
     public DateTimeOffset Timestamp { get; init; }
     public string StrategyType { get; init; } = string.Empty;
@@ -121,10 +124,12 @@ public sealed record RunManifest
 
 public sealed record OrderLifecycleObservation
 {
+    public KGIOptionPricing.OrderManagement.Core.TimeInForce TimeInForce { get; init; }
     public DateTimeOffset Timestamp { get; init; }
     public string StrategyInstanceId { get; init; } = string.Empty;
     public string CycleId { get; init; } = string.Empty;
     public string ClientOrderId { get; init; } = string.Empty;
+    public string PairId { get; init; } = string.Empty;
     public string OcoGroupId { get; init; } = string.Empty;
     public string OrderId { get; init; } = string.Empty;
     public string BrokerOrderId { get; init; } = string.Empty;
@@ -183,6 +188,7 @@ public static class ManagedOrderCorrelation
 
 public sealed record RunSummary
 {
+    public long? DataQualityEvaluations { get; init; }
     public DateTimeOffset FinalizedAt { get; init; }
     public long? MarketEvents { get; init; }
     public long WarmupObservations { get; init; }
@@ -209,6 +215,8 @@ public sealed record RunSummary
     public decimal? AverageLosingPoints { get; init; }
     public decimal? UserDefinedProfitFactor { get; init; }
     public decimal? MaximumDrawdown { get; init; }
+    public decimal? MaximumIntradayLoss { get; init; }
+    public decimal? MaximumTradeLoss { get; init; }
     public decimal? MfePoints { get; init; }
     public decimal? MaePoints { get; init; }
     public decimal? HoldingSeconds { get; init; }
@@ -239,6 +247,9 @@ public sealed record ParameterSearchDefinition(
 
 public sealed record ParameterExperimentRecord
 {
+    public IReadOnlyList<ParameterDataSplit> DataSplits { get; init; } = Array.Empty<ParameterDataSplit>();
+    public IReadOnlyDictionary<string, ParameterSplitResult> SplitResults { get; init; } =
+        new Dictionary<string, ParameterSplitResult>();
     public string ExperimentId { get; init; } = string.Empty;
     public string BaselineRunId { get; init; } = string.Empty;
     public string CandidateRunId { get; init; } = string.Empty;
@@ -274,3 +285,6 @@ public sealed record ParameterExperimentRecord
     public IReadOnlyDictionary<string, string> UnavailableReasons { get; init; } =
         new Dictionary<string, string>();
 }
+
+public sealed record ParameterDataSplit(string Kind, DateTimeOffset Start, DateTimeOffset End);
+public sealed record ParameterSplitResult(int CompletedTrades, decimal? NetPnl, decimal? MaximumDrawdown);

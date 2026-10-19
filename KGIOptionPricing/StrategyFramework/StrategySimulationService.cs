@@ -10,11 +10,11 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Runtime.ExceptionServices;
 using KGIOptionPricing.Strategies.MeanReversionScalper;
-using KGIOptionPricing.Strategies.MiniLeadMicro;
 using KGIOptionPricing.Strategies.NikkeiMicrostructureAlpha;
 using KGIOptionPricing.Strategies.OrderBookTrend;
 using KGIOptionPricing.Strategies.PeriodicQueueCycle;
 using KGIOptionPricing.Strategies.WaveletScalper;
+using KGIOptionPricing.StrategyFramework.Execution;
 using KGIOptionPricing.StrategyFramework.MarketData;
 using KGIOptionPricing.StrategyFramework.Storage;
 
@@ -580,11 +580,12 @@ public sealed class StrategySimulationService : IDisposable
     internal static IReadOnlyList<IStrategyFactory> CreateDefaultFactories() => new IStrategyFactory[]
     {
         new MeanReversionScalperFactory(),
-        new WaveletScalperFactory(),
-        new NikkeiMicrostructureAlphaFactory(),
-        new MiniLeadMicroFactory(),
-        new OrderBookTrendFactory(),
-        new PeriodicQueueCycleFactory()
+        new PeriodicQueueCycleFactory(),
+        new Strategies.TradeFlowTrend.TradeFlowTrendFactory(),
+        new Strategies.BuySellPower.BuySellPowerFactory(),
+        new Strategies.PowerReversal.PowerReversalFactory(),
+        new Strategies.MultiFactorMeanR17.MultiFactorMeanR17Factory(),
+        new Strategies.NikkeiRlDirection.NikkeiRlFactory()
     };
 
     public StrategySimulationService(KGIQuoteService quote, string rootDirectory)
@@ -606,6 +607,8 @@ public sealed class StrategySimulationService : IDisposable
 
     public StrategyInstanceRunner AddLive(StrategyDefinition definition, decimal commissionPerContract)
     {
+        Strategies.PowerReversal.PowerReversalParameters.EnsureCommission(definition,commissionPerContract);
+        Strategies.MultiFactorMeanR17.R17Parameters.EnsureCommission(definition,commissionPerContract);
         using IDisposable operation = _operationGate.Enter(definition.InstanceId);
         if (!_liveRecorders.TryReserve(definition.InstanceId))
             throw new InvalidOperationException($"策略實例識別碼已存在：{definition.InstanceId}");
@@ -619,8 +622,10 @@ public sealed class StrategySimulationService : IDisposable
             InputArchiveBoundary inputBoundary = InputArchiveBoundaryCapture.Begin(
                 _liveArchive.CaptureBarrier(), startedAt);
             string runId = $"live-{DateTime.Now:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}";
-            output = Path.Combine(_root, "StrategyRuns", runId);
-            recorder = new SimulationRunRecorder(output);
+            bool rl = definition.StrategyType == Strategies.NikkeiRlDirection.NikkeiRlFactory.TypeName;
+            if (rl && commissionPerContract != 36) throw new ArgumentException("凍結日經RL費用須為每邊36JPY");
+            output = Path.Combine(rl ? Strategies.NikkeiRlDirection.NikkeiRlParameters.SummaryRoot : _root, "StrategyRuns", runId);
+            recorder = new SimulationRunRecorder(output, summaryOnly: true);
             ParameterResolution parameters = ResolveParameters(strategy.GetSnapshot(), definition);
             RunManifest prepared = CreateManifest(runId, StrategyRunMode.LiveShadow,
                 definition, parameters, universe, commissionPerContract, LiveArchivePath, startedAt, null,
@@ -672,7 +677,7 @@ public sealed class StrategySimulationService : IDisposable
         finally { _liveRecorders.ReleaseReservation(definition.InstanceId); }
     }
 
-    public bool Stop(string instanceId) => _liveHost.Stop(instanceId);
+    public bool Stop(string instanceId) => _liveHost.RequestClose(instanceId,"使用者關閉") || _liveHost.Stop(instanceId);
     public bool Pause(string instanceId) => _liveHost.Pause(instanceId);
     public bool Resume(string instanceId) => _liveHost.Resume(instanceId);
     public bool Remove(string instanceId)
@@ -702,28 +707,59 @@ public sealed class StrategySimulationService : IDisposable
         StrategyDefinition definition,
         decimal commissionPerContract,
         double speed = 0d,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        HistoricalReplayControl? replayControl = null)
     {
+        Strategies.PowerReversal.PowerReversalParameters.EnsureCommission(definition,commissionPerContract);
+        Strategies.MultiFactorMeanR17.R17Parameters.EnsureCommission(definition,commissionPerContract);
         DateTimeOffset startedAt = DateTimeOffset.UtcNow;
         InputArchiveBoundary inputBoundary = InputArchiveBoundaryCapture.Begin(
             eventFilePath, appendOnly: false, startedAt);
         ResolvedStrategyUniverse universe = ResolveArchiveUniverse(eventFilePath, definition.Universe);
         string runId = $"backtest-{DateTime.Now:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}";
-        string output = Path.Combine(_root, "Backtests", runId);
-        using var recorder = new SimulationRunRecorder(output);
+        bool rl = definition.StrategyType == Strategies.NikkeiRlDirection.NikkeiRlFactory.TypeName;
+        if (rl && commissionPerContract != 36) throw new ArgumentException("凍結日經RL費用須為每邊36JPY");
+        string output = Path.Combine(rl ? Strategies.NikkeiRlDirection.NikkeiRlParameters.SummaryRoot : _root, "Backtests", runId);
+        using var recorder = new SimulationRunRecorder(output, summaryOnly: true);
         using var source = new ArchiveReplayMarketDataSource(eventFilePath);
-        using var host = new StrategyHost(source, new ReplayStrategyClock());
+        var replayClock = new ReplayStrategyClock();
+        using var host = new StrategyHost(source, replayClock);
         host.SnapshotChanged += snapshot => { recorder.Record(snapshot); SnapshotChanged?.Invoke(snapshot); };
         host.ExecutionOccurred += execution => { recorder.Record(execution); ExecutionOccurred?.Invoke(execution); };
         host.OrderLifecycleOccurred += recorder.Record;
         host.DecisionObserved += recorder.Record;
         ISimulationStrategy strategy = _registry.Get(definition.StrategyType).Create(definition);
+        if (strategy is MeanReversionScalperStrategy)
+        {
+            MeanReversionSessionSchedule schedule = MeanReversionSessionSchedule.Parse(definition.Parameters);
+            DateTimeOffset? previousEventTime = null;
+            source.BeforeMarketEvent += eventTime =>
+            {
+                if (previousEventTime.HasValue)
+                    foreach (DateTimeOffset stop in schedule.StopsBetween(previousEventTime.Value, eventTime))
+                        host.Pulse(stop);
+                previousEventTime = eventTime;
+            };
+        }
+        if (strategy is IStrategyScheduledPulseSource scheduled)
+        {
+            DateTimeOffset? previous = null;
+            source.BeforeMarketEvent += at =>
+            {
+                if (previous.HasValue && at >= previous.Value)
+                    foreach (var pulse in scheduled.GetPulseTimes(previous.Value, at)) host.Pulse(pulse);
+                previous = at;
+            };
+        }
         ParameterResolution parameters = ResolveParameters(strategy.GetSnapshot(), definition);
         recorder.PrepareManifest(CreateManifest(runId, StrategyRunMode.HistoricalReplay,
             definition, parameters, universe, commissionPerContract, eventFilePath, startedAt, null,
             inputIdentity: null));
-        StrategyInstanceRunner runner = host.Add(strategy, universe, commissionPerContract);
-        await source.ReplayAsync(speed, cancellationToken);
+        StrategyInstanceRunner runner = host.Add(strategy, universe, commissionPerContract,
+            strategy is MeanReversionScalperStrategy
+                ? new CrossPricePaperExecutionService(commissionPerContract, replayClock, fillMarketOnBook: true)
+                : null);
+        await source.ReplayAsync(speed, cancellationToken, replayControl);
         host.StopAll("歷史重播完成");
         DateTimeOffset endedAt = DateTimeOffset.UtcNow;
         InputArchiveIdentity finalInput = InputArchiveBoundaryCapture.Complete(inputBoundary, endedAt);
@@ -816,9 +852,14 @@ public sealed class StrategySimulationService : IDisposable
             CommissionPerContract = commissionPerContract,
             ExecutionAssumptions = new Dictionary<string, string>
             {
-                ["fillModel"] = mode == StrategyRunMode.HistoricalReplay ? "strict-cross" : "paper-strict-cross",
-                ["latencyModel"] = "not-configured",
-                ["slippageModel"] = "not-configured"
+                ["fillModel"] = definition.StrategyType == Strategies.TradeFlowTrend.TradeFlowTrendFactory.TypeName
+                    ? "ROD strict-cross; IOC strict contra-book, displayed size consumed once, limit fill price; retry waits fresh book"
+                    : mode == StrategyRunMode.HistoricalReplay &&
+                    definition.StrategyType == MeanReversionScalperFactory.TypeName
+                        ? "strict-cross limit/stop; market on next valid contra book or trade"
+                        : mode == StrategyRunMode.HistoricalReplay ? "strict-cross" : "paper-strict-cross",
+                ["latencyModel"] = definition.StrategyType == Strategies.NikkeiRlDirection.NikkeiRlFactory.TypeName ? "1ms minimum simulated action delay; release on subsequent eligible trade; whole-process latency not guaranteed" : "not-configured",
+                ["slippageModel"] = definition.StrategyType == Strategies.NikkeiRlDirection.NikkeiRlFactory.TypeName ? "0 extra ticks; strict-cross limit, no queue model" : "not-configured"
             },
             MissingProvenanceFields = missing.Concat(new[] { "GitCommit", "LatencyModel", "SlippageModel" }).ToArray()
         };
@@ -885,6 +926,23 @@ public sealed class StrategySimulationService : IDisposable
         var raw = new SortedDictionary<string, string>(StringComparer.Ordinal);
         foreach (KeyValuePair<string, string> parameter in definition.Parameters)
             raw[parameter.Key] = parameter.Value;
+        if (definition.StrategyType == Strategies.NikkeiRlDirection.NikkeiRlFactory.TypeName)
+            return new ParameterResolution(raw, Strategies.NikkeiRlDirection.NikkeiRlParameters.Parse(definition.Parameters).ToDictionary(), null);
+        if (definition.StrategyType == Strategies.TradeFlowTrend.TradeFlowTrendFactory.TypeName)
+            return new ParameterResolution(raw, Strategies.TradeFlowTrend.TradeFlowParameters.Parse(definition.Parameters).ToDictionary(), null);
+        if (definition.StrategyType == Strategies.BuySellPower.BuySellPowerFactory.TypeName)
+            // Indicator-only parameters are per product; trading strategy uses one shared configuration.
+        {
+            var power = new SortedDictionary<string, string>(StringComparer.Ordinal);
+            foreach (string product in Strategies.BuySellPower.BuySellPowerStrategy.Products)
+                foreach (var pair in Strategies.BuySellPower.PowerParameters.Parse(definition.Parameters, product).ToDictionary(product + "."))
+                    power[pair.Key] = pair.Value;
+            return new ParameterResolution(raw, power, null);
+        }
+        if (definition.StrategyType == Strategies.PowerReversal.PowerReversalFactory.TypeName)
+            return new ParameterResolution(raw, Strategies.PowerReversal.PowerReversalParameters.Parse(definition.Parameters).ToDictionary(), null);
+        if (definition.StrategyType == Strategies.MultiFactorMeanR17.MultiFactorMeanR17Factory.TypeName)
+            return new ParameterResolution(raw, Strategies.MultiFactorMeanR17.R17Parameters.Parse(definition.Parameters).ToDictionary(), null);
         if (!string.Equals(definition.StrategyType, PeriodicQueueCycleFactory.TypeName,
                 StringComparison.Ordinal))
             return new ParameterResolution(raw, new Dictionary<string, string>(),

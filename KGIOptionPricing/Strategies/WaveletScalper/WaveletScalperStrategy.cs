@@ -1,8 +1,6 @@
 using System.Globalization;
-using System.Text.Json;
 using KGIOptionPricing.OrderManagement.Core;
 using KGIOptionPricing.StrategyFramework;
-using KGIOptionPricing.StrategyFramework.Recovery;
 
 namespace KGIOptionPricing.Strategies.WaveletScalper;
 
@@ -20,13 +18,8 @@ public sealed class WaveletScalperFactory : IStrategyFactory
 /// This is a paper-only strategy and emits market-on-next-trade paper orders.
 /// </summary>
 public sealed class WaveletScalperStrategy : ISimulationStrategy, IManagedOrderStrategy,
-    IManagedOrderSubmissionObserver, IStrategyRecoveryParticipant
+    IManagedOrderSubmissionObserver
 {
-    private sealed record RecoveryState(decimal[] D1Details, KeyValuePair<string, MarketEvent>[] Latest,
-        decimal PreviousPrice, decimal Smooth, decimal Sigma, decimal EntryPrice, decimal StopPrice,
-        decimal EntryObi, DateTimeOffset CooldownUntil, DateTimeOffset EntryAt, BuySell EntrySide,
-        bool EntryWorking, bool ExitWorking, int CompletedTrades, string Reason, StrategyLifecycleState State,
-        int CycleSequence, string CurrentCycleId, ManagedOrderBookCheckpoint OrderBook);
     private readonly StrategyDefinition _definition;
     private readonly Queue<decimal> _d1Details = new();
     private readonly Dictionary<string, MarketEvent> _latest = new(StringComparer.OrdinalIgnoreCase);
@@ -43,7 +36,6 @@ public sealed class WaveletScalperStrategy : ISimulationStrategy, IManagedOrderS
     private long _strategyRunGeneration;
     private int _cycleSequence;
     private string _currentCycleId = string.Empty;
-    private bool _restoredBeforeStart;
 
     public string StrategyType => WaveletScalperFactory.TypeName;
     public string InstanceId => _definition.InstanceId;
@@ -52,7 +44,6 @@ public sealed class WaveletScalperStrategy : ISimulationStrategy, IManagedOrderS
     public event Action? CancelAllRequested;
     public event Action<StrategySnapshot>? SnapshotChanged;
     public event Action<string>? CancelOrderRequested;
-    public string RecoverySchema => "wavelet-scalper/v1";
 
     public WaveletScalperStrategy(StrategyDefinition definition)
     {
@@ -70,21 +61,12 @@ public sealed class WaveletScalperStrategy : ISimulationStrategy, IManagedOrderS
 
     public void Start(StrategyRuntimeContext context)
     {
-        if (State != StrategyLifecycleState.Created && !_restoredBeforeStart) throw new InvalidOperationException("策略已啟動。");
+        if (State != StrategyLifecycleState.Created) throw new InvalidOperationException("策略已啟動。");
         _context = context;
-        if (_orderBook == null)
-        {
-            _strategyRunGeneration = context.StrategyRunGeneration;
-            _orderBook = new ManagedStrategyOrderBook(InstanceId, _strategyRunGeneration);
-        }
-        else if (_strategyRunGeneration != context.StrategyRunGeneration)
-            throw new InvalidOperationException("MODWT recovery run generation does not match runtime.");
-        if (_restoredBeforeStart) _restoredBeforeStart = false;
-        else
-        {
-            State = StrategyLifecycleState.WarmingUp;
-            _reason = $"累積 {_windowTicks} 個 MODWT D1 樣本";
-        }
+        _strategyRunGeneration = context.StrategyRunGeneration;
+        _orderBook = new ManagedStrategyOrderBook(InstanceId, _strategyRunGeneration);
+        State = StrategyLifecycleState.WarmingUp;
+        _reason = $"累積 {_windowTicks} 個 MODWT D1 樣本";
         Publish();
     }
 
@@ -339,37 +321,6 @@ public sealed class WaveletScalperStrategy : ISimulationStrategy, IManagedOrderS
         }
     }
 
-    public StrategyRecoveryCheckpoint CaptureRecoveryCheckpoint()
-    {
-        if (_orderBook == null) throw new InvalidOperationException("MODWT strategy has not initialized its managed order book.");
-        var state = new RecoveryState(_d1Details.ToArray(), _latest.ToArray(), _previousPrice, _smooth, _sigma,
-            _entryPrice, _stopPrice, _entryObi, _cooldownUntil, _entryAt, _entrySide, _entryWorking, _exitWorking,
-            _completedTrades, _reason, State, _cycleSequence, _currentCycleId, _orderBook.Capture());
-        return new StrategyRecoveryCheckpoint(StrategyType, InstanceId, _strategyRunGeneration, RecoverySchema,
-            DateTimeOffset.UtcNow, JsonSerializer.Serialize(state));
-    }
-
-    public void RestoreRecoveryCheckpoint(StrategyRecoveryCheckpoint checkpoint)
-    {
-        StrategyRecoveryCheckpointValidator.EnsureCompatible(checkpoint, StrategyType, InstanceId,
-            checkpoint.StrategyRunGeneration, RecoverySchema);
-        RecoveryState state = JsonSerializer.Deserialize<RecoveryState>(checkpoint.PayloadJson)
-            ?? throw new InvalidOperationException("MODWT recovery payload is empty.");
-        if (_strategyRunGeneration != 0 && _strategyRunGeneration != checkpoint.StrategyRunGeneration)
-            throw new InvalidOperationException("MODWT checkpoint run generation conflicts with the runtime.");
-        _strategyRunGeneration = checkpoint.StrategyRunGeneration;
-        _orderBook ??= new ManagedStrategyOrderBook(InstanceId, _strategyRunGeneration);
-        _orderBook.Restore(state.OrderBook);
-        _d1Details.Clear(); foreach (decimal detail in state.D1Details) _d1Details.Enqueue(detail);
-        _latest.Clear(); foreach (var item in state.Latest) _latest[item.Key] = item.Value;
-        _previousPrice = state.PreviousPrice; _smooth = state.Smooth; _sigma = state.Sigma;
-        _entryPrice = state.EntryPrice; _stopPrice = state.StopPrice; _entryObi = state.EntryObi;
-        _cooldownUntil = state.CooldownUntil; _entryAt = state.EntryAt; _entrySide = state.EntrySide;
-        _entryWorking = state.EntryWorking; _exitWorking = state.ExitWorking;
-        _completedTrades = state.CompletedTrades; _reason = state.Reason; State = state.State;
-        _cycleSequence = state.CycleSequence; _currentCycleId = state.CurrentCycleId;
-        _restoredBeforeStart = _context == null;
-    }
 
     private void CancelActiveOrders()
     {

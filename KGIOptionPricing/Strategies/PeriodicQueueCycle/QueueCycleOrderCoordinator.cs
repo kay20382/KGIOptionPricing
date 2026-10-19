@@ -25,15 +25,6 @@ internal sealed class QueueCycleOrderCoordinator
     internal enum LegState { Working, CancelPending, Filled, Cancelled }
     internal enum CancelIntent { None, Reprice, Exit, LateFillSafety, Fault }
 
-    internal sealed record OrderLegCheckpoint(BuySell Side, string CycleId, int RepriceThresholdB,
-        int RepriceTargetC, int Generation, decimal CurrentPrice, string ClientOrderId,
-        string[] ClientOrderIds, string[] FilledClientOrderIds, LegState State, bool Submitted,
-        bool HasFill, decimal? PendingReplacementPrice, CancelIntent CancelIntent);
-    internal sealed record QueueCycleCoordinatorCheckpoint(QueueCyclePhase Phase, string ReasonCode,
-        long CycleNumber, CycleDirection FrozenDirection, DirectionAssessment? FrozenAssessment,
-        OrderLegCheckpoint? Buy, OrderLegCheckpoint? Sell, string[] RetiredClientOrderIds,
-        string[] RetiredFilledClientOrderIds, string? ExitClientOrderId, LegState ExitState,
-        PaperOrderRole? ExitRole, long ExitSequence, decimal TickSize);
 
     private sealed class OrderLeg
     {
@@ -67,6 +58,7 @@ internal sealed class QueueCycleOrderCoordinator
     private PaperOrderRole? _exitRole;
     private long _exitSequence;
     private decimal _tickSize;
+    private bool _exitCancelForSession;
 
     internal QueueCycleOrderCoordinator(
         string instanceId,
@@ -82,6 +74,7 @@ internal sealed class QueueCycleOrderCoordinator
 
     internal QueueCyclePhase Phase { get; private set; } = QueueCyclePhase.Ready;
     internal string ReasonCode { get; private set; } = "WarmupIncomplete";
+    internal string BlockingDetail { get; private set; } = string.Empty;
     internal long CycleNumber { get; private set; }
     internal string CurrentCycleId => _buy?.CycleId ?? string.Empty;
     internal CycleDirection FrozenDirection { get; private set; } = CycleDirection.Neutral;
@@ -107,42 +100,6 @@ internal sealed class QueueCycleOrderCoordinator
         $"Buy={LegSummary(_buy)};Sell={LegSummary(_sell)};" +
         $"Exit={_exitClientOrderId ?? "none"},{_exitRole?.ToString() ?? "none"},{_exitState}";
 
-    internal QueueCycleCoordinatorCheckpoint Capture() => new(Phase, ReasonCode, CycleNumber,
-        FrozenDirection, FrozenAssessment, SaveLeg(_buy), SaveLeg(_sell), _retiredClientOrderIds.ToArray(),
-        _retiredFilledClientOrderIds.ToArray(), _exitClientOrderId, _exitState, _exitRole, _exitSequence, _tickSize);
-
-    internal void Restore(QueueCycleCoordinatorCheckpoint checkpoint)
-    {
-        ArgumentNullException.ThrowIfNull(checkpoint);
-        Phase = checkpoint.Phase; ReasonCode = checkpoint.ReasonCode; CycleNumber = checkpoint.CycleNumber;
-        FrozenDirection = checkpoint.FrozenDirection; FrozenAssessment = checkpoint.FrozenAssessment;
-        _buy = LoadLeg(checkpoint.Buy); _sell = LoadLeg(checkpoint.Sell);
-        _retiredClientOrderIds.Clear(); foreach (string id in checkpoint.RetiredClientOrderIds) _retiredClientOrderIds.Add(id);
-        _retiredFilledClientOrderIds.Clear(); foreach (string id in checkpoint.RetiredFilledClientOrderIds) _retiredFilledClientOrderIds.Add(id);
-        _exitClientOrderId = checkpoint.ExitClientOrderId; _exitState = checkpoint.ExitState;
-        _exitRole = checkpoint.ExitRole; _exitSequence = checkpoint.ExitSequence; _tickSize = checkpoint.TickSize;
-    }
-
-    private static OrderLegCheckpoint? SaveLeg(OrderLeg? leg) => leg is null ? null : new OrderLegCheckpoint(
-        leg.Side, leg.CycleId, leg.RepriceThresholdB, leg.RepriceTargetC, leg.Generation,
-        leg.CurrentPrice, leg.ClientOrderId, leg.ClientOrderIds.ToArray(), leg.FilledClientOrderIds.ToArray(),
-        leg.State, leg.Submitted, leg.HasFill, leg.PendingReplacementPrice, leg.CancelIntent);
-
-    private static OrderLeg? LoadLeg(OrderLegCheckpoint? saved)
-    {
-        if (saved is null) return null;
-        var leg = new OrderLeg
-        {
-            Side = saved.Side, CycleId = saved.CycleId, RepriceThresholdB = saved.RepriceThresholdB,
-            RepriceTargetC = saved.RepriceTargetC, Generation = saved.Generation, CurrentPrice = saved.CurrentPrice,
-            ClientOrderId = saved.ClientOrderId, State = saved.State, Submitted = saved.Submitted,
-            HasFill = saved.HasFill, PendingReplacementPrice = saved.PendingReplacementPrice,
-            CancelIntent = saved.CancelIntent
-        };
-        foreach (string id in saved.ClientOrderIds) leg.ClientOrderIds.Add(id);
-        foreach (string id in saved.FilledClientOrderIds) leg.FilledClientOrderIds.Add(id);
-        return leg;
-    }
 
     internal event Action<PaperOrderRequest>? OrderRequested;
     internal event Action<string>? CancelOrderRequested;
@@ -224,6 +181,7 @@ internal sealed class QueueCycleOrderCoordinator
         _tickSize = 0m;
         Phase = QueueCyclePhase.Ready;
         ReasonCode = "WarmupIncomplete";
+        BlockingDetail = string.Empty;
         return true;
     }
 
@@ -234,6 +192,28 @@ internal sealed class QueueCycleOrderCoordinator
         ReasonCode = reasonCode;
         CancelWithoutReplacement(_buy, CancelIntent.Exit);
         CancelWithoutReplacement(_sell, CancelIntent.Exit);
+    }
+
+    internal void BeginSessionClose(string reasonCode)
+    {
+        if (IsFaulted) return;
+        Phase = QueueCyclePhase.CancellingForExit;
+        ReasonCode = reasonCode;
+        // Cancelling a peer can synchronously confirm and submit a new Flatten.
+        // Only cancel the exit that existed on entry, never that replacement.
+        string? previousExitId = _exitClientOrderId;
+        bool cancelPreviousExit = previousExitId is not null &&
+            _exitState is LegState.Working or LegState.CancelPending;
+        bool requestExitCancel = cancelPreviousExit && _exitState == LegState.Working;
+        if (cancelPreviousExit)
+        {
+            _exitCancelForSession = true;
+            _exitState = LegState.CancelPending;
+        }
+        CancelWithoutReplacement(_buy, CancelIntent.Exit);
+        CancelWithoutReplacement(_sell, CancelIntent.Exit);
+        if (requestExitCancel && _exitClientOrderId == previousExitId && _exitState == LegState.CancelPending)
+            CancelOrderRequested?.Invoke(previousExitId!);
     }
 
     internal bool TrySubmitExit(
@@ -303,6 +283,7 @@ internal sealed class QueueCycleOrderCoordinator
         if (string.Equals(_exitClientOrderId, execution.ClientOrderId, StringComparison.Ordinal))
         {
             if (_exitState == LegState.Filled) return;
+            _exitCancelForSession = false;
             _exitState = LegState.Filled;
             Phase = QueueCyclePhase.Flattening;
             return;
@@ -356,13 +337,32 @@ internal sealed class QueueCycleOrderCoordinator
                     _exitState = LegState.CancelPending;
                     return;
                 case OrderLifecycleState.Cancelled:
+                    if (_exitCancelForSession)
+                    {
+                        _retiredClientOrderIds.Add(_exitClientOrderId);
+                        _exitClientOrderId = null;
+                        _exitState = LegState.Cancelled;
+                        _exitRole = null;
+                        _exitCancelForSession = false;
+                        Phase = QueueCyclePhase.CancellingForExit;
+                        ReasonCode = "SessionClosing";
+                        return;
+                    }
+                    goto case OrderLifecycleState.Rejected;
                 case OrderLifecycleState.Rejected:
+                    _exitCancelForSession = false;
                     _exitState = LegState.Cancelled;
-                    EnterClosingBlocked();
+                    EnterClosingBlocked(cause: orderEvent);
                     return;
                 case OrderLifecycleState.Working:
                 case OrderLifecycleState.Submitted:
                 case OrderLifecycleState.PartiallyFilled:
+                    if (string.Equals(orderEvent.ReasonCode, "CancelFailed", StringComparison.OrdinalIgnoreCase))
+                    {
+                        _exitCancelForSession = false;
+                        EnterClosingBlocked(cause: orderEvent);
+                        return;
+                    }
                     _exitState = LegState.Working;
                     return;
             }
@@ -382,7 +382,7 @@ internal sealed class QueueCycleOrderCoordinator
                 leg.State == LegState.CancelPending &&
                 string.Equals(orderEvent.ReasonCode, "CancelRequestNotRouted", StringComparison.Ordinal):
                 leg.PendingReplacementPrice = null;
-                EnterClosingBlocked(leg);
+                EnterClosingBlocked(leg, orderEvent);
                 return;
             case OrderLifecycleState.CancelPending when leg.State == LegState.CancelPending:
                 return;
@@ -437,7 +437,7 @@ internal sealed class QueueCycleOrderCoordinator
                 string.Equals(orderEvent.ReasonCode, "CancelFailed", StringComparison.OrdinalIgnoreCase):
                 if (leg.CancelIntent != CancelIntent.Reprice)
                 {
-                    EnterClosingBlocked(leg);
+                    EnterClosingBlocked(leg, orderEvent);
                     return;
                 }
                 leg.PendingReplacementPrice = null;
@@ -450,8 +450,8 @@ internal sealed class QueueCycleOrderCoordinator
                 leg.PendingReplacementPrice = null;
                 leg.CancelIntent = CancelIntent.None;
                 leg.State = LegState.Cancelled;
+                EnterClosingBlocked(cause: orderEvent);
                 CancelWithoutReplacement(ReferenceEquals(leg, _buy) ? _sell : _buy, CancelIntent.Fault);
-                EnterClosingBlocked();
                 return;
         }
     }
@@ -511,8 +511,11 @@ internal sealed class QueueCycleOrderCoordinator
         CancelOrderRequested?.Invoke(leg.ClientOrderId);
     }
 
-    private void EnterClosingBlocked(OrderLeg? failedLeg = null)
+    private void EnterClosingBlocked(OrderLeg? failedLeg = null, OrderLifecycleEvent? cause = null)
     {
+        if (cause != null && (!IsClosingBlocked || BlockingDetail.Length == 0))
+            BlockingDetail = $"{cause.ReasonCode} [ClientOrderId={cause.ClientOrderId}]" +
+                (string.IsNullOrWhiteSpace(cause.ReasonDetail) ? string.Empty : $"：{cause.ReasonDetail}");
         if (failedLeg?.State == LegState.CancelPending)
             failedLeg.State = LegState.Working;
         if (failedLeg is not null)
@@ -577,11 +580,12 @@ internal sealed class QueueCycleOrderCoordinator
         return null;
     }
 
-    private static int QuantityAtPrice(BuySell side, MarketEvent book, decimal price)
+    private int QuantityAtPrice(BuySell side, MarketEvent book, decimal price)
     {
         decimal[] prices = side == BuySell.Buy ? book.BidPrices : book.AskPrices;
         int[] quantities = side == BuySell.Buy ? book.BidQuantities : book.AskQuantities;
-        for (int index = 0; index < prices.Length && index < quantities.Length; index++)
+        int count = QueueCyclePricingPolicy.VisibleDepthCount(side, book, _tickSize);
+        for (int index = 0; index < count; index++)
             if (prices[index] == price) return Math.Max(0, quantities[index]);
         return 0;
     }

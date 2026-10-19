@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using KGIOptionPricing.StrategyFramework.Recovery;
 
 namespace KGIOptionPricing.StrategyFramework.Execution;
 
@@ -49,19 +48,37 @@ public enum StrategySubmissionState { Prepared, Working, Unknown, Filled, Cancel
 
 public sealed record LiveOrderOwnership
 {
+    public KGIOptionPricing.OrderManagement.Core.TimeInForce TimeInForce { get; init; }
+    public decimal LimitPrice { get; init; }
     public LiveOrderOwnerKey Key { get; init; } = new(string.Empty, 0, string.Empty);
     public string Account { get; init; } = string.Empty;
     public string Symbol { get; init; } = string.Empty;
     public string CycleId { get; init; } = string.Empty;
     public string OcoGroupId { get; init; } = string.Empty;
+    public string PairId { get; init; } = string.Empty;
+    public bool IsRestingPair { get; init; }
     public PaperOrderRole Role { get; init; }
     public int Quantity { get; init; }
     public StrategySubmissionState SubmissionState { get; init; } = StrategySubmissionState.Prepared;
     public int CumulativeFilledQuantity { get; init; }
     public string Reason { get; init; } = string.Empty;
+    public bool PriorProcessReconciled { get; init; }
 }
 
 public sealed record FillAcceptance(bool Accepted, int AcceptedQuantity);
+
+public sealed record LiveStrategyRetirement(
+    string StrategyInstanceId,
+    long StrategyRunGeneration,
+    string Account,
+    string Symbol,
+    DateTimeOffset CapturedAt,
+    int Position,
+    decimal RealizedPnl,
+    decimal UnrealizedPnl,
+    decimal Costs,
+    int QuarantinedOrders,
+    bool PnlVerified);
 
 public sealed record QuarantinedBrokerEvent(
     string EventType,
@@ -77,18 +94,15 @@ public sealed record QuarantinedBrokerEvent(
 
 public sealed record LiveOwnershipSnapshot
 {
+    public IReadOnlyList<RestingPairSnapshot> RestingPairs { get; init; } = Array.Empty<RestingPairSnapshot>();
+    public IReadOnlyList<LiveStrategyCheckpoint> StrategyCheckpoints { get; init; } = Array.Empty<LiveStrategyCheckpoint>();
     public IReadOnlyList<LiveOrderOwnership> Routes { get; init; } = Array.Empty<LiveOrderOwnership>();
     public IReadOnlyList<LiveStrategyOcoGroupState> OcoGroups { get; init; } = Array.Empty<LiveStrategyOcoGroupState>();
     public IReadOnlyDictionary<BrokerOrderAlias, LiveOrderOwnerKey> Aliases { get; init; } =
         new Dictionary<BrokerOrderAlias, LiveOrderOwnerKey>();
-    public IReadOnlyList<StrategyRecoveryCheckpoint> Checkpoints { get; init; } = Array.Empty<StrategyRecoveryCheckpoint>();
     public IReadOnlyList<QuarantinedBrokerEvent> QuarantinedEvents { get; init; } = Array.Empty<QuarantinedBrokerEvent>();
-    public bool IsQuarantined { get; init; }
-    public string QuarantineReason { get; init; } = string.Empty;
+    public IReadOnlyList<LiveStrategyRetirement> Retirements { get; init; } = Array.Empty<LiveStrategyRetirement>();
 }
 
-public sealed class LiveOwnershipJournalException : InvalidOperationException
-{
-    public LiveOwnershipJournalException(string message) : base(message) { }
-    public LiveOwnershipJournalException(string message, Exception innerException) : base(message, innerException) { }
-}
+public sealed record LiveStrategyCheckpoint(string StrategyInstanceId,long StrategyRunGeneration,int SchemaVersion,
+    string StrategyType,string ParameterHash,System.Text.Json.JsonElement State,DateTimeOffset SavedAt);

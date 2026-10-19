@@ -1,0 +1,9 @@
+# Python 3.10, Windows x64. Workspace venv reuses installed torch/numpy/pandas/matplotlib.
+torch==2.9.1
+numpy==1.26.4
+gymnasium==1.2.2
+stable-baselines3==2.7.1
+sb3-contrib==2.7.1
+cloudpickle==3.1.2
+farama-notifications==0.0.4
+onnx==1.19.1

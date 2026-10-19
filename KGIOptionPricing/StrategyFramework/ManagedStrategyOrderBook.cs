@@ -1,12 +1,11 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using KGIOptionPricing.StrategyFramework.Recovery;
 
 namespace KGIOptionPricing.StrategyFramework;
 
 public sealed record ManagedOrderRecord(PaperOrderRequest Request, OrderLifecycleEvent? LastLifecycle);
-public sealed record ManagedOrderBookCheckpoint(string StrategyInstanceId, long StrategyRunGeneration,
+public sealed record ManagedOrderBookSnapshot(string StrategyInstanceId, long StrategyRunGeneration,
     long NextClientSequence, IReadOnlyList<ManagedOrderRecord> Orders);
 
 /// <summary>Common exact-client-id lifecycle index shared by managed live strategies.</summary>
@@ -94,31 +93,12 @@ public sealed class ManagedStrategyOrderBook
             x.LastLifecycle?.State is not (OrderLifecycleState.Filled or OrderLifecycleState.Cancelled or OrderLifecycleState.Rejected));
     }
 
-    public ManagedOrderBookCheckpoint Capture()
+    public ManagedOrderBookSnapshot Snapshot()
     {
-        lock (_sync) return new ManagedOrderBookCheckpoint(StrategyInstanceId, StrategyRunGeneration,
+        lock (_sync) return new ManagedOrderBookSnapshot(StrategyInstanceId, StrategyRunGeneration,
             _nextSequence, _orders.Values.ToArray());
     }
 
-    public void Restore(ManagedOrderBookCheckpoint checkpoint)
-    {
-        ArgumentNullException.ThrowIfNull(checkpoint);
-        if (!string.Equals(checkpoint.StrategyInstanceId, StrategyInstanceId, StringComparison.Ordinal) ||
-            checkpoint.StrategyRunGeneration != StrategyRunGeneration)
-            throw new InvalidOperationException("Managed order checkpoint identity or generation is incompatible.");
-        lock (_sync)
-        {
-            _orders.Clear();
-            foreach (ManagedOrderRecord record in checkpoint.Orders)
-            {
-                if (!string.Equals(record.Request.StrategyInstanceId, StrategyInstanceId, StringComparison.Ordinal) ||
-                    record.Request.StrategyRunGeneration != StrategyRunGeneration ||
-                    !_orders.TryAdd(record.Request.ClientOrderId, record))
-                    throw new InvalidOperationException("Managed order checkpoint contains mismatched or duplicate ownership.");
-            }
-            _nextSequence = Math.Max(checkpoint.NextClientSequence, checkpoint.Orders.Count);
-        }
-    }
 }
 
 public static class StrategyLiveCapabilityGate
@@ -129,7 +109,6 @@ public static class StrategyLiveCapabilityGate
         var missing = new List<string>();
         if (strategy is not IManagedOrderStrategy) missing.Add(nameof(IManagedOrderStrategy));
         if (strategy is not IManagedOrderSubmissionObserver) missing.Add(nameof(IManagedOrderSubmissionObserver));
-        if (strategy is not IStrategyRecoveryParticipant) missing.Add(nameof(IStrategyRecoveryParticipant));
         if (missing.Count > 0)
             throw new InvalidOperationException($"{strategy.StrategyType} is not live-capable; missing: {string.Join(", ", missing)}.");
     }

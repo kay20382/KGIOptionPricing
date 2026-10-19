@@ -23,27 +23,11 @@ namespace KGIOptionPricing
             // Register CodePages for Big5 Encoding support needed by KGI API
             log.Info("Register CodePages");
             System.Text.Encoding.RegisterProvider(System.Text.CodePagesEncodingProvider.Instance);
-            
-            //// Enable BinaryFormatter for KGI APIs on modern .NET
-            //AppContext.SetSwitch("System.Runtime.Serialization.EnableUnsafeBinaryFormatterSerialization", true);
-            //log.Info("BinaryFormatter");
-            //// Handle legacy Thread.Abort calls inside TradeCom.dll / PushClient.dll
-            //Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
-            //Application.ThreadException += (sender, e) =>
-            //{
-            //    if (e.Exception is PlatformNotSupportedException && e.Exception.Message.Contains("Thread abort"))
-            //    {
-            //        return; // Ignore legacy Thread.Abort() in .NET Core / .NET 10
-            //    }
-            //};
 
-            //AppDomain.CurrentDomain.UnhandledException += (sender, e) =>
-            //{
-            //    if (e.ExceptionObject is PlatformNotSupportedException ex && ex.Message.Contains("Thread abort"))
-            //    {
-            //        return; // Ignore legacy Thread.Abort()
-            //    }
-            //};
+            // TradeCom still depends on BinaryFormatter. The compatibility package
+            // supplies the implementation on .NET 10; this switch explicitly enables it.
+            AppContext.SetSwitch("System.Runtime.Serialization.EnableUnsafeBinaryFormatterSerialization", true);
+            using var displayFonts = Infrastructure.WindowsFontBootstrap.Load(message => log.Info(message));
             log.Info("Program Initialize");
             ApplicationConfiguration.Initialize();
             Application.Run(new Form1());

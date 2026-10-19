@@ -9,6 +9,7 @@ public enum MarketEventKind { Trade, Book, Connection, Session }
 public enum PaperOrderType { Limit, Stop, Market, BrokerLimit }
 public enum PaperOrderState { Working, Filled, Cancelled, Rejected }
 public enum PaperOrderRole { EntryLong, EntryShort, TakeProfit, StopLoss, Flatten }
+public enum RestingPairMode { None, OppositeLegIsExit }
 public enum OrderLifecycleState
 {
     Submitted, Working, CancelPending, PartiallyFilled, Filled, Cancelled, Rejected
@@ -16,6 +17,11 @@ public enum OrderLifecycleState
 
 public sealed record MarketEvent
 {
+    // Source time-of-day only; no inferred exchange date/timezone. Timestamp retains receive-time semantics.
+    public string? SourceTradeTime { get; init; }
+    public BookReference? PriorBook { get; init; }
+    public long ConnectionGeneration { get; init; }
+    public string? ProvenanceWarning { get; init; }
     public long Sequence { get; init; }
     public DateTimeOffset Timestamp { get; init; }
     public string Symbol { get; init; } = string.Empty;
@@ -31,6 +37,9 @@ public sealed record MarketEvent
     public decimal BestAsk => AskPrices.Length == 0 ? 0m : AskPrices[0];
     public decimal MidPrice => BestBid > 0m && BestAsk > 0m ? (BestBid + BestAsk) / 2m : LastPrice;
 }
+
+public sealed record BookReference(string Symbol, DateTimeOffset Timestamp, long Sequence, long Generation,
+    decimal Bid, decimal Ask, int BidQuantity, int AskQuantity);
 
 public sealed record ProductSelection(string ProductId, string? Symbol = null);
 
@@ -76,6 +85,9 @@ public sealed record ResolvedStrategyUniverse
 
 public sealed record PaperOrderRequest
 {
+    public RestingPairMode RestingPairMode { get; init; } = RestingPairMode.None;
+    public string PairId { get; init; } = string.Empty;
+    public TimeInForce TimeInForce { get; init; } = TimeInForce.ROD;
     public string ClientOrderId { get; init; } = string.Empty;
     public string CycleId { get; init; } = string.Empty;
     public string OcoGroupId { get; init; } = string.Empty;
@@ -92,6 +104,9 @@ public sealed record PaperOrderRequest
 
 public sealed record PaperOrder
 {
+    public RestingPairMode RestingPairMode { get; init; } = RestingPairMode.None;
+    public string PairId { get; init; } = string.Empty;
+    public TimeInForce TimeInForce { get; init; } = TimeInForce.ROD;
     public string OrderId { get; init; } = string.Empty;
     public string ClientOrderId { get; init; } = string.Empty;
     public string CycleId { get; init; } = string.Empty;
@@ -111,6 +126,8 @@ public sealed record PaperOrder
 
 public sealed record ExecutionEvent
 {
+    public string PairId { get; init; } = string.Empty;
+    public PaperOrderRole? OriginalOrderRole { get; init; }
     public long Sequence { get; init; }
     public string ExecutionId { get; init; } = string.Empty;
     public int CumulativeFilledQuantity { get; init; }
@@ -133,6 +150,8 @@ public sealed record ExecutionEvent
 
 public sealed record OrderLifecycleEvent
 {
+    public string PairId { get; init; } = string.Empty;
+    public TimeInForce TimeInForce { get; init; } = TimeInForce.ROD;
     public DateTimeOffset Timestamp { get; init; }
     public string StrategyInstanceId { get; init; } = string.Empty;
     public string ClientOrderId { get; init; } = string.Empty;
@@ -156,10 +175,20 @@ public sealed record OrderLifecycleEvent
     public int RemainingQuantity { get; init; }
     public bool HasFinalCumulativeFillWatermark { get; init; }
     public string ReasonCode { get; init; } = string.Empty;
+    public string ReasonDetail { get; init; } = string.Empty;
 }
 
 public sealed record PositionSnapshot
 {
+    /// <summary>Cumulative accepted fill quantity, both entry and exit sides.</summary>
+    public int TotalTradedQuantity { get; init; }
+    public decimal GrossPnl => RealizedPnl + UnrealizedPnl;
+    /// <summary>Mean net currency PnL of completed roundtrips only; null before first completion.</summary>
+    public decimal? ExpectedPnlPerTrade { get; init; }
+    public decimal? WinRate { get; init; }
+    public decimal? AverageWinningPoints { get; init; }
+    public decimal? AverageLosingPoints { get; init; }
+    public decimal? UserDefinedProfitFactor { get; init; }
     public string StrategyInstanceId { get; init; } = string.Empty;
     public long StrategyRunGeneration { get; init; }
     public string Symbol { get; init; } = string.Empty;
@@ -175,11 +204,18 @@ public sealed record PositionSnapshot
 
 public sealed record StrategySnapshot
 {
+    public int TotalTradedQuantity { get; init; }
+    public decimal GrossPnl { get; init; }
+    public decimal? ExpectedPnlPerTrade { get; init; }
+    public decimal? WinRate { get; init; }
+    public decimal? AverageWinningPoints { get; init; }
+    public decimal? AverageLosingPoints { get; init; }
+    public decimal? UserDefinedProfitFactor { get; init; }
+    public IReadOnlyDictionary<string,decimal?> Features { get; init; } = new Dictionary<string,decimal?>();
+    public IReadOnlyDictionary<string,string> Diagnostics { get; init; } = new Dictionary<string,string>();
     public string StrategyType { get; init; } = string.Empty;
     public string InstanceId { get; init; } = string.Empty;
     public long StrategyRunGeneration { get; init; }
-    public string RecoveryState { get; init; } = string.Empty;
-    public string RecoveryReason { get; init; } = string.Empty;
     public string OcoStatusSummary { get; init; } = string.Empty;
     public string ParameterSummary { get; init; } = string.Empty;
     public string TradableProductId { get; init; } = string.Empty;
@@ -190,6 +226,7 @@ public sealed record StrategySnapshot
     public decimal LastPrice { get; init; }
     public decimal CenterPrice { get; init; }
     public decimal Range { get; init; }
+    public decimal RollingRange { get; init; }
     public decimal BuyEntry { get; init; }
     public decimal SellEntry { get; init; }
     public decimal StopPrice { get; init; }

@@ -6,7 +6,6 @@ using System.Runtime.ExceptionServices;
 using System.Threading;
 using KGIOptionPricing.StrategyFramework.Execution;
 using KGIOptionPricing.StrategyFramework.Performance;
-using KGIOptionPricing.StrategyFramework.Recovery;
 
 namespace KGIOptionPricing.StrategyFramework;
 
@@ -66,7 +65,8 @@ public sealed class StrategyInstanceRunner : IDisposable
         _strategyRunGeneration = strategyRunGeneration ?? 1L;
         if (_strategyRunGeneration <= 0) throw new ArgumentOutOfRangeException(nameof(strategyRunGeneration));
         _commissionPerContract = Math.Max(0m, commissionPerContract);
-        _broker = executionService ?? new CrossPricePaperExecutionService(commissionPerContract, clock);
+        _broker = executionService ?? new CrossPricePaperExecutionService(commissionPerContract, clock,
+            allowLimitIoc: strategy is Strategies.TradeFlowTrend.TradeFlowTrendStrategy);
         foreach (ResolvedProduct product in universe.AllProducts) ledger.RegisterProduct(strategy.InstanceId, _strategyRunGeneration, product);
         _strategy.OrderRequested += OnOrderRequested;
         _strategy.CancelAllRequested += OnCancelAllRequested;
@@ -113,6 +113,7 @@ public sealed class StrategyInstanceRunner : IDisposable
         lock (_sync)
         {
             if (_disposed || _disposing || _observationFaulted || !UsesSymbol(marketEvent.Symbol)) return;
+            if (_strategy is IStrategyBeforeMarketExecution causal && !causal.BeforeMarketExecution(marketEvent)) return;
             // Mark open positions from an actual last-traded price, never a half-tick midpoint.
             if (marketEvent.LastPrice > 0m)
                 _ledger.ApplyMark(marketEvent.Symbol, marketEvent.LastPrice);
@@ -137,12 +138,6 @@ public sealed class StrategyInstanceRunner : IDisposable
 
     public StrategySnapshot GetSnapshot() { lock (_sync) return GetSnapshotCore(); }
 
-    internal StrategyRecoveryCheckpoint? CaptureRecoveryCheckpoint()
-    {
-        lock (_sync) return _strategy is IStrategyRecoveryParticipant recovery
-            ? recovery.CaptureRecoveryCheckpoint() : null;
-    }
-
     public void Pulse(DateTimeOffset now)
     {
         lock (_sync)
@@ -152,7 +147,8 @@ public sealed class StrategyInstanceRunner : IDisposable
             if (_paused)
             {
                 PositionSnapshot position = _ledger.GetPosition(_strategy.InstanceId, _universe.Tradable.Symbol);
-                if (position.NetQuantity == 0) return;
+                if (position.NetQuantity == 0 &&
+                    _strategy is not IStrategyHeartbeatWhilePaused { ShouldPulseWhilePaused: true }) return;
             }
             heartbeat.OnHeartbeat(now);
         }
@@ -170,12 +166,24 @@ public sealed class StrategyInstanceRunner : IDisposable
         }
     }
 
+    public bool RequestRiskExit(string reason)
+    {
+        lock (_sync)
+        {
+            if (_disposed || _strategy is not IStrategyRiskExit risk) return false;
+            _paused = true; risk.RequestRiskExit(reason); return true;
+        }
+    }
+    public bool RequestClose(string reason)
+    { lock(_sync) {if(_disposed || _strategy is not IStrategyCloseRequest close)return false;_paused=true;close.RequestClose(reason);return true;} }
+
     public bool Resume()
     {
         lock (_sync)
         {
             if (_disposed || !_paused || _strategy.State is StrategyLifecycleState.Stopped or StrategyLifecycleState.Faulted)
                 return false;
+            if (_strategy is IStrategyResumeGate { CanResume: false }) return false;
             _paused = false;
             _strategy.Resume();
             return true;
@@ -188,6 +196,19 @@ public sealed class StrategyInstanceRunner : IDisposable
         {
             if (_disposed) return;
             StopCore(reason);
+        }
+    }
+
+    public void OperatorStop(string reason)
+    {
+        lock (_sync)
+        {
+            if (_disposed) return;
+            _paused = false;
+            if (_strategy is IStrategyOperatorStop operatorStop)
+                operatorStop.OperatorStop(reason);
+            else
+                StopCore(reason);
         }
     }
 
@@ -316,8 +337,15 @@ public sealed class StrategyInstanceRunner : IDisposable
             RealizedPnl = position.RealizedPnl,
             UnrealizedPnl = position.UnrealizedPnl,
             NetPnl = position.NetPnl,
+            TotalTradedQuantity = position.TotalTradedQuantity,
+            GrossPnl = position.GrossPnl,
+            ExpectedPnlPerTrade = position.ExpectedPnlPerTrade,
             CommissionPerContract = _commissionPerContract,
             CompletedTrades = position.CompletedTrades
+            ,WinRate = position.WinRate
+            ,AverageWinningPoints = position.AverageWinningPoints
+            ,AverageLosingPoints = position.AverageLosingPoints
+            ,UserDefinedProfitFactor = position.UserDefinedProfitFactor
         };
     }
 
@@ -345,7 +373,11 @@ public sealed class StrategyInstanceRunner : IDisposable
         lock (_sync) _observationFaulted = true;
     }
 
-    public void Dispose()
+    public void Dispose() => DisposeCore(allowRetired: false);
+
+    internal void DisposeRetired() => DisposeCore(allowRetired: true);
+
+    private void DisposeCore(bool allowRetired)
     {
         int attempt;
         lock (_sync)
@@ -372,7 +404,8 @@ public sealed class StrategyInstanceRunner : IDisposable
         {
             if (_broker is KgiLiveStrategyExecutionService liveBroker)
                 liveBroker.DisposeIfSafe(() =>
-                    _ledger.GetPosition(_strategy.InstanceId, _universe.Tradable.Symbol).NetQuantity == 0);
+                    _ledger.GetPosition(_strategy.InstanceId, _universe.Tradable.Symbol).NetQuantity == 0,
+                    allowRetired);
             else if (_broker is IDisposable disposable) disposable.Dispose();
             Exception? cleanupError = null;
             lock (_sync)
@@ -514,12 +547,17 @@ public sealed class StrategyHost : IDisposable
         return runners.Select(x => x.GetSnapshot()).ToArray();
     }
 
-    public IReadOnlyList<StrategyRecoveryCheckpoint> CaptureRecoveryCheckpoints()
-    {
-        StrategyInstanceRunner[] runners = GetRunnersForOperation(throwIfDisposed: true);
-        return runners.Select(runner => runner.CaptureRecoveryCheckpoint())
-            .Where(checkpoint => checkpoint is not null).Cast<StrategyRecoveryCheckpoint>().ToArray();
-    }
+    /// <summary>
+    /// Read only the requested instance. Execution/heartbeat callbacks may own
+    /// that runner's lock and must not acquire unrelated runner locks via GetSnapshots.
+    /// Like GetSnapshots, reads expose only published/retained runners, never a
+    /// partial starting runner. Do not use the mutating-operation lookup here:
+    /// a synchronous broker callback during Start must return null, not wait on Add.
+    /// </summary>
+    public StrategySnapshot? GetSnapshot(string instanceId) =>
+        GetRunnersForOperation(throwIfDisposed: true)
+            .FirstOrDefault(runner => string.Equals(runner.InstanceId, instanceId, StringComparison.OrdinalIgnoreCase))
+            ?.GetSnapshot();
 
     public bool Stop(string instanceId, string reason = "使用者停止")
     {
@@ -527,6 +565,14 @@ public sealed class StrategyHost : IDisposable
         if (runner == null) return false;
         runner.Stop(reason);
         return true;
+    }
+
+    public bool OperatorStop(string instanceId, string reason)
+    {
+        StrategyInstanceRunner? runner = FindForOperation(instanceId);
+        if (runner == null) return false;
+        runner.OperatorStop(reason);
+        return runner.GetSnapshot().State == StrategyLifecycleState.Stopped;
     }
 
     public bool MarkObservationFault(string instanceId, Exception exception)
@@ -568,6 +614,25 @@ public sealed class StrategyHost : IDisposable
             {
                 lock (_sync) _runners.Remove(runner);
                 _ledger.RemoveFlatInstance(instanceId, runner.StrategyRunGeneration);
+            }
+        }
+        return true;
+    }
+
+    public bool RequestRiskExit(string instanceId, string reason) => FindForOperation(instanceId)?.RequestRiskExit(reason) == true;
+    public bool RequestClose(string instanceId,string reason) => FindForOperation(instanceId)?.RequestClose(reason)==true;
+
+    public bool RemoveRetired(string instanceId)
+    {
+        StrategyInstanceRunner? runner = FindForOperation(instanceId);
+        if (runner == null) return false;
+        try { runner.DisposeRetired(); }
+        finally
+        {
+            if (runner.IsDisposed)
+            {
+                lock (_sync) _runners.Remove(runner);
+                _ledger.RemoveRetiredInstance(instanceId, runner.StrategyRunGeneration);
             }
         }
         return true;

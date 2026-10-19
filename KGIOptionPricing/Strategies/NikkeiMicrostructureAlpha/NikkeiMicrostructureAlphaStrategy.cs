@@ -1,8 +1,6 @@
 using System.Globalization;
-using System.Text.Json;
 using KGIOptionPricing.OrderManagement.Core;
 using KGIOptionPricing.StrategyFramework;
-using KGIOptionPricing.StrategyFramework.Recovery;
 
 namespace KGIOptionPricing.Strategies.NikkeiMicrostructureAlpha;
 
@@ -21,17 +19,10 @@ public sealed class NikkeiMicrostructureAlphaFactory : IStrategyFactory
 /// simulation require richer data and remain separate, controlled research work.
 /// </summary>
 public sealed class NikkeiMicrostructureAlphaStrategy : ISimulationStrategy, IManagedOrderStrategy,
-    IManagedOrderSubmissionObserver, IStrategyRecoveryParticipant
+    IManagedOrderSubmissionObserver
 {
     private sealed record TradeFlow(DateTimeOffset Time, int SignedQuantity, int Quantity);
     private sealed record MidSample(DateTimeOffset Time, decimal Mid);
-    private sealed record RecoveryState(KeyValuePair<string, MarketEvent>[] Latest,
-        KeyValuePair<string, MidSample[]>[] Mids, TradeFlow[] TradeFlows, DateTimeOffset? FirstHealthyAt,
-        DateTimeOffset EntryRequestedAt, DateTimeOffset EntryAt, DateTimeOffset CooldownUntil, BuySell EntrySide,
-        bool EntryWorking, bool ExitWorking, decimal Alpha, decimal Obi, decimal Aofi, decimal ReferenceScore,
-        decimal ExpectedMoveTicks, decimal ExpectedNetEdge, decimal Atr, decimal EntryPrice, decimal EntryOrderPrice,
-        decimal TakeProfitPrice, decimal StopPrice, int CompletedTrades, long LastSequence, string Reason,
-        StrategyLifecycleState State, int CycleSequence, string CurrentCycleId, ManagedOrderBookCheckpoint OrderBook);
 
     private readonly StrategyDefinition _definition;
     private readonly Dictionary<string, MarketEvent> _latest = new(StringComparer.OrdinalIgnoreCase);
@@ -57,7 +48,6 @@ public sealed class NikkeiMicrostructureAlphaStrategy : ISimulationStrategy, IMa
     private long _strategyRunGeneration;
     private int _cycleSequence;
     private string _currentCycleId = string.Empty;
-    private bool _restoredBeforeStart;
 
     public string StrategyType => NikkeiMicrostructureAlphaFactory.TypeName;
     public string InstanceId => _definition.InstanceId;
@@ -66,7 +56,6 @@ public sealed class NikkeiMicrostructureAlphaStrategy : ISimulationStrategy, IMa
     public event Action? CancelAllRequested;
     public event Action<StrategySnapshot>? SnapshotChanged;
     public event Action<string>? CancelOrderRequested;
-    public string RecoverySchema => "nikkei-microstructure-alpha/v1";
 
     public NikkeiMicrostructureAlphaStrategy(StrategyDefinition definition)
     {
@@ -93,21 +82,12 @@ public sealed class NikkeiMicrostructureAlphaStrategy : ISimulationStrategy, IMa
 
     public void Start(StrategyRuntimeContext context)
     {
-        if (State != StrategyLifecycleState.Created && !_restoredBeforeStart) throw new InvalidOperationException("策略已啟動。");
+        if (State != StrategyLifecycleState.Created) throw new InvalidOperationException("策略已啟動。");
         _context = context;
-        if (_orderBook == null)
-        {
-            _strategyRunGeneration = context.StrategyRunGeneration;
-            _orderBook = new ManagedStrategyOrderBook(InstanceId, _strategyRunGeneration);
-        }
-        else if (_strategyRunGeneration != context.StrategyRunGeneration)
-            throw new InvalidOperationException("Nikkei Alpha recovery run generation does not match runtime.");
-        if (_restoredBeforeStart) _restoredBeforeStart = false;
-        else
-        {
-            State = StrategyLifecycleState.WarmingUp;
-            _reason = $"暖機中：等待 {_warmupSeconds} 秒的 225MC/參考商品行情";
-        }
+        _strategyRunGeneration = context.StrategyRunGeneration;
+        _orderBook = new ManagedStrategyOrderBook(InstanceId, _strategyRunGeneration);
+        State = StrategyLifecycleState.WarmingUp;
+        _reason = $"暖機中：等待 {_warmupSeconds} 秒的 225MC/參考商品行情";
         Publish();
     }
 
@@ -508,45 +488,6 @@ public sealed class NikkeiMicrostructureAlphaStrategy : ISimulationStrategy, IMa
         }
     }
 
-    public StrategyRecoveryCheckpoint CaptureRecoveryCheckpoint()
-    {
-        if (_orderBook == null) throw new InvalidOperationException("Nikkei Alpha has not initialized its managed order book.");
-        var state = new RecoveryState(_latest.ToArray(),
-            _mids.Select(x => new KeyValuePair<string, MidSample[]>(x.Key, x.Value.ToArray())).ToArray(),
-            _tradeFlows.ToArray(), _firstHealthyAt, _entryRequestedAt, _entryAt, _cooldownUntil, _entrySide,
-            _entryWorking, _exitWorking, _alpha, _obi, _aofi, _referenceScore, _expectedMoveTicks, _expectedNetEdge,
-            _atr, _entryPrice, _entryOrderPrice, _takeProfitPrice, _stopPrice, _completedTrades, _lastSequence,
-            _reason, State, _cycleSequence, _currentCycleId, _orderBook.Capture());
-        return new StrategyRecoveryCheckpoint(StrategyType, InstanceId, _strategyRunGeneration, RecoverySchema,
-            DateTimeOffset.UtcNow, JsonSerializer.Serialize(state));
-    }
-
-    public void RestoreRecoveryCheckpoint(StrategyRecoveryCheckpoint checkpoint)
-    {
-        StrategyRecoveryCheckpointValidator.EnsureCompatible(checkpoint, StrategyType, InstanceId,
-            checkpoint.StrategyRunGeneration, RecoverySchema);
-        RecoveryState state = JsonSerializer.Deserialize<RecoveryState>(checkpoint.PayloadJson)
-            ?? throw new InvalidOperationException("Nikkei Alpha recovery payload is empty.");
-        if (_strategyRunGeneration != 0 && _strategyRunGeneration != checkpoint.StrategyRunGeneration)
-            throw new InvalidOperationException("Nikkei Alpha checkpoint run generation conflicts with the runtime.");
-        _strategyRunGeneration = checkpoint.StrategyRunGeneration;
-        _orderBook ??= new ManagedStrategyOrderBook(InstanceId, _strategyRunGeneration);
-        _orderBook.Restore(state.OrderBook);
-        _latest.Clear(); foreach (var item in state.Latest) _latest[item.Key] = item.Value;
-        _mids.Clear(); foreach (var item in state.Mids) _mids[item.Key] = new Queue<MidSample>(item.Value);
-        _tradeFlows.Clear(); foreach (TradeFlow flow in state.TradeFlows) _tradeFlows.Enqueue(flow);
-        _firstHealthyAt = state.FirstHealthyAt; _entryRequestedAt = state.EntryRequestedAt;
-        _entryAt = state.EntryAt; _cooldownUntil = state.CooldownUntil; _entrySide = state.EntrySide;
-        _entryWorking = state.EntryWorking; _exitWorking = state.ExitWorking;
-        _alpha = state.Alpha; _obi = state.Obi; _aofi = state.Aofi; _referenceScore = state.ReferenceScore;
-        _expectedMoveTicks = state.ExpectedMoveTicks; _expectedNetEdge = state.ExpectedNetEdge; _atr = state.Atr;
-        _entryPrice = state.EntryPrice; _entryOrderPrice = state.EntryOrderPrice;
-        _takeProfitPrice = state.TakeProfitPrice; _stopPrice = state.StopPrice;
-        _completedTrades = state.CompletedTrades; _lastSequence = state.LastSequence;
-        _reason = state.Reason; State = state.State; _cycleSequence = state.CycleSequence;
-        _currentCycleId = state.CurrentCycleId;
-        _restoredBeforeStart = _context == null;
-    }
 
     private void CancelActiveOrders()
     {

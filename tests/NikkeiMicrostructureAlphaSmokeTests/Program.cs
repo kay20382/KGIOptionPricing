@@ -19,7 +19,7 @@ FeedLongSetup(strategy, t0);
 PaperOrderRequest entry = orders.Single();
 Assert(entry.Role == PaperOrderRole.EntryLong && entry.Type == PaperOrderType.Limit && entry.Price == 100m && entry.Quantity == 1 &&
        !string.IsNullOrWhiteSpace(entry.ClientOrderId) && !string.IsNullOrWhiteSpace(entry.CycleId) && entry.StrategyRunGeneration == 1 &&
-       strategy is IManagedOrderStrategy && strategy is IStrategyRecoveryParticipant,
+       strategy is IManagedOrderStrategy && strategy is IManagedOrderSubmissionObserver,
     "同向 OBI/AOFI/mini/large 訊號應在買一建立一口被動多單");
 Assert(strategy.GetSnapshot().ParameterSummary.Contains("Alpha=0.70/0.65", StringComparison.Ordinal) &&
        strategy.GetSnapshot().ParameterSummary.Contains("Cost=¥72", StringComparison.Ordinal),

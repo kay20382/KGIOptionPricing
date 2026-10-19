@@ -1,0 +1,102 @@
+{
+  "SaveTickData": true,
+  "KGI_USER_ID": "",
+  "KGI_PASSWORD": "",
+  "TradeCom_Host": "itrade.kgi.com.tw",
+  "TradeCom_Port": 8000,
+  "TradeCom_BrokerID": "F004000",
+  "TradeCom_Account": "",
+  "QuoteServer": {
+    "Host": "quoteapi.kgi.com.tw",
+    "Port": 443,
+    "SourceID": "API",
+    "Token": ""
+  },
+  "RiskDataOutputPath": ".\\RiskData.json",
+  "QuoteDisplayMode": 0,
+  "SubscribeProductIDs": [],
+  "JPXSubscriptionStartTime": "07:20:00",
+  "HotMonthContractDates": [],
+  "ProductSpreads": [
+    {
+      "Id": "JPX-225MC-TPXM",
+      "ProductName": "225MC／TPXM價差",
+      "LegA": {
+        "ProductID": "225MC",
+        "Direction": "Buy",
+        "Quantity": 6
+      },
+      "LegB": {
+        "ProductID": "TPXM",
+        "Direction": "Sell",
+        "Quantity": 1
+      },
+      "ShiftPoint": 0.0,
+      "MinimumTick": 100,
+      "PxDecimal": 0,
+      "SnapshotEnabled": true,
+      "SnapshotIntervalSeconds": 30,
+      "SnapshotPath": ".\\SpreadSnapshots"
+    }
+  ],
+  "RISK_FREE_RATE": 0.0,
+  "AutoExportIntervalSeconds": 15000,
+  "TTM_Config": {
+    "Method": "ExactSeconds",
+    "DaysInYear": 240.0,
+    "MinTValue": 0.001,
+    "ExpirationTime": "13:30:00",
+    "IntradayWeights": [
+      {
+        "Name": "DaySession",
+        "StartTime": "08:45:00",
+        "EndTime": "13:45:00",
+        "Weight": 0.5
+      },
+      {
+        "Name": "NightSession",
+        "StartTime": "15:00:00",
+        "EndTime": "05:00:00",
+        "Weight": 0.5
+      }
+    ]
+  },
+  "spreadconfig": [
+    {
+      "minBid": 0.0,
+      "maxBid": 100.0,
+      "percentage": 0.12,
+      "minSpread": 3.0
+    },
+    {
+      "minBid": 100.0,
+      "maxBid": 400.0,
+      "percentage": 0.08,
+      "minSpread": 12.0
+    },
+    {
+      "minBid": 400.0,
+      "maxBid": 800.0,
+      "percentage": 0.07,
+      "minSpread": 32.0
+    },
+    {
+      "minBid": 800.0,
+      "maxBid": 1000.0,
+      "percentage": 0.06,
+      "minSpread": 56.0
+    },
+    {
+      "minBid": 1000.0,
+      "maxBid": 6000.0,
+      "percentage": 0.04,
+      "minSpread": 60.0
+    },
+    {
+      "minBid": 6000.0,
+      "maxBid": 999999.0,
+      "percentage": 0.0,
+      "fixedSpread": 300.0
+    }
+  ]
+}

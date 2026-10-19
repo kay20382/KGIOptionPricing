@@ -1,18 +1,9 @@
-using System.Text.Json;
 using KGIOptionPricing.StrategyFramework;
-using KGIOptionPricing.StrategyFramework.Recovery;
 
 namespace KGIOptionPricing.Strategies.PeriodicQueueCycle;
 
-public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOrderStrategy, IManagedOrderSubmissionObserver, IStrategyRecoveryParticipant, IStrategyHeartbeat, IStrategyDecisionSource
+public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOrderStrategy, IManagedOrderSubmissionObserver, IStrategyHeartbeat, IStrategyDecisionSource, IStrategyOperatorStop
 {
-    private sealed record RecoveryState(ManagedOrderBookCheckpoint OrderBook, DirectionWindowCheckpoint? DirectionWindow,
-        QueueCycleOrderCoordinator.QueueCycleCoordinatorCheckpoint? Coordinator, MarketEvent? LastBook, MarketEvent? LastHealthyBook,
-        DateTimeOffset? LastObservedBookTimestamp, long LastObservedBookSequence, string Reason, int OppositeDirectionSeconds,
-        long LastOppositeUtcSecond, bool Paused, bool StopRequested, string StopReason, DateTimeOffset? OneLegStartedAt,
-        DateTimeOffset? UnhealthySince, DateTimeOffset? CooldownUntil, PaperOrderRole? PendingExitRole,
-        string? PendingExitReason, int PendingCooldownSeconds, bool ExitRequested, decimal FixedStopPrice,
-        string ActiveCandidateId, bool AcceptDecisionPending, StrategyLifecycleState State);
     private readonly StrategyDefinition _definition;
     private readonly PeriodicQueueCycleParameters _parameters;
     private StrategyRuntimeContext? _context;
@@ -25,6 +16,7 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
     private long _lastObservedBookSequence = long.MinValue;
     private string _reason = "尚未啟動";
     private int _oppositeDirectionSeconds;
+    private bool _preFillReversalPending;
     private long _lastOppositeUtcSecond = long.MinValue;
     private bool _paused;
     private bool _stopRequested;
@@ -41,8 +33,9 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
     private bool _acceptDecisionPending;
     private long _strategyRunGeneration;
     private ManagedStrategyOrderBook? _managedOrderBook;
-    private bool _restoreBeforeStart;
-    public string RecoverySchema => "periodic-queue-cycle/v1";
+    private string _activeSession = "Closed";
+    private string _requestedSession = "Closed";
+    private bool _sessionTransitionPending;
 
     internal PeriodicQueueCycleStrategy(
         StrategyDefinition definition,
@@ -65,41 +58,22 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
     public void Start(StrategyRuntimeContext context)
     {
         ArgumentNullException.ThrowIfNull(context);
-        if (State != StrategyLifecycleState.Created && !_restoreBeforeStart) throw new InvalidOperationException("策略已啟動。");
+        if (State != StrategyLifecycleState.Created) throw new InvalidOperationException("策略已啟動。");
         if (context.Universe.Tradable.TickSize <= 0m)
             throw new ArgumentException("交易商品 TickSize 必須大於零。", nameof(context));
 
         _context = context;
-        if (_restoreBeforeStart)
-        {
-            if (_strategyRunGeneration != context.StrategyRunGeneration)
-                throw new InvalidOperationException("Restored PQC run generation does not match runtime context.");
-        }
-        else _strategyRunGeneration = context.StrategyRunGeneration;
-        _managedOrderBook ??= new ManagedStrategyOrderBook(InstanceId, context.StrategyRunGeneration);
-        if (_managedOrderBook.StrategyRunGeneration != context.StrategyRunGeneration)
-            throw new InvalidOperationException("PQC managed order book generation mismatch.");
+        _strategyRunGeneration = context.StrategyRunGeneration;
+        _managedOrderBook = new ManagedStrategyOrderBook(InstanceId, context.StrategyRunGeneration);
         _directionWindow = new DirectionWindow(context.Universe.Tradable.TickSize, _parameters);
         _coordinator = new QueueCycleOrderCoordinator(
             InstanceId, context.Universe.Tradable.Symbol, _parameters, context.StrategyRunGeneration);
-        if (_restoreBeforeStart && _restoreCoordinator is not null)
-            _coordinator.Restore(_restoreCoordinator);
-        if (_restoreBeforeStart && _restoreDirectionWindow is not null)
-            _directionWindow.Restore(_restoreDirectionWindow);
         _coordinator.OrderRequested += ForwardOrder;
         _coordinator.CancelOrderRequested += ForwardCancel;
-        if (_restoreBeforeStart)
-        {
-            _paused = true;
-            State = StrategyLifecycleState.Suspended;
-            _reason = "RecoveryAwaitingResume";
-        }
-        else
-        {
-            State = StrategyLifecycleState.WarmingUp;
-            _reason = "WarmupIncomplete";
-        }
-        _restoreBeforeStart = false;
+        _activeSession = GetSession(context.Clock.Now);
+        _requestedSession = _activeSession;
+        State = _activeSession == "Closed" ? StrategyLifecycleState.Suspended : StrategyLifecycleState.WarmingUp;
+        _reason = _activeSession == "Closed" ? "OutsideTradingSession" : "WarmupIncomplete";
         Publish();
     }
 
@@ -110,6 +84,9 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
             marketEvent.Kind != MarketEventKind.Book ||
             !string.Equals(marketEvent.Symbol, _context.Universe.Tradable.Symbol, StringComparison.OrdinalIgnoreCase))
             return;
+        if (AdvanceSession(_context.Clock.Now)) return;
+        if (_activeSession == "Closed") return;
+        if (DirectionWindow.HasMissingTopThreeDepth(marketEvent)) return;
 
         if (_cooldownUntil.HasValue)
         {
@@ -159,13 +136,10 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
             if (!currentBookHealthy)
             {
                 _unhealthySince ??= _context.Clock.Now;
-                _coordinator.BeginRiskCancellation(_lastAssessment.PrimaryReasonCode);
-                decimal unhealthySeconds = (decimal)(_context.Clock.Now - _unhealthySince.Value).TotalSeconds;
-                if (unhealthySeconds >= _parameters.MarketDataRecoverySeconds)
-                    BeginRiskExit(PaperOrderRole.Flatten, "MarketDataRecoveryTimeout", _parameters.ShockCooldownSeconds);
-                else
-                    _reason = _lastAssessment.PrimaryReasonCode;
-                TryAdvanceRiskExit();
+                // A one-leg cycle keeps its peer completion order working through
+                // quote-health interruptions. Invalid/stale prices are not a stop
+                // trigger; only a later healthy quote may hit the fixed stop.
+                _reason = _lastAssessment.PrimaryReasonCode;
                 SetProtectedState();
                 Publish();
                 return;
@@ -174,9 +148,6 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
             _unhealthySince = null;
             if (_pendingExitRole is null && IsFixedStopHit(position, marketEvent))
                 BeginRiskExit(PaperOrderRole.StopLoss, "FixedStopLoss", _parameters.StopLossCooldownSeconds);
-            else if (_pendingExitRole is null && _oneLegStartedAt.HasValue &&
-                     (_context.Clock.Now - _oneLegStartedAt.Value).TotalSeconds >= _parameters.MaxOneLegSeconds)
-                BeginRiskExit(PaperOrderRole.Flatten, "OneLegTimeout", _parameters.CycleCooldownSeconds);
 
             if (_pendingExitRole is not null)
             {
@@ -268,6 +239,7 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
         ApplyCoordinatorState();
         if (execution.Role is PaperOrderRole.EntryLong or PaperOrderRole.EntryShort)
         {
+            _preFillReversalPending = false;
             PositionSnapshot position = Position();
             if (position.NetQuantity != 0)
             {
@@ -287,6 +259,15 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
         if (_context is null || _directionWindow is null || _coordinator is null ||
             State is StrategyLifecycleState.Stopped or StrategyLifecycleState.Faulted)
             return;
+
+        if (AdvanceSession(now)) return;
+        if (_activeSession == "Closed")
+        {
+            State = StrategyLifecycleState.Suspended;
+            _reason = "OutsideTradingSession";
+            Publish();
+            return;
+        }
 
         if (_coordinator.IsClosingBlocked)
         {
@@ -331,16 +312,7 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
         if (now > staleAt)
         {
             if (!_unhealthySince.HasValue || _unhealthySince.Value > staleAt) _unhealthySince = staleAt;
-            _coordinator.BeginRiskCancellation("StaleQuote");
-            if ((decimal)(now - _unhealthySince.Value).TotalSeconds >= _parameters.MarketDataRecoverySeconds)
-                BeginRiskExit(PaperOrderRole.Flatten, "MarketDataRecoveryTimeout", _parameters.ShockCooldownSeconds);
-            else
-                _reason = "StaleQuote";
-        }
-        else if (_pendingExitRole is null && _oneLegStartedAt.HasValue &&
-                 (now - _oneLegStartedAt.Value).TotalSeconds >= _parameters.MaxOneLegSeconds)
-        {
-            BeginRiskExit(PaperOrderRole.Flatten, "OneLegTimeout", _parameters.CycleCooldownSeconds);
+            _reason = "StaleQuote";
         }
 
         TryAdvanceRiskExit();
@@ -362,47 +334,8 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
         Publish();
     }
 
-    private QueueCycleOrderCoordinator.QueueCycleCoordinatorCheckpoint? _restoreCoordinator;
-    private DirectionWindowCheckpoint? _restoreDirectionWindow;
-
     public void OnOrderSubmitted(PaperOrderRequest request) => _managedOrderBook?.Track(request);
 
-    public StrategyRecoveryCheckpoint CaptureRecoveryCheckpoint()
-    {
-        if (_strategyRunGeneration <= 0) throw new InvalidOperationException("PQC has no strategy run generation to checkpoint.");
-        var state = new RecoveryState(_managedOrderBook?.Capture() ?? new ManagedOrderBookCheckpoint(InstanceId,
-                _strategyRunGeneration, 0, Array.Empty<ManagedOrderRecord>()),
-            _directionWindow?.Capture(), _coordinator?.Capture(), _lastBook, _lastHealthyBook,
-            _lastObservedBookTimestamp, _lastObservedBookSequence, _reason, _oppositeDirectionSeconds,
-            _lastOppositeUtcSecond, _paused, _stopRequested, _stopReason, _oneLegStartedAt, _unhealthySince,
-            _cooldownUntil, _pendingExitRole, _pendingExitReason, _pendingCooldownSeconds, _exitRequested,
-            _fixedStopPrice, _activeCandidateId, _acceptDecisionPending, State);
-        return new StrategyRecoveryCheckpoint(StrategyType, InstanceId, _strategyRunGeneration, RecoverySchema,
-            _context?.Clock.Now ?? DateTimeOffset.Now, JsonSerializer.Serialize(state));
-    }
-
-    public void RestoreRecoveryCheckpoint(StrategyRecoveryCheckpoint checkpoint)
-    {
-        long expectedRun = _context?.StrategyRunGeneration ?? checkpoint.StrategyRunGeneration;
-        StrategyRecoveryCheckpointValidator.EnsureCompatible(checkpoint, StrategyType, InstanceId, expectedRun, RecoverySchema);
-        RecoveryState saved = JsonSerializer.Deserialize<RecoveryState>(checkpoint.PayloadJson)
-            ?? throw new InvalidOperationException("PQC recovery payload is empty.");
-        _strategyRunGeneration = checkpoint.StrategyRunGeneration;
-        _managedOrderBook = new ManagedStrategyOrderBook(InstanceId, _strategyRunGeneration);
-        _managedOrderBook.Restore(saved.OrderBook);
-        _lastBook = saved.LastBook; _lastHealthyBook = saved.LastHealthyBook;
-        _lastObservedBookTimestamp = saved.LastObservedBookTimestamp; _lastObservedBookSequence = saved.LastObservedBookSequence;
-        _reason = saved.Reason; _oppositeDirectionSeconds = saved.OppositeDirectionSeconds;
-        _lastOppositeUtcSecond = saved.LastOppositeUtcSecond; _paused = saved.Paused;
-        _stopRequested = saved.StopRequested; _stopReason = saved.StopReason; _oneLegStartedAt = saved.OneLegStartedAt;
-        _unhealthySince = saved.UnhealthySince; _cooldownUntil = saved.CooldownUntil;
-        _pendingExitRole = saved.PendingExitRole; _pendingExitReason = saved.PendingExitReason;
-        _pendingCooldownSeconds = saved.PendingCooldownSeconds; _exitRequested = saved.ExitRequested;
-        _fixedStopPrice = saved.FixedStopPrice; _activeCandidateId = saved.ActiveCandidateId;
-        _acceptDecisionPending = saved.AcceptDecisionPending; State = saved.State;
-        _restoreCoordinator = saved.Coordinator; _restoreDirectionWindow = saved.DirectionWindow;
-        _restoreBeforeStart = true;
-    }
 
     public void Pause(string reason)
     {
@@ -436,6 +369,17 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
         _paused = false;
         State = StrategyLifecycleState.Running;
         _reason = _coordinator?.ReasonCode ?? "持倉保護恢復";
+        Publish();
+    }
+
+    public void OperatorStop(string reason)
+    {
+        if (State == StrategyLifecycleState.Stopped) return;
+        _paused = true;
+        _stopRequested = true;
+        _stopReason = reason;
+        State = StrategyLifecycleState.Stopped;
+        _reason = reason;
         Publish();
     }
 
@@ -478,7 +422,8 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
                 ? "Cycle=none;Direction=Neutral;Buy=none;Sell=none"
                 : _coordinator.CycleSummary,
             State = State,
-            Reason = _reason,
+            Reason = _coordinator?.IsClosingBlocked == true && _coordinator.BlockingDetail.Length > 0
+                ? $"{_reason} / {_coordinator.BlockingDetail}" : _reason,
             LastPrice = _lastBook?.LastPrice ?? 0m,
             CenterPrice = _lastBook?.MidPrice ?? 0m,
             Range = _lastAssessment?.PathTicks ?? 0m,
@@ -522,12 +467,12 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
         }
         StrategyDecision decision = primaryReason switch
         {
-            "WarmupIncomplete" => StrategyDecision.Warmup,
+            "WarmupIncomplete" or "MicrostructureWarmup" => StrategyDecision.Warmup,
             "NeutralDirection" or "StaleQuote" or "InvalidBook" or "InsufficientSideDepth" or
-                "InsufficientNearDepth" or "DepthImbalance" or "SpreadTooWide" or "VolatilityTooHigh" => StrategyDecision.Reject,
-            "FixedStopLoss" or "OneLegTimeout" or "MarketDataRecoveryTimeout" or
+                "InsufficientNearDepth" or "DepthImbalance" or "SpreadTooWide" or "VolatilityTooHigh" or "MicrostructureFiltered" => StrategyDecision.Reject,
+            "FixedStopLoss" or "OneLegTimeout" or "MarketDataRecoveryTimeout" or "SessionClosing" or
                 "SignalReversedBeforeFill" => StrategyDecision.Exit,
-            "DailyLossLocked" or "ClosingBlocked" => StrategyDecision.Halt,
+            "DailyLossLocked" or "ClosingBlocked" or "OutsideTradingSession" => StrategyDecision.Halt,
             _ when State is StrategyLifecycleState.Stopped or StrategyLifecycleState.Faulted => StrategyDecision.Halt,
             _ => StrategyDecision.Hold
         };
@@ -550,6 +495,10 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
             ["pathTicks"] = assessment?.PathTicks,
             ["trendEfficiency"] = assessment?.TrendEfficiency,
             ["averageObi"] = assessment?.AverageObi,
+            ["normalizedOfi"] = assessment?.Microstructure?.NormalizedOfi,
+            ["queueImbalance"] = assessment?.Microstructure?.QueueImbalance,
+            ["weightedMidBiasTicks"] = assessment?.Microstructure?.WeightedMidBiasTicks,
+            ["depthResilience"] = assessment?.Microstructure?.DepthResilience,
             ["volatilityTicks"] = assessment?.VolatilityTicks,
             ["buyWorkingPrice"] = _coordinator?.BuyWorkingPrice,
             ["sellWorkingPrice"] = _coordinator?.SellWorkingPrice,
@@ -605,7 +554,9 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
     private static string ThresholdUnit(string name) => name switch
     {
         "MinSideDepth" or "MinNearDepth" or "DirectionWindowSeconds" => "count",
-        "QuoteFreshnessSeconds" => "seconds",
+        "QuoteFreshnessSeconds" or "MicrostructureWindowSeconds" => "seconds",
+        "NormalizedOfi" or "MaxAbsNormalizedOfi" => "L1-depth-equivalents",
+        "QueueImbalance" or "DepthResilience" => "ratio",
         "MinDepthRatio" or "MinTrendEfficiency" or "UpMinDepthObi" or "DownMinDepthObi" => "ratio",
         _ => "ticks"
     };
@@ -636,7 +587,13 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
         _lastOppositeUtcSecond = utcSecond;
         _oppositeDirectionSeconds++;
         if (_oppositeDirectionSeconds < _parameters.DirectionReverseSeconds) return false;
-        return _coordinator.CancelBothBeforeFill("SignalReversedBeforeFill");
+        // Mark intent before cancellation: paper and broker adapters may deliver
+        // terminal callbacks synchronously inside CancelBothBeforeFill.
+        _preFillReversalPending = true;
+        bool cancelled = _coordinator.CancelBothBeforeFill("SignalReversedBeforeFill");
+        if (!cancelled) _preFillReversalPending = false;
+        TryCompleteCycle();
+        return cancelled;
     }
 
     private void TryCompleteStop()
@@ -689,6 +646,11 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
         PositionSnapshot position = Position();
         if (position.NetQuantity == 0)
         {
+            if (_sessionTransitionPending)
+            {
+                TryCompleteSessionTransition();
+                return;
+            }
             if (_stopRequested)
             {
                 TryCompleteStop();
@@ -724,6 +686,13 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
     private void TryCompleteCycle()
     {
         if (_coordinator is null || _cooldownUntil.HasValue || Position().NetQuantity != 0) return;
+        if (_preFillReversalPending && _coordinator.BothUnfilled &&
+            !_coordinator.HasOutstandingOrders && !_paused && !_stopRequested &&
+            !_sessionTransitionPending && _pendingExitRole is null)
+        {
+            EnterCooldown(_parameters.CycleCooldownSeconds);
+            return;
+        }
         if (_exitRequested && _pendingExitRole is not null)
         {
             if (!_coordinator.HasOutstandingOrders) EnterCooldown(_pendingCooldownSeconds);
@@ -733,8 +702,88 @@ public sealed class PeriodicQueueCycleStrategy : ISimulationStrategy, IManagedOr
             EnterCooldown(_parameters.CycleCooldownSeconds);
     }
 
+    private bool AdvanceSession(DateTimeOffset now)
+    {
+        if (_context is null || _coordinator is null) return false;
+        string desired = GetSession(now);
+        if (_sessionTransitionPending)
+        {
+            _requestedSession = desired;
+            TryCompleteSessionTransition();
+            return _sessionTransitionPending;
+        }
+        if (desired == _activeSession) return false;
+
+        _requestedSession = desired;
+        _sessionTransitionPending = true;
+        _pendingExitRole = PaperOrderRole.Flatten;
+        _pendingExitReason = "SessionClosed";
+        _pendingCooldownSeconds = 0;
+        _exitRequested = false;
+        _reason = "SessionClosing";
+        _coordinator.BeginSessionClose("SessionClosing");
+        TryAdvanceRiskExit();
+        TryCompleteSessionTransition();
+        Publish();
+        return true;
+    }
+
+    private void TryCompleteSessionTransition()
+    {
+        if (!_sessionTransitionPending || _coordinator is null || _coordinator.IsClosingBlocked ||
+            _coordinator.HasOutstandingOrders || Position().NetQuantity != 0)
+            return;
+
+        _coordinator.EnterCooldown();
+        _coordinator.ResetAfterCooldown();
+        _directionWindow = new DirectionWindow(_context!.Universe.Tradable.TickSize, _parameters);
+        _lastAssessment = null;
+        _lastBook = null;
+        _lastHealthyBook = null;
+        _lastObservedBookTimestamp = null;
+        _lastObservedBookSequence = long.MinValue;
+        _oneLegStartedAt = null;
+        _unhealthySince = null;
+        _cooldownUntil = null;
+        _pendingExitRole = null;
+        _pendingExitReason = null;
+        _pendingCooldownSeconds = 0;
+        _exitRequested = false;
+        _fixedStopPrice = 0m;
+        _activeCandidateId = string.Empty;
+        _acceptDecisionPending = false;
+        _oppositeDirectionSeconds = 0;
+        _lastOppositeUtcSecond = long.MinValue;
+        _activeSession = _requestedSession;
+        _preFillReversalPending = false;
+        _sessionTransitionPending = false;
+        if (_activeSession == "Closed")
+        {
+            State = StrategyLifecycleState.Suspended;
+            _reason = "OutsideTradingSession";
+        }
+        else
+        {
+            State = _paused ? StrategyLifecycleState.Suspended : StrategyLifecycleState.WarmingUp;
+            _reason = _paused ? "使用者暫停" : "WarmupIncomplete";
+        }
+    }
+
+    private string GetSession(DateTimeOffset timestamp)
+    {
+        TimeOnly localTime = TimeOnly.FromDateTime(timestamp.ToOffset(TimeSpan.FromHours(8)).DateTime);
+        bool day = _parameters.DaySessionEnabled && IsWithin(localTime, _parameters.DaySessionStart, _parameters.DaySessionEnd);
+        bool night = _parameters.NightSessionEnabled && IsWithin(localTime, _parameters.NightSessionStart, _parameters.NightSessionEnd);
+        return day ? "Day" : night ? "Night" : "Closed";
+    }
+
+    private static bool IsWithin(TimeOnly time, TimeOnly start, TimeOnly end) => start < end
+        ? time >= start && time < end
+        : time >= start || time < end;
+
     private void EnterCooldown(int seconds)
     {
+        _preFillReversalPending = false;
         if (_coordinator is null || _context is null || _cooldownUntil.HasValue) return;
         _coordinator.EnterCooldown();
         _cooldownUntil = _context.Clock.Now.AddSeconds(seconds);

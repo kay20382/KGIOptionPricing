@@ -1,0 +1,6 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0-windows</TargetFramework><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable><PlatformTarget>x64</PlatformTarget></PropertyGroup>
+  <ItemGroup>
+    <Reference Include="ReadinessBridge"><HintPath>C:/Users/user/.codex/visualizations/2026/10/07/01a1161a-64d8-7c81-9e7d-b725164d7ff5/nikkei-rl-readiness-contract-20261009/runtime/ReadinessBridge.dll</HintPath></Reference>
+  </ItemGroup>
+</Project>

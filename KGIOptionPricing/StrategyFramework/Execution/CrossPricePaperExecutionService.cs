@@ -7,14 +7,20 @@ namespace KGIOptionPricing.StrategyFramework.Execution;
 
 /// <summary>
 /// Deterministic paper broker. A touch does not fill; a trade must pass strictly through
-/// limit/stop prices. Those fills use the requested price; Market fills use the next trade price.
+/// limit/stop prices. Those fills use the requested price. By default Market
+/// fills use the next trade; offline research may opt into next valid contra book.
 /// </summary>
 public sealed class CrossPricePaperExecutionService : IPaperExecutionService, IManagedStrategyExecutionService
 {
     private readonly object _sync = new();
     private readonly Dictionary<string, PaperOrder> _orders = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ManagedRestingPairCoordinator _restingPairs = new();
     private readonly decimal _commissionPerContract;
     private readonly IStrategyClock _clock;
+    private readonly bool _fillMarketOnBook;
+    private readonly bool _allowLimitIoc;
+    private readonly TimeSpan _maxBookAge;
+    private readonly Dictionary<string,(MarketEvent Book,int BuyUsed,int SellUsed)> _liquidity = new(StringComparer.OrdinalIgnoreCase);
     private long _orderSequence;
     private long _executionSequence;
 
@@ -22,18 +28,29 @@ public sealed class CrossPricePaperExecutionService : IPaperExecutionService, IM
     public event Action<string>? Failed;
     public event Action<OrderLifecycleEvent>? OrderLifecycleChanged;
 
-    public CrossPricePaperExecutionService(decimal commissionPerContract = 0m, IStrategyClock? clock = null)
+    public CrossPricePaperExecutionService(decimal commissionPerContract = 0m, IStrategyClock? clock = null,
+        bool fillMarketOnBook = false, bool allowLimitIoc = false, TimeSpan? maxBookAge = null)
     {
         _commissionPerContract = Math.Max(0m, commissionPerContract);
         _clock = clock ?? new SystemStrategyClock();
+        _fillMarketOnBook = fillMarketOnBook;
+        _allowLimitIoc = allowLimitIoc;
+        _maxBookAge = maxBookAge ?? TimeSpan.FromSeconds(2);
     }
 
     public PaperOrder Submit(PaperOrderRequest request, DateTimeOffset now)
     {
         if (request.Price <= 0m) throw new ArgumentOutOfRangeException(nameof(request.Price));
         if (request.Quantity <= 0) throw new ArgumentOutOfRangeException(nameof(request.Quantity));
+        if (request.TimeInForce != TimeInForce.ROD && !(request.TimeInForce == TimeInForce.IOC && _allowLimitIoc && request.Type == PaperOrderType.BrokerLimit))
+            throw new ArgumentException("Unsupported limit time in force");
+        if (request.RestingPairMode == RestingPairMode.OppositeLegIsExit &&
+            (request.Type != PaperOrderType.BrokerLimit || request.TimeInForce != TimeInForce.ROD))
+            throw new ArgumentException("Resting pairs require broker-limit ROD orders.");
         var order = new PaperOrder
         {
+            RestingPairMode = request.RestingPairMode,
+            PairId = request.PairId,
             OrderId = $"SIM-{request.StrategyInstanceId}-{System.Threading.Interlocked.Increment(ref _orderSequence)}",
             ClientOrderId = request.ClientOrderId,
             CycleId = request.CycleId,
@@ -44,15 +61,29 @@ public sealed class CrossPricePaperExecutionService : IPaperExecutionService, IM
             Symbol = request.Symbol,
             Side = request.Side,
             Type = request.Type,
+            TimeInForce = request.TimeInForce,
             Role = request.Role,
             Price = request.Price,
             Quantity = request.Quantity,
             State = PaperOrderState.Working,
             CreatedAt = now
         };
-        lock (_sync) _orders[order.OrderId] = order;
+        lock (_sync)
+        {
+            if (order.RestingPairMode == RestingPairMode.OppositeLegIsExit)
+            {
+                var key = new RestingPairKey(order.StrategyInstanceId, order.StrategyRunGeneration,
+                    order.CycleId, order.PairId);
+                RestingPairDecision registration = _restingPairs.RegisterLeg(key, order.ClientOrderId,
+                    order.OrderId, order.Side, order.Role, order.Quantity);
+                if (registration.Phase == RestingPairPhase.Quarantined)
+                    throw new InvalidOperationException("Paired order registration could not be uniquely attributed.");
+            }
+            _orders[order.OrderId] = order;
+        }
         PublishLifecycle(order, OrderLifecycleState.Submitted, OrderLifecycleState.Submitted, now, "Submitted");
         PublishLifecycle(order, OrderLifecycleState.Submitted, OrderLifecycleState.Working, now, "Working");
+        if (order.TimeInForce == TimeInForce.IOC) MatchIoc(order, now);
         return order;
     }
 
@@ -121,14 +152,28 @@ public sealed class CrossPricePaperExecutionService : IPaperExecutionService, IM
 
     public void OnMarketEvent(MarketEvent marketEvent)
     {
-        if (marketEvent.Kind != MarketEventKind.Trade || marketEvent.LastPrice <= 0m) return;
+        lock (_sync)
+        {
+            if (marketEvent.Kind == MarketEventKind.Connection) _liquidity.Clear();
+            if (marketEvent.Kind == MarketEventKind.Book)
+            {
+                bool newer = !_liquidity.TryGetValue(marketEvent.Symbol, out var old) ||
+                    (marketEvent.ConnectionGeneration != old.Book.ConnectionGeneration) ||
+                    (marketEvent.Timestamp >= old.Book.Timestamp && marketEvent.Sequence > old.Book.Sequence);
+                if (newer) _liquidity[marketEvent.Symbol] = (marketEvent, 0, 0);
+            }
+        }
+        bool trade = marketEvent.Kind == MarketEventKind.Trade && marketEvent.LastPrice > 0m;
+        bool book = _fillMarketOnBook && marketEvent.Kind == MarketEventKind.Book &&
+            marketEvent.BestBid > 0m && marketEvent.BestAsk > marketEvent.BestBid;
+        if (!trade && !book) return;
         List<ExecutionEvent> fills = new();
         List<PaperOrder> filledOrders = new();
         List<PaperOrder> cancelledOcoSiblings = new();
         lock (_sync)
         {
             PaperOrder[] candidates = _orders.Values
-                .Where(x => x.State == PaperOrderState.Working &&
+                .Where(x => x.State == PaperOrderState.Working && x.TimeInForce == TimeInForce.ROD &&
                             string.Equals(x.Symbol, marketEvent.Symbol, StringComparison.OrdinalIgnoreCase))
                 .OrderBy(x => x.CreatedAt).ThenBy(x => x.OrderId).ToArray();
 
@@ -141,20 +186,36 @@ public sealed class CrossPricePaperExecutionService : IPaperExecutionService, IM
                 PaperOrder order = current;
                 bool crossed = order.Type switch
                 {
-                    PaperOrderType.Market => true,
-                    PaperOrderType.Limit or PaperOrderType.BrokerLimit when order.Side == BuySell.Buy
+                    PaperOrderType.Market when trade => true,
+                    PaperOrderType.Market when book && order.Side == BuySell.Buy
+                        => marketEvent.AskQuantities.Length > 0 && marketEvent.AskQuantities[0] >= order.Quantity,
+                    PaperOrderType.Market when book
+                        => marketEvent.BidQuantities.Length > 0 && marketEvent.BidQuantities[0] >= order.Quantity,
+                    PaperOrderType.Limit or PaperOrderType.BrokerLimit when trade && order.Side == BuySell.Buy
                         => marketEvent.LastPrice < order.Price,
-                    PaperOrderType.Limit or PaperOrderType.BrokerLimit
+                    PaperOrderType.Limit or PaperOrderType.BrokerLimit when trade
                         => marketEvent.LastPrice > order.Price,
-                    PaperOrderType.Stop when order.Side == BuySell.Buy => marketEvent.LastPrice > order.Price,
-                    PaperOrderType.Stop => marketEvent.LastPrice < order.Price,
+                    PaperOrderType.Stop when trade && order.Side == BuySell.Buy => marketEvent.LastPrice > order.Price,
+                    PaperOrderType.Stop when trade => marketEvent.LastPrice < order.Price,
                     _ => false
                 };
                 if (!crossed) continue;
 
+                long executionSequence = ++_executionSequence;
+                RestingPairDecision? pairedFill = null;
+                if (order.RestingPairMode == RestingPairMode.OppositeLegIsExit)
+                {
+                    var key = new RestingPairKey(order.StrategyInstanceId, order.StrategyRunGeneration,
+                        order.CycleId, order.PairId);
+                    pairedFill = _restingPairs.RecordFill(key, order.ClientOrderId, order.OrderId,
+                        $"SIM-FILL-{executionSequence}", order.Quantity, order.Quantity, executionSequence);
+                    if (pairedFill.Phase == RestingPairPhase.Quarantined || pairedFill.EffectiveRole == null)
+                        throw new InvalidOperationException("Paired paper fill could not be uniquely attributed.");
+                }
+
                 _orders[order.OrderId] = order with { State = PaperOrderState.Filled };
                 filledOrders.Add(order with { State = PaperOrderState.Filled });
-                if (!string.IsNullOrWhiteSpace(order.OcoGroupId))
+                if (order.RestingPairMode == RestingPairMode.None && !string.IsNullOrWhiteSpace(order.OcoGroupId))
                 {
                     bool isEntry = order.Role is PaperOrderRole.EntryLong or PaperOrderRole.EntryShort;
                     bool isExit = order.Role is PaperOrderRole.TakeProfit or PaperOrderRole.StopLoss or PaperOrderRole.Flatten;
@@ -178,8 +239,12 @@ public sealed class CrossPricePaperExecutionService : IPaperExecutionService, IM
                 }
                 fills.Add(new ExecutionEvent
                 {
-                    Sequence = ++_executionSequence,
+                    Sequence = executionSequence,
+                    ExecutionId = $"SIM-FILL-{executionSequence}",
+                    CumulativeFilledQuantity = order.Quantity,
                     Timestamp = marketEvent.Timestamp,
+                    PairId = order.PairId,
+                    OriginalOrderRole = pairedFill == null ? null : order.Role,
                     StrategyInstanceId = order.StrategyInstanceId,
                     ClientOrderId = order.ClientOrderId,
                     CycleId = order.CycleId,
@@ -188,11 +253,16 @@ public sealed class CrossPricePaperExecutionService : IPaperExecutionService, IM
                     OrderId = order.OrderId,
                     Symbol = order.Symbol,
                     Side = order.Side,
-                    Role = order.Role,
-                    Price = order.Type == PaperOrderType.Market ? marketEvent.LastPrice : order.Price,
+                    Role = pairedFill?.EffectiveRole ?? order.Role,
+                    Price = order.Type == PaperOrderType.Market
+                        ? book ? order.Side == BuySell.Buy ? marketEvent.BestAsk : marketEvent.BestBid
+                            : marketEvent.LastPrice
+                        : order.Price,
                     Quantity = order.Quantity,
                     Commission = _commissionPerContract * order.Quantity,
-                    TriggerMarketPrice = marketEvent.LastPrice,
+                    TriggerMarketPrice = book
+                        ? order.Side == BuySell.Buy ? marketEvent.BestAsk : marketEvent.BestBid
+                        : marketEvent.LastPrice,
                     MarketSequence = marketEvent.Sequence
                 });
             }
@@ -223,6 +293,7 @@ public sealed class CrossPricePaperExecutionService : IPaperExecutionService, IM
     {
         OrderLifecycleChanged?.Invoke(new OrderLifecycleEvent
         {
+            PairId = order.PairId,
             Timestamp = timestamp,
             StrategyInstanceId = order.StrategyInstanceId,
             ClientOrderId = order.ClientOrderId,
@@ -237,6 +308,7 @@ public sealed class CrossPricePaperExecutionService : IPaperExecutionService, IM
             PreviousState = previousState,
             State = state,
             Price = order.Price,
+            TimeInForce = order.TimeInForce,
             Quantity = order.Quantity,
             FilledQuantity = filledQuantity,
             DeliveredFilledQuantity = filledQuantity,
@@ -246,5 +318,35 @@ public sealed class CrossPricePaperExecutionService : IPaperExecutionService, IM
             HasFinalCumulativeFillWatermark = state is OrderLifecycleState.Filled or OrderLifecycleState.Cancelled or OrderLifecycleState.Rejected,
             ReasonCode = reasonCode
         });
+    }
+
+    private void MatchIoc(PaperOrder order, DateTimeOffset now)
+    {
+        int quantity=0; MarketEvent? book=null; long sequence=0;
+        lock (_sync)
+        {
+            if (_liquidity.TryGetValue(order.Symbol,out var liquidity))
+            {
+                book=liquidity.Book;
+                bool valid=book.BestBid>0 && book.BestAsk>book.BestBid && book.Timestamp<=now && now-book.Timestamp<=_maxBookAge;
+                bool crossed=valid && (order.Side==BuySell.Buy ? order.Price>book.BestAsk : order.Price<book.BestBid);
+                int available=order.Side==BuySell.Buy ? book.AskQuantities.FirstOrDefault()-liquidity.BuyUsed : book.BidQuantities.FirstOrDefault()-liquidity.SellUsed;
+                quantity=crossed ? Math.Min(order.Quantity,Math.Max(0,available)) : 0;
+                _liquidity[order.Symbol]=(book,liquidity.BuyUsed+(order.Side==BuySell.Buy?quantity:0),liquidity.SellUsed+(order.Side==BuySell.Sell?quantity:0));
+            }
+            _orders[order.OrderId]=order with{State=quantity==order.Quantity?PaperOrderState.Filled:PaperOrderState.Cancelled};
+            if(quantity>0) sequence=++_executionSequence;
+        }
+        if(quantity>0)
+        {
+            Filled?.Invoke(new ExecutionEvent{Sequence=sequence,ExecutionId=$"SIM-FILL-{sequence}",CumulativeFilledQuantity=quantity,
+                Timestamp=now,StrategyInstanceId=order.StrategyInstanceId,StrategyRunGeneration=order.StrategyRunGeneration,
+                ClientOrderId=order.ClientOrderId,CycleId=order.CycleId,OrderId=order.OrderId,Symbol=order.Symbol,Side=order.Side,Role=order.Role,
+                Price=order.Price,Quantity=quantity,Commission=_commissionPerContract*quantity,MarketSequence=book?.Sequence??0,
+                TriggerMarketPrice=order.Side==BuySell.Buy?book!.BestAsk:book!.BestBid});
+            if(quantity<order.Quantity) PublishLifecycle(order,OrderLifecycleState.Working,OrderLifecycleState.PartiallyFilled,now,"PartialFill",quantity,book?.Sequence??0);
+        }
+        PublishLifecycle(order,OrderLifecycleState.Working,quantity==order.Quantity?OrderLifecycleState.Filled:OrderLifecycleState.Cancelled,
+            now,quantity==order.Quantity?"Filled":"IocAwaitFreshBook",quantity,book?.Sequence??0);
     }
 }

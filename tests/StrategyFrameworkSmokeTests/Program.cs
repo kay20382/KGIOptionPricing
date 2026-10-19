@@ -13,6 +13,8 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 
+TestPairedPaper();
+
 // Strict crossing: a touch must not fill, a pass through must fill.
 Assert(StrategyProductSpecifications.ResolveTickSize("225MC") == 5m &&
        StrategyProductSpecifications.ResolveContractMultiplier("225MC") == 10m &&
@@ -141,6 +143,52 @@ using (var managedFillRunner = new StrategyInstanceRunner(
            managedFillProbe.Executions[0].ClientOrderId == "buy-fill-g1",
         "BrokerLimit 成交必須保留 ClientOrderId");
 }
+
+var paperOcoBroker = new CrossPricePaperExecutionService();
+var paperOcoFills = new List<ExecutionEvent>();
+var paperOcoLifecycle = new List<OrderLifecycleEvent>();
+paperOcoBroker.Filled += paperOcoFills.Add;
+paperOcoBroker.OrderLifecycleChanged += paperOcoLifecycle.Add;
+DateTimeOffset paperOcoTime = new(2026, 9, 23, 1, 0, 0, TimeSpan.Zero);
+PaperOrder paperTakeProfit = paperOcoBroker.Submit(new PaperOrderRequest
+{
+    ClientOrderId = "paper-a-cycle-1-tp", CycleId = "cycle-1", OcoGroupId = "cycle-1",
+    StrategyRunGeneration = 1, StrategyInstanceId = "paper-a", Symbol = "OCO-MC",
+    Side = BuySell.Sell, Type = PaperOrderType.BrokerLimit, Role = PaperOrderRole.TakeProfit,
+    Price = 100m, Quantity = 1
+}, paperOcoTime);
+PaperOrder paperStop = paperOcoBroker.Submit(new PaperOrderRequest
+{
+    ClientOrderId = "paper-a-cycle-1-stop", CycleId = "cycle-1", OcoGroupId = "cycle-1",
+    StrategyRunGeneration = 1, StrategyInstanceId = "paper-a", Symbol = "OCO-MC",
+    Side = BuySell.Sell, Type = PaperOrderType.Stop, Role = PaperOrderRole.StopLoss,
+    Price = 100m, Quantity = 1
+}, paperOcoTime);
+PaperOrder otherStrategyExit = paperOcoBroker.Submit(new PaperOrderRequest
+{
+    ClientOrderId = "paper-b-cycle-1-tp", CycleId = "cycle-1", OcoGroupId = "cycle-1",
+    StrategyRunGeneration = 1, StrategyInstanceId = "paper-b", Symbol = "OCO-MC",
+    Side = BuySell.Sell, Type = PaperOrderType.BrokerLimit, Role = PaperOrderRole.TakeProfit,
+    Price = 100m, Quantity = 1
+}, paperOcoTime);
+MarketEvent paperOcoCross = Trade("OCO-MC", "225MC", 105m, 700, paperOcoTime.AddSeconds(1));
+paperOcoBroker.OnMarketEvent(paperOcoCross);
+paperOcoBroker.OnMarketEvent(paperOcoCross with { Sequence = 701, Timestamp = paperOcoTime.AddSeconds(2) });
+Assert(paperOcoFills.Count == 2 &&
+       paperOcoFills.Any(fill => fill.ClientOrderId == "paper-a-cycle-1-tp" && fill.Price == 100m) &&
+       paperOcoFills.Any(fill => fill.ClientOrderId == "paper-b-cycle-1-tp" && fill.Price == 100m) &&
+       paperOcoFills.All(fill => fill.ClientOrderId != "paper-a-cycle-1-stop") &&
+       paperOcoBroker.GetWorkingOrders("paper-a").Count == 0 &&
+       paperOcoBroker.GetWorkingOrders("paper-b").Count == 0,
+    "同一策略/週期的 TakeProfit/StopLoss 只能成交一側且按限價；重播不可重複成交，其他策略相同商品的 OCO 不受影響");
+Assert(paperOcoLifecycle.Any(item => item.ClientOrderId == paperStop.ClientOrderId &&
+               item.State == OrderLifecycleState.Cancelled && item.TriggerMarketSequence == 700 &&
+               item.ReasonCode == "OcoSiblingCancelled" && item.HasFinalCumulativeFillWatermark &&
+               item.BrokerFinalCumulativeFilledQuantity == 0) &&
+       paperOcoLifecycle.Any(item => item.ClientOrderId == paperTakeProfit.ClientOrderId &&
+               item.State == OrderLifecycleState.Filled && item.TriggerMarketSequence == 700 &&
+               item.BrokerFinalCumulativeFilledQuantity == 1),
+    "紙上 OCO 成交與對側終止事件必須帶 authoritative final watermark 與觸發行情序號");
 
 var sharedManagedBroker = new CrossPricePaperExecutionService();
 var firstManagedProbe = new ManagedProbeStrategy("managed-first", "MG1");
@@ -653,11 +701,15 @@ source.Emit(Book("L", "225", 49990m, 50010m, 1, t0));
 source.Emit(Book("M", "225M", 109m, 111m, 2, t0));
 source.Emit(Book("MC", "225MC", 109m, 111m, 3, t0));
 source.Emit(Trade("MC", "225MC", 100m, 4, t0, 109m, 111m));
-source.Emit(Book("L", "225", 49990m, 50010m, 5, t0.AddSeconds(10)));
-source.Emit(Book("M", "225M", 109m, 111m, 6, t0.AddSeconds(10)));
+source.Emit(Book("L", "225", 49990m, 50010m, 41, t0.AddSeconds(1)));
+source.Emit(Book("M", "225M", 109m, 111m, 42, t0.AddSeconds(1)));
+source.Emit(Book("L", "225", 50000m, 50020m, 5, t0.AddSeconds(10)));
+source.Emit(Book("M", "225M", 119m, 121m, 6, t0.AddSeconds(10)));
 source.Emit(Trade("MC", "225MC", 120m, 7, t0.AddSeconds(10), 109m, 111m));
 Assert(snapshots.Last().State == StrategyLifecycleState.Running && snapshots.Last().BuyEntry == 100m && snapshots.Last().SellEntry == 120m,
-    "暖機完成後未建立預期雙邊模擬掛單");
+    "暖機完成後未建立預期單邊順勢回檔模擬掛單");
+source.Emit(Book("L", "225", 50000m, 50020m, 71, t0.AddSeconds(11)));
+source.Emit(Book("M", "225M", 119m, 121m, 72, t0.AddSeconds(11)));
 source.Emit(Trade("MC", "225MC", 100m, 8, t0.AddSeconds(11), 99m, 101m));
 Assert(executions.Count == 0, "買單只觸價時不應成交");
 source.Emit(Trade("MC", "225MC", 95m, 9, t0.AddSeconds(12), 94m, 96m));
@@ -683,31 +735,62 @@ var frozenBracketDefinition = new StrategyDefinition
 {
     StrategyType = MeanReversionScalperFactory.TypeName,
     InstanceId = "MR-frozen-bracket",
-    Universe = new StrategyUniverse { Tradable = new ProductSelection("225MC", "FZ") },
+    Universe = new StrategyUniverse { Tradable = new ProductSelection("225MC", "FZ"),
+        References = new[] { new ProductSelection("225", "FZL"), new ProductSelection("225M", "FZM") } },
     Parameters = new Dictionary<string, string>
     {
         ["HorizonSeconds"] = "10", ["F"] = "0.75", ["K"] = "1.35",
         ["MinimumRangeTicks"] = "1", ["MaximumSpreadTicks"] = "1", ["FreshnessSeconds"] = "30"
     }
 };
-var frozenBracket = new MeanReversionScalperFactory().Create(frozenBracketDefinition);
+var frozenBracket = (MeanReversionScalperStrategy)new MeanReversionScalperFactory().Create(frozenBracketDefinition);
 var frozenOrders = new List<PaperOrderRequest>();
-frozenBracket.OrderRequested += frozenOrders.Add;
+frozenBracket.OrderRequested += order =>
+{
+    frozenOrders.Add(order);
+    frozenBracket.OnOrderSubmitted(order);
+};
+var frozenLedger = new PaperPortfolioLedger();
+frozenLedger.RegisterProduct("MR-frozen-bracket", Product("225MC", "FZ", 5m, 10m));
 frozenBracket.Start(new StrategyRuntimeContext(
-    new ResolvedStrategyUniverse { Tradable = Product("225MC", "FZ", 5m, 10m) },
-    new SystemStrategyClock(), new PaperPortfolioLedger()));
+    new ResolvedStrategyUniverse { Tradable = Product("225MC", "FZ", 5m, 10m),
+        References = new[] { Product("225", "FZL", 10m, 1000m), Product("225M", "FZM", 5m, 100m) } },
+    new SystemStrategyClock(), frozenLedger));
 DateTimeOffset frozenTime = new(2026, 9, 16, 1, 0, 0, TimeSpan.Zero);
+frozenBracket.OnMarketEvent(Book("FZL", "225", 995m, 1005m, 101, frozenTime));
+frozenBracket.OnMarketEvent(Book("FZM", "225M", 995m, 1005m, 102, frozenTime));
 frozenBracket.OnMarketEvent(Trade("FZ", "225MC", 100m, 1, frozenTime, 95m, 100m));
+frozenBracket.OnMarketEvent(Book("FZL", "225", 995m, 1005m, 103, frozenTime.AddSeconds(1)));
+frozenBracket.OnMarketEvent(Book("FZM", "225M", 995m, 1005m, 104, frozenTime.AddSeconds(1)));
+frozenBracket.OnMarketEvent(Book("FZL", "225", 985m, 995m, 105, frozenTime.AddSeconds(10)));
+frozenBracket.OnMarketEvent(Book("FZM", "225M", 985m, 995m, 106, frozenTime.AddSeconds(10)));
 frozenBracket.OnMarketEvent(Trade("FZ", "225MC", 120m, 2, frozenTime.AddSeconds(10), 115m, 120m));
-decimal frozenShortEntry = frozenOrders.Single(x => x.Role == PaperOrderRole.EntryShort).Price;
+PaperOrderRequest frozenShortEntry = frozenOrders.Single(x => x.Role == PaperOrderRole.EntryShort);
+decimal frozenShortEntryPrice = frozenShortEntry.Price;
 frozenBracket.OnMarketEvent(Trade("FZ", "225MC", 100m, 3, frozenTime.AddSeconds(21), 95m, 100m));
-frozenBracket.OnExecution(new ExecutionEvent
+Assert(frozenOrders.Count(x => x.Role is PaperOrderRole.EntryLong or PaperOrderRole.EntryShort) == 2 &&
+       frozenShortEntry.Type == PaperOrderType.BrokerLimit &&
+       frozenShortEntry.OcoGroupId == frozenShortEntry.CycleId &&
+       frozenShortEntry.Price == frozenBracket.GetSnapshot().SellEntry,
+    "MR must submit both BrokerLimit entries with frozen prices");
+ExecutionEvent frozenEntryFill = new()
 {
     StrategyInstanceId = "MR-frozen-bracket", Symbol = "FZ", Side = BuySell.Sell,
-    Role = PaperOrderRole.EntryShort, Price = frozenShortEntry, Timestamp = frozenTime.AddSeconds(22)
-});
-PaperOrderRequest frozenStop = frozenOrders.Last(x => x.Role == PaperOrderRole.StopLoss);
-Assert(frozenStop.Price > frozenShortEntry,
+    ClientOrderId = frozenShortEntry.ClientOrderId, CycleId = frozenShortEntry.CycleId,
+    StrategyRunGeneration = frozenShortEntry.StrategyRunGeneration,
+    Role = PaperOrderRole.EntryShort, Price = frozenShortEntry.Price, Quantity = 1,
+    Timestamp = frozenTime.AddSeconds(22)
+};
+frozenLedger.ApplyExecution(frozenEntryFill);
+frozenBracket.OnExecution(frozenEntryFill);
+PaperOrderRequest frozenStop = frozenOrders.Single(x => x.Role == PaperOrderRole.StopLoss);
+Assert(frozenStop.Type == PaperOrderType.Stop && frozenStop.Price > frozenShortEntryPrice &&
+       frozenOrders.All(x => x.Role != PaperOrderRole.TakeProfit),
+    "MR entry fill must immediately install its fixed local stop, without submitting take-profit before entry settlement");
+Assert(frozenOrders.Single(x => x.Role == PaperOrderRole.EntryLong).Price == frozenBracket.GetSnapshot().BuyEntry &&
+       frozenOrders.All(x => x.Role != PaperOrderRole.TakeProfit),
+    "The unchanged opposite original limit must be the eventual effective take-profit");
+Assert(frozenStop.Price > frozenShortEntryPrice,
     "空單的停損價不得因滾動 R 縮小而落在進場價下方");
 
 // MODWT fixed price-stop remains a StopLoss only for an adverse executable price.
@@ -933,10 +1016,21 @@ try
             OrderLifecycleState.Submitted, 100m, observedAt.AddMilliseconds(15)));
         recorder.Record(Lifecycle("observe-1-cycle-1-sell-g1", "SIM-2", OrderLifecycleState.Submitted,
             OrderLifecycleState.Submitted, 110m, observedAt.AddMilliseconds(20)));
-        recorder.Record(Lifecycle("observe-1-cycle-1-sell-g1", "SIM-2", OrderLifecycleState.Working,
-            OrderLifecycleState.Cancelled, 110m, observedAt.AddSeconds(1)));
-        recorder.Record(ObservedExecution(1, "cycle-1-buy-g1", "SIM-1", BuySell.Buy,
-            PaperOrderRole.EntryLong, 100m, 95m, 201, observedAt.AddSeconds(2)));
+    recorder.Record(Lifecycle("observe-1-cycle-1-sell-g1", "SIM-2", OrderLifecycleState.Working,
+        OrderLifecycleState.Cancelled, 110m, observedAt.AddSeconds(1)));
+    recorder.Record(new OrderLifecycleEvent
+    {
+        Timestamp = observedAt.AddSeconds(2), StrategyInstanceId = "observe-1",
+        ClientOrderId = "observe-1-cycle-1-stop-g1", CycleId = "cycle-1", OcoGroupId = "cycle-1",
+        OrderId = "SIM-STOP", BrokerOrderId = "BRK-STOP", Symbol = "MCM6", Side = BuySell.Sell,
+        Role = PaperOrderRole.StopLoss, Generation = 1, TriggerMarketSequence = 205,
+        PreviousState = OrderLifecycleState.Working, State = OrderLifecycleState.Filled,
+        Price = 95m, Quantity = 2, FilledQuantity = 2, DeliveredFilledQuantity = 2,
+        BrokerFinalCumulativeFilledQuantity = 2, RemainingQuantity = 0,
+        HasFinalCumulativeFillWatermark = true, ReasonCode = "OcoStopFilled"
+    });
+    recorder.Record(ObservedExecution(1, "cycle-1-buy-g1", "SIM-1", BuySell.Buy,
+        PaperOrderRole.EntryLong, 100m, 95m, 201, observedAt.AddSeconds(2)));
         recorder.Record(ObservedExecution(2, "cycle-1-sell-g2", "SIM-3", BuySell.Sell,
             PaperOrderRole.EntryShort, 110m, 115m, 202, observedAt.AddSeconds(3)));
         recorder.Record(new StrategySnapshot
@@ -1052,7 +1146,20 @@ try
                lifecycleDocument.RootElement.GetProperty("role").GetString() == "EntryLong" &&
                lifecycleDocument.RootElement.GetProperty("submittedAt").ValueKind == JsonValueKind.String,
             "訂單生命週期必須以 typed metadata 關聯週期、商品、角色、世代與階段時間");
-    Assert(File.ReadLines(Path.Combine(observationDirectory, "order-lifecycle.jsonl")).Count() == 3,
+    using (JsonDocument ocoLifecycleDocument = JsonDocument.Parse(
+        File.ReadLines(Path.Combine(observationDirectory, "order-lifecycle.jsonl")).Single(line => line.Contains("SIM-STOP", StringComparison.Ordinal))))
+    {
+        JsonElement ocoLifecycle = ocoLifecycleDocument.RootElement;
+        Assert(ocoLifecycle.GetProperty("ocoGroupId").GetString() == "cycle-1" &&
+               ocoLifecycle.GetProperty("brokerOrderId").GetString() == "BRK-STOP" &&
+               ocoLifecycle.GetProperty("triggerMarketSequence").GetInt64() == 205 &&
+               ocoLifecycle.GetProperty("deliveredFilledQuantity").GetInt32() == 2 &&
+               ocoLifecycle.GetProperty("brokerFinalCumulativeFilledQuantity").GetInt32() == 2 &&
+               ocoLifecycle.GetProperty("hasFinalCumulativeFillWatermark").GetBoolean() &&
+               ocoLifecycle.GetProperty("reasonCode").GetString() == "OcoStopFilled",
+            "OCO lifecycle 必須保存群組、broker id、觸發序號、成交水位與原因");
+    }
+    Assert(File.ReadLines(Path.Combine(observationDirectory, "order-lifecycle.jsonl")).Count() == 4,
         "同一委託重送相同生命週期轉換不得重複落盤");
     using (JsonDocument summaryDocument = JsonDocument.Parse(
         File.ReadAllText(Path.Combine(observationDirectory, "run-summary.json"))))
@@ -1591,34 +1698,41 @@ finally
 }
 
 // UI regression: NumericUpDown defaults to Maximum=100, so Value=900 must be assigned only after its range.
-Exception? uiConstructionError = null;
-var uiThread = new Thread(() =>
+if (args.Contains("--skip-windows-ui-regression", StringComparer.Ordinal))
 {
-    try
+    Console.WriteLine("Skipped WinForms STA-only regression check by explicit command-line option.");
+}
+else
+{
+    Exception? uiConstructionError = null;
+    var uiThread = new Thread(() =>
     {
-        MethodInfo numberFactory = typeof(StrategyCenterForm).GetMethod(
-            "Number", BindingFlags.NonPublic | BindingFlags.Static)
-            ?? throw new MissingMethodException(nameof(StrategyCenterForm), "Number");
-        using var number = (NumericUpDown)(numberFactory.Invoke(null, new object[] { 900m, 10m, 86400m, 0 })
-            ?? throw new InvalidOperationException("Number helper returned null"));
-        Assert(number.Value == 900m && number.Minimum == 10m && number.Maximum == 86400m,
-            "策略中心數值欄位的預設值或範圍錯誤");
-    }
-    catch (Exception ex)
-    {
-        uiConstructionError = ex is TargetInvocationException { InnerException: not null } ? ex.InnerException : ex;
-    }
-});
-uiThread.SetApartmentState(ApartmentState.STA);
-uiThread.Start();
-uiThread.Join();
-if (uiConstructionError != null)
-    throw new InvalidOperationException("StrategyCenterForm 數值欄位建構失敗", uiConstructionError);
+        try
+        {
+            using var form = new StrategyCenterForm();
+            NumericUpDown number = (NumericUpDown)(typeof(StrategyCenterForm).GetField(
+                "_mlWindow", BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(form)
+                ?? throw new MissingFieldException(nameof(StrategyCenterForm), "_mlWindow"));
+            Assert(number.Value == 1000m && number.Minimum == 50m && number.Maximum == 60000m,
+                "策略中心數值欄位的預設值或範圍錯誤");
+        }
+        catch (Exception ex)
+        {
+            uiConstructionError = ex is TargetInvocationException { InnerException: not null } ? ex.InnerException : ex;
+        }
+    });
+    uiThread.SetApartmentState(ApartmentState.STA);
+    uiThread.Start();
+    uiThread.Join();
+    if (uiConstructionError != null)
+        throw new InvalidOperationException("StrategyCenterForm 數值欄位建構失敗", uiConstructionError);
+}
 
 Console.WriteLine("Strategy framework smoke tests passed.");
 
-if (args.Length > 0)
-    await RunActualMarketReplay(args[0]);
+string? replayPath = args.FirstOrDefault(argument => !argument.StartsWith("--", StringComparison.Ordinal));
+if (replayPath != null)
+    await RunActualMarketReplay(replayPath);
 
 static ResolvedProduct Product(string productId, string symbol, decimal tick, decimal multiplier) => new()
 { ProductId = productId, Symbol = symbol, TickSize = tick, ContractMultiplier = multiplier, TickType = TickTypeEnum.tt1 };
@@ -1668,6 +1782,85 @@ static MarketEvent FiveLevelTrade(string symbol, decimal bid, decimal ask, int b
     BidQuantities = Enumerable.Repeat(bidQuantity, 5).ToArray(),
     AskQuantities = Enumerable.Repeat(askQuantity, 5).ToArray()
 };
+
+static void TestPairedPaper()
+{
+    DateTimeOffset t0 = new(2026, 9, 24, 8, 0, 0, TimeSpan.FromHours(8));
+    var broker = new CrossPricePaperExecutionService(36m);
+    var ledger = new PaperPortfolioLedger();
+    ledger.RegisterProduct("MR-pair", 1, Product("225MC", "MC-PAIR", 5m, 10m));
+    var fills = new List<ExecutionEvent>();
+    broker.Filled += fill => { fills.Add(fill); ledger.ApplyExecution(fill); };
+    var buy = broker.Submit(new PaperOrderRequest
+    {
+        StrategyInstanceId = "MR-pair", StrategyRunGeneration = 1, CycleId = "cycle-1",
+        PairId = "pair-1", RestingPairMode = RestingPairMode.OppositeLegIsExit,
+        OcoGroupId = "existing-oco", ClientOrderId = "pair-buy", Symbol = "MC-PAIR",
+        Side = BuySell.Buy, Type = PaperOrderType.BrokerLimit,
+        Role = PaperOrderRole.EntryLong, Price = 95m, Quantity = 1
+    }, t0);
+    var sell = broker.Submit(new PaperOrderRequest
+    {
+        StrategyInstanceId = "MR-pair", StrategyRunGeneration = 1, CycleId = "cycle-1",
+        PairId = "pair-1", RestingPairMode = RestingPairMode.OppositeLegIsExit,
+        OcoGroupId = "existing-oco", ClientOrderId = "pair-sell", Symbol = "MC-PAIR",
+        Side = BuySell.Sell, Type = PaperOrderType.BrokerLimit,
+        Role = PaperOrderRole.EntryShort, Price = 105m, Quantity = 1
+    }, t0);
+    broker.OnMarketEvent(Trade("MC-PAIR", "225MC", 95m, 1, t0.AddSeconds(1)));
+    Assert(fills.Count == 0, "touching the paired buy limit must not fill");
+    broker.OnMarketEvent(Trade("MC-PAIR", "225MC", 90m, 2, t0.AddSeconds(2)));
+    Assert(fills.Count == 1 && broker.GetWorkingOrders("MR-pair").Single().OrderId == sell.OrderId,
+        "first buy fill must leave the exact original opposite order resting");
+    broker.OnMarketEvent(Trade("MC-PAIR", "225MC", 105m, 3, t0.AddSeconds(3)));
+    Assert(fills.Count == 1, "touching the original sell limit must not fill");
+    broker.OnMarketEvent(Trade("MC-PAIR", "225MC", 110m, 4, t0.AddSeconds(4)));
+    Assert(fills.Count == 2 && fills[0].OrderId == buy.OrderId &&
+           fills[1].OrderId == sell.OrderId && fills[1].ClientOrderId == "pair-sell" &&
+           fills[1].Role == PaperOrderRole.TakeProfit &&
+           fills[1].OriginalOrderRole == PaperOrderRole.EntryShort,
+        "the original sell broker order must be the only effective limit exit");
+    PositionSnapshot position = ledger.GetPosition("MR-pair", 1, "MC-PAIR");
+    Assert(position.NetQuantity == 0 && position.CompletedTrades == 1 &&
+           position.RealizedPnl == 100m && position.Costs == 72m && position.NetPnl == 28m,
+        "shared ledger must value two limit fills with 225MC multiplier and two JPY36 fees");
+    var stopSource = new FakeSource();
+    using (var stopHost = new StrategyHost(stopSource))
+    {
+        var stopFills = new List<ExecutionEvent>();
+        stopHost.ExecutionOccurred += stopFills.Add;
+        stopHost.Add(new MeanReversionScalperStrategy(new StrategyDefinition
+        {
+            StrategyType = MeanReversionScalperFactory.TypeName,
+            InstanceId = "MR-pair-stop",
+            Parameters = new Dictionary<string, string>
+            {
+                ["HorizonSeconds"] = "10", ["F"] = "0.75", ["K"] = "1.2",
+                ["MinimumRangeTicks"] = "1", ["CooldownSeconds"] = "30"
+            }
+        }), new ResolvedStrategyUniverse { Tradable = Product("225MC", "MC-STOP", 5m, 10m) }, 36m);
+        stopSource.Emit(Trade("MC-STOP", "225MC", 100m, 1, t0, 95m, 105m));
+        stopSource.Emit(Trade("MC-STOP", "225MC", 120m, 2, t0.AddSeconds(10), 115m, 125m));
+        stopSource.Emit(Trade("MC-STOP", "225MC", 105m, 3, t0.AddSeconds(11), 100m, 110m));
+        stopSource.Emit(Trade("MC-STOP", "225MC", 100m, 4, t0.AddSeconds(12), 95m, 105m));
+        Assert(stopFills.Count == 2 && stopFills[0].Role == PaperOrderRole.EntryLong &&
+               stopFills[1].Role == PaperOrderRole.StopLoss &&
+               stopHost.GetSnapshots().Single().Position == 0,
+            "Paper stop must close the owned position without booking the opposite resting limit.");
+    }
+    string recordPath = Path.Combine(Path.GetTempPath(), "kgi-pair-record-" + Guid.NewGuid().ToString("N"));
+    try
+    {
+        using (var recorder = new SimulationRunRecorder(recordPath))
+            foreach (ExecutionEvent fill in fills) recorder.Record(fill);
+        string[] records = File.ReadAllLines(Path.Combine(recordPath, "executions.csv"));
+        Assert(records[0].Contains("pairId,originalOrderRole,effectiveRole,executionId", StringComparison.Ordinal) &&
+               records[2].Contains("\"pair-1\",\"EntryShort\",TakeProfit,\"SIM-FILL-", StringComparison.Ordinal),
+            "append-only execution record must retain pair identity and original versus effective fill roles");
+    }
+    finally { if (Directory.Exists(recordPath)) Directory.Delete(recordPath, recursive: true); }
+    Console.WriteLine("PASS paired paper");
+}
 
 static void Assert(bool condition, string message)
 {

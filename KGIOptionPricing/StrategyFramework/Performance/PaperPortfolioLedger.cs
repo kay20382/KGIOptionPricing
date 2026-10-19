@@ -20,6 +20,11 @@ public sealed class PaperPortfolioLedger : IStrategyPerformanceView
         public decimal Costs;
         public decimal Multiplier = 1m;
         public int CompletedTrades;
+        public int TotalTradedQuantity;
+        public decimal CompletedNetPnl;
+        public decimal CycleGross, CycleCosts;
+        public int CycleClosedQuantity;
+        public readonly List<decimal> CompletedNetPoints = new();
     }
 
     private readonly object _sync = new();
@@ -65,6 +70,22 @@ public sealed class PaperPortfolioLedger : IStrategyPerformanceView
             Position position = GetOrCreate(execution.StrategyInstanceId, execution.StrategyRunGeneration, execution.Symbol);
             int signed = execution.Side == BuySell.Buy ? execution.Quantity : -execution.Quantity;
             int oldQuantity = position.Quantity;
+            if(execution.Quantity<=0) throw new ArgumentOutOfRangeException(nameof(execution.Quantity));
+            position.TotalTradedQuantity+=execution.Quantity;
+            if(oldQuantity==0 || Math.Sign(oldQuantity)==Math.Sign(signed)) position.CycleCosts+=execution.Commission;
+            else
+            {
+                int closed=Math.Min(Math.Abs(oldQuantity),execution.Quantity);
+                decimal closingCost=execution.Commission*closed/execution.Quantity;
+                position.CycleGross+=(execution.Price-position.AveragePrice)*Math.Sign(oldQuantity)*closed*position.Multiplier;
+                position.CycleCosts+=closingCost;position.CycleClosedQuantity+=closed;
+                if(execution.Quantity>=Math.Abs(oldQuantity))
+                {
+                    position.CompletedNetPnl+=position.CycleGross-position.CycleCosts;
+                    position.CompletedNetPoints.Add((position.CycleGross-position.CycleCosts)/(position.CycleClosedQuantity*position.Multiplier));
+                    position.CycleGross=0;position.CycleClosedQuantity=0;position.CycleCosts=execution.Commission-closingCost;
+                }
+            }
 
             if (oldQuantity == 0 || Math.Sign(oldQuantity) == Math.Sign(signed))
             {
@@ -139,32 +160,6 @@ public sealed class PaperPortfolioLedger : IStrategyPerformanceView
             .Select(x => Snapshot(x.Key.Instance, x.Key.Generation, x.Key.Symbol, x.Value)).ToArray();
     }
 
-    public PaperPortfolioCheckpoint Capture()
-    {
-        lock (_sync) return new PaperPortfolioCheckpoint(
-            _positions.Select(x => new PaperPositionCheckpoint(x.Key.Instance, x.Key.Generation, x.Key.Symbol,
-                x.Value.Quantity, x.Value.AveragePrice, x.Value.MarkPrice, x.Value.Realized, x.Value.Costs,
-                x.Value.Multiplier, x.Value.CompletedTrades)).ToArray(),
-            _processedExecutionIds.ToArray(), new Dictionary<string, int>(_executionWatermarks));
-    }
-
-    public void Restore(PaperPortfolioCheckpoint checkpoint)
-    {
-        ArgumentNullException.ThrowIfNull(checkpoint);
-        lock (_sync)
-        {
-            _positions.Clear(); _processedExecutionIds.Clear(); _executionWatermarks.Clear();
-            foreach (PaperPositionCheckpoint saved in checkpoint.Positions)
-                _positions[(saved.StrategyInstanceId, saved.StrategyRunGeneration, saved.Symbol)] = new Position
-                {
-                    Quantity = saved.Quantity, AveragePrice = saved.AveragePrice, MarkPrice = saved.MarkPrice,
-                    Realized = saved.Realized, Costs = saved.Costs, Multiplier = saved.Multiplier, CompletedTrades = saved.CompletedTrades
-                };
-            foreach (string id in checkpoint.ProcessedExecutionIds) _processedExecutionIds.Add(id);
-            foreach (var item in checkpoint.ExecutionWatermarks) _executionWatermarks[item.Key] = item.Value;
-        }
-    }
-
     public IReadOnlyList<PositionSnapshot> GetStrategyPositions(string strategyInstanceId)
     {
         lock (_sync)
@@ -181,6 +176,17 @@ public sealed class PaperPortfolioLedger : IStrategyPerformanceView
 
     internal void RemoveFlatInstance(string strategyInstanceId, long strategyRunGeneration)
         => RemoveFlatInstance(strategyInstanceId, (long?)strategyRunGeneration);
+
+    internal void RemoveRetiredInstance(string strategyInstanceId, long strategyRunGeneration)
+    {
+        lock (_sync)
+        {
+            foreach (var key in _positions.Keys
+                         .Where(x => string.Equals(x.Instance, strategyInstanceId, StringComparison.OrdinalIgnoreCase) &&
+                                     x.Generation == strategyRunGeneration).ToArray())
+                _positions.Remove(key);
+        }
+    }
 
     private void RemoveFlatInstance(string strategyInstanceId, long? strategyRunGeneration)
     {
@@ -228,12 +234,14 @@ public sealed class PaperPortfolioLedger : IStrategyPerformanceView
             RealizedPnl = position.Realized,
             UnrealizedPnl = unrealized,
             Costs = position.Costs,
+            TotalTradedQuantity = position.TotalTradedQuantity,
+            ExpectedPnlPerTrade = position.CompletedTrades==0?null:position.CompletedNetPnl/position.CompletedTrades,
             CompletedTrades = position.CompletedTrades
+            ,WinRate = position.CompletedNetPoints.Count==0?null:100m*position.CompletedNetPoints.Count(x=>x>0)/position.CompletedNetPoints.Count
+            ,AverageWinningPoints = position.CompletedNetPoints.Where(x=>x>0).Cast<decimal?>().DefaultIfEmpty(null).Average()
+            ,AverageLosingPoints = position.CompletedNetPoints.Where(x=>x<0).Cast<decimal?>().DefaultIfEmpty(null).Average()
+            ,UserDefinedProfitFactor = position.CompletedNetPoints.Any(x=>x>0) && position.CompletedNetPoints.Any(x=>x<0)
+                ? -position.CompletedNetPoints.Where(x=>x>0).Average()/position.CompletedNetPoints.Where(x=>x<0).Average():null
         };
     }
 }
-
-public sealed record PaperPositionCheckpoint(string StrategyInstanceId, long StrategyRunGeneration, string Symbol,
-    int Quantity, decimal AveragePrice, decimal MarkPrice, decimal Realized, decimal Costs, decimal Multiplier, int CompletedTrades);
-public sealed record PaperPortfolioCheckpoint(IReadOnlyList<PaperPositionCheckpoint> Positions,
-    IReadOnlyList<string> ProcessedExecutionIds, IReadOnlyDictionary<string, int> ExecutionWatermarks);

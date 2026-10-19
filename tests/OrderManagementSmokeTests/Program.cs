@@ -4,8 +4,237 @@ using KGIOptionPricing.OrderManagement.Core;
 using KGIOptionPricing.OrderManagement.Gateway;
 using KGIOptionPricing.OrderManagement.Storage;
 using KGIOptionPricing.Strategies.PeriodicQueueCycle;
+using KGIOptionPricing.Strategies.MeanReversionScalper;
 using KGIOptionPricing.StrategyFramework;
 using KGIOptionPricing.StrategyFramework.Execution;
+
+TestForeignCancelWaitsForBrokerIdentity();
+TestForeignCancelReportsIncompleteAcceptedIdentity();
+TestManagedRestingPair();
+TestLiveRestingPair();
+TestLiveRestingPairStop();
+TestRestingPairRecoveryHalt();
+TestLiveRestingPairSecondRejected();
+
+var ocoKey = new LiveStrategyOcoKey("oco-owner", 4, "cycle-1");
+var ocoCoordinator = new ManagedStrategyOcoCoordinator();
+var entrySubmitActions = ocoCoordinator.Apply(new ManagedStrategyOcoEvent(
+    ocoKey, ManagedStrategyOcoEventKind.EntrySubmitted, "entry-long", "broker-long",
+    PaperOrderRole.EntryLong, 0, null, false, 1, DateTimeOffset.UtcNow));
+Assert(entrySubmitActions.Any(action => action.Kind == ManagedStrategyOcoActionKind.PersistState),
+    "OCO entry submission should persist its owner-scoped state");
+ocoCoordinator.Apply(new ManagedStrategyOcoEvent(
+    ocoKey, ManagedStrategyOcoEventKind.EntrySubmitted, "entry-short", "broker-short",
+    PaperOrderRole.EntryShort, 0, null, false, 2, DateTimeOffset.UtcNow));
+var entryFillActions = ocoCoordinator.Apply(new ManagedStrategyOcoEvent(
+    ocoKey, ManagedStrategyOcoEventKind.EntryFill, "entry-long", "broker-long",
+    PaperOrderRole.EntryLong, 1, null, false, 3, DateTimeOffset.UtcNow));
+Assert(entryFillActions.Any(action => action.Kind == ManagedStrategyOcoActionKind.CancelBrokerOrder &&
+                                      action.ClientOrderId == "entry-short"),
+    "first OCO entry fill should cancel only its opposite entry");
+var inlineRaceKey = new LiveStrategyOcoKey("inline-race", 1, "cycle-inline");
+ocoCoordinator.Apply(new ManagedStrategyOcoEvent(inlineRaceKey, ManagedStrategyOcoEventKind.EntryFill,
+    "inline-long", "broker-inline-long", PaperOrderRole.EntryLong, 1, null, false, 1, DateTimeOffset.UtcNow));
+var lateEntryActions = ocoCoordinator.Apply(new ManagedStrategyOcoEvent(inlineRaceKey,
+    ManagedStrategyOcoEventKind.EntrySubmitted, "inline-short", "broker-inline-short",
+    PaperOrderRole.EntryShort, 0, null, false, 2, DateTimeOffset.UtcNow));
+Assert(lateEntryActions.Any(action => action.Kind == ManagedStrategyOcoActionKind.CancelBrokerOrder &&
+                                      action.ClientOrderId == "inline-short"),
+    "entry submitted after an inline opposite fill must be cancelled immediately");
+var isolatedFillActions = ocoCoordinator.Apply(new ManagedStrategyOcoEvent(
+    new LiveStrategyOcoKey("another-owner", 4, "cycle-1"), ManagedStrategyOcoEventKind.EntryFill,
+    "other-entry", "broker-other", PaperOrderRole.EntryLong, 1, null, false, 3, DateTimeOffset.UtcNow));
+Assert(!isolatedFillActions.Any(action => action.Kind == ManagedStrategyOcoActionKind.CancelBrokerOrder),
+    "same cycle text under another strategy owner must not cancel an order");
+var stopKey = new LiveStrategyOcoKey("oco-stop", 2, "cycle-stop");
+ocoCoordinator.Apply(new ManagedStrategyOcoEvent(stopKey, ManagedStrategyOcoEventKind.TakeProfitSubmitted,
+    "take-profit", "broker-tp", PaperOrderRole.TakeProfit, 0, null, false, 0, DateTimeOffset.UtcNow));
+var stopActions = ocoCoordinator.Apply(new ManagedStrategyOcoEvent(stopKey, ManagedStrategyOcoEventKind.StopTriggered,
+    "stop-condition", string.Empty, PaperOrderRole.StopLoss, 1, null, false, 99, DateTimeOffset.UtcNow));
+Assert(stopActions.Any(action => action.Kind == ManagedStrategyOcoActionKind.CancelBrokerOrder && action.ClientOrderId == "take-profit") &&
+       !stopActions.Any(action => action.Kind == ManagedStrategyOcoActionKind.SubmitStopMarket),
+    "stop trigger must cancel take-profit and wait for its terminal acknowledgement");
+var stopSettledActions = ocoCoordinator.Apply(new ManagedStrategyOcoEvent(stopKey, ManagedStrategyOcoEventKind.CancelAccepted,
+    "take-profit", "broker-tp", PaperOrderRole.TakeProfit, 0, 0, true, 99, DateTimeOffset.UtcNow));
+Assert(stopSettledActions.Any(action => action.Kind == ManagedStrategyOcoActionKind.SubmitStopMarket && action.Quantity == 1),
+    "stop market may be submitted only after authoritative OCO cancellation settlement");
+var preTakeProfitKey = new LiveStrategyOcoKey("oco-pre-tp-stop", 1, "cycle-pre-tp");
+ocoCoordinator.Apply(new ManagedStrategyOcoEvent(preTakeProfitKey, ManagedStrategyOcoEventKind.EntrySubmitted,
+    "entry-long", "broker-long", PaperOrderRole.EntryLong, 0, null, false, 1, DateTimeOffset.UtcNow));
+ocoCoordinator.Apply(new ManagedStrategyOcoEvent(preTakeProfitKey, ManagedStrategyOcoEventKind.EntrySubmitted,
+    "entry-short", "broker-short", PaperOrderRole.EntryShort, 0, null, false, 2, DateTimeOffset.UtcNow));
+ocoCoordinator.Apply(new ManagedStrategyOcoEvent(preTakeProfitKey, ManagedStrategyOcoEventKind.EntryFill,
+    "entry-long", "broker-long", PaperOrderRole.EntryLong, 1, null, false, 3, DateTimeOffset.UtcNow));
+var preTpStopActions = ocoCoordinator.Apply(new ManagedStrategyOcoEvent(preTakeProfitKey,
+    ManagedStrategyOcoEventKind.StopTriggered, "local-stop", string.Empty, PaperOrderRole.StopLoss,
+    1, null, false, 4, DateTimeOffset.UtcNow));
+Assert(!preTpStopActions.Any(action => action.Kind == ManagedStrategyOcoActionKind.SubmitStopMarket),
+    "stop before take-profit placement must wait for the already-pending entry cancellation");
+var entryCancelSettledActions = ocoCoordinator.Apply(new ManagedStrategyOcoEvent(preTakeProfitKey,
+    ManagedStrategyOcoEventKind.EntryTerminal, "entry-short", "broker-short", PaperOrderRole.EntryShort,
+    0, 0, true, 4, DateTimeOffset.UtcNow));
+Assert(entryCancelSettledActions.Any(action => action.Kind == ManagedStrategyOcoActionKind.SubmitStopMarket && action.Quantity == 1),
+    "pre-take-profit stop may market-close only after opposite entry terminal watermark settles");
+var settledStopState = entryCancelSettledActions.Single(action => action.Kind == ManagedStrategyOcoActionKind.PersistState).State;
+var stopMarketCompleteActions = ocoCoordinator.Apply(new ManagedStrategyOcoEvent(preTakeProfitKey,
+    ManagedStrategyOcoEventKind.StopMarketResult, settledStopState.StopMarketClientOrderId, "broker-stop",
+    PaperOrderRole.StopLoss, 1, 1, true, 4, DateTimeOffset.UtcNow));
+Assert(stopMarketCompleteActions.Single(action => action.Kind == ManagedStrategyOcoActionKind.PersistState).State.Phase == LiveStrategyOcoPhase.Completed,
+    "a stop-market order with matching authoritative terminal fill watermark completes the OCO cycle");
+Assert(ocoCoordinator.Apply(new ManagedStrategyOcoEvent(preTakeProfitKey,
+    ManagedStrategyOcoEventKind.StopMarketResult, settledStopState.StopMarketClientOrderId, "broker-stop",
+    PaperOrderRole.StopLoss, 1, 1, true, 4, DateTimeOffset.UtcNow)).Count == 0,
+    "duplicate terminal stop-market reports must not alter completed state or submit again");
+var duplicateStopTriggerActions = ocoCoordinator.Apply(new ManagedStrategyOcoEvent(preTakeProfitKey,
+    ManagedStrategyOcoEventKind.StopTriggered, "local-stop", string.Empty, PaperOrderRole.StopLoss,
+    1, null, false, 5, DateTimeOffset.UtcNow));
+Assert(duplicateStopTriggerActions.Count == 0, "a completed OCO cycle must not submit another stop order");
+var unknownStopKey = new LiveStrategyOcoKey("oco-unknown-stop", 1, "cycle-unknown-stop");
+ocoCoordinator.Apply(new ManagedStrategyOcoEvent(unknownStopKey, ManagedStrategyOcoEventKind.TakeProfitSubmitted,
+    "take-profit", "broker-tp", PaperOrderRole.TakeProfit, 0, null, false, 0, DateTimeOffset.UtcNow));
+ocoCoordinator.Apply(new ManagedStrategyOcoEvent(unknownStopKey, ManagedStrategyOcoEventKind.StopTriggered,
+    "stop-condition", string.Empty, PaperOrderRole.StopLoss, 1, null, false, 1, DateTimeOffset.UtcNow));
+var unknownWatermarkActions = ocoCoordinator.Apply(new ManagedStrategyOcoEvent(unknownStopKey,
+    ManagedStrategyOcoEventKind.CancelAccepted, "take-profit", "broker-tp", PaperOrderRole.TakeProfit,
+    0, null, false, 1, DateTimeOffset.UtcNow));
+Assert(unknownWatermarkActions.Single(action => action.Kind == ManagedStrategyOcoActionKind.PersistState).State.Phase ==
+       LiveStrategyOcoPhase.ReconciliationRequired &&
+       !unknownWatermarkActions.Any(action => action.Kind == ManagedStrategyOcoActionKind.SubmitStopMarket),
+    "missing cancel terminal watermark must quarantine without stop-market submission");
+var partialTpKey = new LiveStrategyOcoKey("oco-partial-tp", 1, "cycle-partial-tp");
+ocoCoordinator.Apply(new ManagedStrategyOcoEvent(partialTpKey, ManagedStrategyOcoEventKind.TakeProfitSubmitted,
+    "partial-tp", "broker-partial-tp", PaperOrderRole.TakeProfit, 0, null, false, 0, DateTimeOffset.UtcNow));
+ocoCoordinator.Apply(new ManagedStrategyOcoEvent(partialTpKey, ManagedStrategyOcoEventKind.StopTriggered,
+    "stop-condition", string.Empty, PaperOrderRole.StopLoss, 2, null, false, 1, DateTimeOffset.UtcNow));
+var partialTpCancelActions = ocoCoordinator.Apply(new ManagedStrategyOcoEvent(partialTpKey,
+    ManagedStrategyOcoEventKind.CancelAccepted, "partial-tp", "broker-partial-tp", PaperOrderRole.TakeProfit,
+    1, 1, true, 1, DateTimeOffset.UtcNow));
+Assert(partialTpCancelActions.Single(action => action.Kind == ManagedStrategyOcoActionKind.SubmitStopMarket).Quantity == 1,
+    "take-profit partial fill must reduce stop-market quantity to the outstanding residual");
+var cancelRejectKey = new LiveStrategyOcoKey("oco-cancel-reject", 1, "cycle-cancel-reject");
+ocoCoordinator.Apply(new ManagedStrategyOcoEvent(cancelRejectKey, ManagedStrategyOcoEventKind.TakeProfitSubmitted,
+    "take-profit", "broker-tp", PaperOrderRole.TakeProfit, 0, null, false, 0, DateTimeOffset.UtcNow));
+ocoCoordinator.Apply(new ManagedStrategyOcoEvent(cancelRejectKey, ManagedStrategyOcoEventKind.StopTriggered,
+    "stop-condition", string.Empty, PaperOrderRole.StopLoss, 1, null, false, 1, DateTimeOffset.UtcNow));
+var cancelRejectedActions = ocoCoordinator.Apply(new ManagedStrategyOcoEvent(cancelRejectKey,
+    ManagedStrategyOcoEventKind.CancelRejected, "take-profit", "broker-tp", PaperOrderRole.TakeProfit,
+    0, null, false, 1, DateTimeOffset.UtcNow));
+Assert(cancelRejectedActions.Single(action => action.Kind == ManagedStrategyOcoActionKind.PersistState).State.Phase ==
+       LiveStrategyOcoPhase.ReconciliationRequired &&
+       !cancelRejectedActions.Any(action => action.Kind == ManagedStrategyOcoActionKind.SubmitStopMarket),
+    "take-profit cancel rejection must quarantine without sending a stop market order");
+var oppositeFillKey = new LiveStrategyOcoKey("oco-opposite-fill", 1, "cycle-opposite-fill");
+ocoCoordinator.Apply(new ManagedStrategyOcoEvent(oppositeFillKey, ManagedStrategyOcoEventKind.EntrySubmitted,
+    "entry-long", "broker-long", PaperOrderRole.EntryLong, 0, null, false, 1, DateTimeOffset.UtcNow));
+ocoCoordinator.Apply(new ManagedStrategyOcoEvent(oppositeFillKey, ManagedStrategyOcoEventKind.EntrySubmitted,
+    "entry-short", "broker-short", PaperOrderRole.EntryShort, 0, null, false, 2, DateTimeOffset.UtcNow));
+ocoCoordinator.Apply(new ManagedStrategyOcoEvent(oppositeFillKey, ManagedStrategyOcoEventKind.EntryFill,
+    "entry-long", "broker-long", PaperOrderRole.EntryLong, 1, null, false, 3, DateTimeOffset.UtcNow));
+var oppositeRaceActions = ocoCoordinator.Apply(new ManagedStrategyOcoEvent(oppositeFillKey,
+    ManagedStrategyOcoEventKind.EntryFill, "entry-short", "broker-short", PaperOrderRole.EntryShort,
+    1, null, false, 4, DateTimeOffset.UtcNow));
+Assert(oppositeRaceActions.Single(action => action.Kind == ManagedStrategyOcoActionKind.PersistState).State.Phase ==
+       LiveStrategyOcoPhase.ReconciliationRequired &&
+       !oppositeRaceActions.Any(action => action.Kind == ManagedStrategyOcoActionKind.SubmitStopMarket),
+    "fills on both opposing entries must require reconciliation instead of creating duplicate brackets");
+using (var ocoRouter = new LiveStrategyOrderRouter(new FakeLiveStrategyOrderGateway(), new LiveOrderOwnershipRegistry()))
+using (var ocoOwnerFacade = (IDisposable)ocoRouter.Register("oco-owner-a", 7))
+{
+    var otherOwnerFacade = ocoRouter.Register("oco-owner-b", 7);
+    var ownerApi = (ILiveStrategyOrderGateway)ocoOwnerFacade;
+    ownerApi.AppendOcoState(new LiveStrategyOcoGroupState
+    {
+        Key = new LiveStrategyOcoKey("oco-owner-a", 7, "cycle-scope"),
+        Phase = LiveStrategyOcoPhase.EntryWorking,
+        UpdatedAt = DateTimeOffset.UtcNow
+    });
+    Assert(ownerApi.GetOcoStates("oco-owner-a", 7).Count == 1 &&
+           otherOwnerFacade.GetOcoStates("oco-owner-b", 7).Count == 0,
+        "routed OCO state must remain isolated by strategy instance and generation");
+    AssertThrows<InvalidOperationException>(() => otherOwnerFacade.AppendOcoState(new LiveStrategyOcoGroupState
+    {
+        Key = new LiveStrategyOcoKey("oco-owner-a", 7, "cycle-scope"),
+        Phase = LiveStrategyOcoPhase.EntryWorking,
+        UpdatedAt = DateTimeOffset.UtcNow
+    }), "a different strategy facade must not persist another owner's OCO state");
+    var routedPair = new ManagedRestingPairCoordinator();
+    var routedPairKey = new RestingPairKey("oco-owner-a", 7, "cycle-pair", "pair-1");
+    routedPair.RegisterLeg(routedPairKey, "pair-buy", "real-buy", BuySell.Buy, PaperOrderRole.EntryLong);
+    routedPair.RegisterLeg(routedPairKey, "pair-sell", "real-sell", BuySell.Sell, PaperOrderRole.EntryShort);
+    RestingPairSnapshot routedSnapshot = routedPair.Snapshot(routedPairKey);
+    ownerApi.AppendRestingPairState(routedSnapshot);
+    Assert(ownerApi.GetRestingPairStates("oco-owner-a", 7).Single().Key == routedPairKey,
+        "pair state must be journaled under its exact strategy owner");
+    AssertThrows<InvalidOperationException>(() => otherOwnerFacade.AppendRestingPairState(routedSnapshot),
+        "another strategy facade must not journal this pair");
+}
+
+// A new process starts with no strategy trade routes; current-session aliases and
+// execution ids still isolate and deduplicate broker callbacks.
+var ownership = new LiveOrderOwnershipRegistry();
+var ownershipKey = new LiveOrderOwnerKey("session-a", 42, "entry-1");
+ownership.Prepare(new LiveOrderOwnership
+{
+    Key = ownershipKey, Account = "TEST", Symbol = "225MC-Z26", CycleId = "cycle-1", Quantity = 2
+});
+ownership.BindAlias(ownershipKey, new BrokerOrderAlias("TEST", "20260924", "OrderId", "broker-1"));
+Assert(ownership.TryAcceptFill(ownershipKey, "exec-1", 1).Accepted &&
+       !ownership.TryAcceptFill(ownershipKey, "exec-1", 1).Accepted &&
+       ownership.Snapshot().Routes.Single().CumulativeFilledQuantity == 1,
+    "current-session fill identity and cumulative quantity must remain consistent");
+Assert(new LiveOrderOwnershipRegistry().Snapshot().Routes.Count == 0,
+    "a new session must not replay strategy trade routes");
+
+// A disk-backed registry must retain order ownership, fill deduplication and
+// an unreconciled retired strategy across process restart.
+string durableOwnershipPath = Path.Combine(Path.GetTempPath(), "KGIOptionPricing_OwnershipTests", Guid.NewGuid().ToString("N"));
+var durableRegistry = new LiveOrderOwnershipRegistry(durableOwnershipPath);
+var durableKey = new LiveOrderOwnerKey("retired-a", 7, "entry-a");
+durableRegistry.Prepare(new LiveOrderOwnership
+{
+    Key = durableKey, Account = "TEST", Symbol = "225MC-Z26", CycleId = "cycle-a", Quantity = 1
+});
+durableRegistry.BindAlias(durableKey, new BrokerOrderAlias("TEST", "20260926", "OrderId", "broker-a"));
+durableRegistry.TryAcceptFill(durableKey, "fill-a", 1);
+durableRegistry.AppendRetirement(new LiveStrategyRetirement("retired-a", 7, "TEST", "225MC-Z26",
+    DateTimeOffset.UtcNow, -1, -2350m, 150m, 1404m, 0, false));
+var unresolvedKey = new LiveOrderOwnerKey("restart-open", 8, "entry-open");
+durableRegistry.Prepare(new LiveOrderOwnership
+{
+    Key = unresolvedKey, Account = "TEST", Symbol = "225MC-Z26", CycleId = "cycle-open", Quantity = 1
+});
+var reloadedRegistry = new LiveOrderOwnershipRegistry(durableOwnershipPath);
+// Fresh-session mode must ignore even an existing unresolved journal and never append to it.
+string legacyJournal = Path.Combine(durableOwnershipPath, "ownership.jsonl");
+byte[] legacyBeforeSession = File.ReadAllBytes(legacyJournal);
+var freshSession = new LiveOrderOwnershipRegistry(durableOwnershipPath, sessionOnly: true);
+Assert(freshSession.Snapshot().Routes.Count == 0 && freshSession.Snapshot().QuarantinedEvents.Count == 0,
+    "fresh startup must not restore old orders or quarantine even when an old journal exists");
+var freshOwner = new LiveOrderOwnerKey("fresh-session", 1, "fresh-order");
+freshSession.Prepare(new LiveOrderOwnership { Key = freshOwner, Account = "TEST", Symbol = "225MC", Quantity = 1 });
+freshSession.MarkSubmissionUnknown(freshOwner, "current-session uncertainty");
+Assert(freshSession.Snapshot().Routes.Single().SubmissionState == StrategySubmissionState.Unknown &&
+       new LiveOrderOwnershipRegistry(durableOwnershipPath, sessionOnly: true).Snapshot().Routes.Count == 0 &&
+       File.ReadAllBytes(legacyJournal).SequenceEqual(legacyBeforeSession),
+    "current-session ownership remains tracked but a new session starts empty without changing old journal files");
+Assert(reloadedRegistry.Snapshot().Routes.Any(x => x.Key == durableKey) &&
+       reloadedRegistry.Snapshot().Routes.Single(x => x.Key == unresolvedKey).SubmissionState == StrategySubmissionState.Unknown &&
+       reloadedRegistry.Snapshot().Aliases.Values.Single() == durableKey &&
+       !reloadedRegistry.TryAcceptFill(durableKey, "fill-a", 1).Accepted &&
+       reloadedRegistry.Snapshot().Retirements.Single().Position == -1,
+    "restart must retain original owner, fill dedup and unreconciled retired position");
+reloadedRegistry.ConfirmPriorProcessOrders("TEST", "225MC-Z26", new[] { unresolvedKey });
+var confirmedRegistry = new LiveOrderOwnershipRegistry(durableOwnershipPath);
+Assert(confirmedRegistry.Snapshot().Routes.Single(x => x.Key == unresolvedKey).PriorProcessReconciled &&
+       confirmedRegistry.Snapshot().Routes.Single(x => x.Key == durableKey).CumulativeFilledQuantity == 1,
+    "manual prior-process confirmation must survive restart and preserve original ownership and fills");
+AssertThrows<InvalidOperationException>(() => confirmedRegistry.ConfirmPriorProcessOrders(
+    "OTHER", "225MC-Z26", new[] { unresolvedKey }), "confirmation must not cross account boundaries");
+confirmedRegistry.MarkSubmissionUnknown(unresolvedKey, "new uncertainty");
+Assert(!confirmedRegistry.Snapshot().Routes.Single(x => x.Key == unresolvedKey).PriorProcessReconciled,
+    "new uncertainty must invalidate prior manual confirmation");
+AssertThrows<InvalidOperationException>(() => confirmedRegistry.ConfirmPriorProcessOrders(
+    "TEST", "225MC-Z26", new[] { unresolvedKey }), "current-session uncertainty cannot use prior-process confirmation");
 
 string storagePath = Path.Combine(Path.GetTempPath(), "KGIOptionPricing_OrderTests", Guid.NewGuid().ToString("N"));
 var gateway = new FakeGateway();
@@ -73,7 +302,7 @@ manager.PlaceOrder(new OrderRequest
     Price = 62000,
     Quantity = 1,
     BrokerId = "F004000",
-    Account = "9819113"
+    Account = "TESTACCOUNT"
 });
 gateway.Emit(new OrderEvent
 {
@@ -395,9 +624,9 @@ OrderRequest mappedBuy = LiveStrategyOrderMapper.CreateBrokerLimit(
     liveBuy, liveInstrument, "BRK", "ACC", "REAL-1");
 Assert(mappedBuy.Instrument == liveInstrument && mappedBuy.BuySell == BuySell.Buy &&
        mappedBuy.Price == 65000d && mappedBuy.TimeInForce == TimeInForce.ROD &&
-       mappedBuy.PositionEffect == PositionEffect.Auto && mappedBuy.Quantity == 1 &&
+       mappedBuy.PositionEffect == PositionEffect.Open && mappedBuy.Quantity == 1 &&
        mappedBuy.BrokerId == "BRK" && mappedBuy.Account == "ACC" && mappedBuy.OrderId == "REAL-1",
-    "BrokerLimit 買單必須成為一口、正價格、Auto 的 ROD 限價單並保留券商識別");
+    "BrokerLimit 買單必須依帳戶淨部位解析為 Open、固定一口並保留 ROD 與券商識別");
 
 OrderRequest mappedSell = LiveStrategyOrderMapper.CreateBrokerLimit(
     liveBuy with { ClientOrderId = "cycle-1-sell-g1", Side = BuySell.Sell, Price = 65005m },
@@ -406,6 +635,122 @@ Assert(mappedSell.BuySell == BuySell.Sell && mappedSell.Price == 65005d &&
        mappedSell.TimeInForce == TimeInForce.ROD && mappedSell.Quantity == 1 &&
        mappedSell.OrderId == "REAL-2",
     "BrokerLimit 賣單必須保留方向、限價與真實委託識別");
+
+// A quarantined account/product blocks the router before it calls the broker.
+var sessionRegistry = new LiveOrderOwnershipRegistry(sessionOnly: true);
+var sessionGateway = new FakeLiveStrategyOrderGateway();
+using (var sessionRouter = new LiveStrategyOrderRouter(sessionGateway, sessionRegistry))
+{
+    sessionGateway.PlaceOrder(mappedBuy); // Represents a broker recovery/manual order, not submitted by this router.
+    Assert(sessionRegistry.Snapshot().QuarantinedEvents.Count == 0 && sessionRegistry.Snapshot().Routes.Count == 0,
+        "unowned broker recovery events must not recreate prior-session strategy locks or positions");
+    var sessionFacade = sessionRouter.Register("fresh-router", 12);
+    sessionFacade.PlaceOrder(LiveStrategyOrderMapper.CreateBrokerLimit(liveBuy with
+        { StrategyInstanceId = "fresh-router", StrategyRunGeneration = 12, ClientOrderId = "session-buy", CycleId = "session-cycle" },
+        liveInstrument, "BRK", "ACC", "SESSION-1"));
+    Assert(sessionRegistry.Snapshot().Routes.Single().Key == new LiveOrderOwnerKey("fresh-router", 12, "session-buy"),
+        "fresh-session routing must retain exact ownership for new orders");
+    sessionRegistry.MarkSubmissionUnknown(new("fresh-router", 12, "session-buy"), "current-session unknown");
+    AssertThrows<BrokerReconciliationRequiredException>(() => sessionFacade.PlaceOrder(
+        LiveStrategyOrderMapper.CreateBrokerLimit(liveBuy with
+        { StrategyInstanceId = "fresh-router", StrategyRunGeneration = 12, ClientOrderId = "session-next", CycleId = "session-cycle" },
+        liveInstrument, "BRK", "ACC", "SESSION-2")),
+        "fresh startup must not disable current-session submission-unknown protection");
+    var conflictingOwner = new LiveOrderOwnerKey("other-current", 13, "other-current-buy");
+    sessionRegistry.Prepare(new LiveOrderOwnership
+        { Key = conflictingOwner, Account = "ACC", Symbol = "225MC", Quantity = 1 });
+    sessionRegistry.BindAlias(conflictingOwner, new("ACC", "20260930", "OrdNo", "ORD-REAL-1"));
+    sessionRegistry.BindAlias(new("fresh-router", 12, "session-buy"), new("ACC", "20260930", "OrderId", "REAL-1"));
+    sessionGateway.EmitState("REAL-1", OrderStatus.Accepted, 0, 1);
+    Assert(sessionRegistry.Snapshot().QuarantinedEvents.Count == 1,
+        "ambiguous aliases referencing current-session owners must still quarantine the broker event");
+}
+
+// The executor must not report a phantom active broker order for that attempt.
+var blockedRegistry = new LiveOrderOwnershipRegistry();
+var blockedUnresolvedKey = new LiveOrderOwnerKey("prior-live", 1, "prior-buy");
+blockedRegistry.Prepare(new LiveOrderOwnership
+{
+    Key = blockedUnresolvedKey, Account = "ACC", Symbol = "225MC",
+    CycleId = "prior-cycle", Role = PaperOrderRole.EntryLong, Quantity = 1
+});
+blockedRegistry.MarkSubmissionUnknown(blockedUnresolvedKey, "prior outcome unknown");
+var blockedGateway = new FakeLiveStrategyOrderGateway();
+using (var blockedRouter = new LiveStrategyOrderRouter(blockedGateway, blockedRegistry))
+{
+    var blockedExecution = CreateLiveService(blockedRouter.Register("blocked-live", 9), "blocked-live");
+    var blockedLifecycles = new List<OrderLifecycleEvent>();
+    blockedExecution.OrderLifecycleChanged += blockedLifecycles.Add;
+    AssertThrows<BrokerReconciliationRequiredException>(() => blockedExecution.Submit(
+        liveBuy with
+        {
+            StrategyInstanceId = "blocked-live", StrategyRunGeneration = 9,
+            ClientOrderId = "blocked-buy", CycleId = "blocked-cycle"
+        }, DateTimeOffset.UtcNow),
+        "quarantined product must reject an attempted fresh order");
+    Assert(blockedExecution.ActiveBrokerOrderCount == 0 &&
+           blockedExecution.QuarantinedBrokerOrderCount == 0 &&
+           blockedExecution.GetWorkingOrders("blocked-live").Count == 0 &&
+           blockedLifecycles.Any(x => x.ClientOrderId == "blocked-buy" &&
+               x.State == OrderLifecycleState.Rejected &&
+               x.ReasonDetail.Contains("unresolved submission", StringComparison.Ordinal)),
+        "pre-broker routing rejection must not appear as an active market order");
+    blockedExecution.Dispose();
+    var blockedMarket = CreateLiveService(blockedRouter.Register("blocked-market", 10), "blocked-market");
+    AssertThrows<BrokerReconciliationRequiredException>(() => blockedMarket.Submit(
+        liveBuy with { StrategyInstanceId = "blocked-market", StrategyRunGeneration = 10,
+            ClientOrderId = "blocked-market-exit", CycleId = "blocked-market-cycle",
+            Type = PaperOrderType.Market, Role = PaperOrderRole.Flatten }, DateTimeOffset.UtcNow),
+        "quarantined product must block a market exit before the broker call");
+    Assert(blockedMarket.ActiveBrokerOrderCount == 0 && blockedMarket.QuarantinedBrokerOrderCount == 0,
+        "a definitely unsent market exit must not leave a phantom broker order or settlement wait");
+    blockedMarket.Dispose();
+}
+
+PaperOrderRequest pairedBuy = liveBuy with
+{
+    StrategyRunGeneration = 3, CycleId = "cycle-pair", PairId = "pair-1",
+    RestingPairMode = RestingPairMode.OppositeLegIsExit
+};
+OrderRequest pairedBuyMapped = LiveStrategyOrderMapper.CreateBrokerLimit(
+    pairedBuy, liveInstrument, "BRK", "ACC", "PAIR-BUY", accountNetQuantity: -2,
+    capabilities: new StrategyExecutionCapabilities(AllowPairedRestingLive: true));
+OrderRequest pairedSellMapped = LiveStrategyOrderMapper.CreateBrokerLimit(
+    pairedBuy with { ClientOrderId = "pair-sell", Side = BuySell.Sell,
+        Role = PaperOrderRole.EntryShort, Price = 65010m },
+    liveInstrument, "BRK", "ACC", "PAIR-SELL", accountNetQuantity: 2,
+    capabilities: new StrategyExecutionCapabilities(AllowPairedRestingLive: true));
+Assert(pairedBuyMapped.PositionEffect == PositionEffect.Auto &&
+       pairedSellMapped.PositionEffect == PositionEffect.Auto &&
+       pairedBuyMapped.StrategyRoute?.ClientOrderId == pairedBuy.ClientOrderId &&
+       pairedSellMapped.StrategyRoute?.ClientOrderId == "pair-sell" &&
+       pairedBuyMapped.StrategyRoute?.PairId == "pair-1" &&
+       pairedSellMapped.StrategyRoute?.IsRestingPair == true,
+    "兩側預掛限價都要使用 Auto，且不能因帳戶反向淨部位改變策略歸屬");
+AssertThrows<ArgumentException>(() => LiveStrategyOrderMapper.CreateBrokerLimit(
+    pairedBuy, liveInstrument, "BRK", "ACC", "PAIR-DISABLED"),
+    "unverified paired-live mode must remain disabled by default");
+var meanReversionDefinition = new StrategyDefinition
+{
+    StrategyType = MeanReversionScalperFactory.TypeName,
+    InstanceId = "paired-live-opt-in"
+};
+var capabilityMethod = typeof(LiveStrategyService).GetMethod("FlowCapabilities",
+    BindingFlags.NonPublic | BindingFlags.Static) ?? throw new Exception("Missing live capability selection");
+var meanReversionCapabilities = (StrategyExecutionCapabilities)capabilityMethod.Invoke(null,
+    new object[] { meanReversionDefinition })!;
+OrderRequest optedInPair = LiveStrategyOrderMapper.CreateBrokerLimit(
+    pairedBuy, liveInstrument, "BRK", "ACC", "PAIR-OPT-IN", accountNetQuantity: -1,
+    capabilities: meanReversionCapabilities);
+Assert(optedInPair.PositionEffect == PositionEffect.Auto &&
+       optedInPair.StrategyRoute?.IsRestingPair == true &&
+       optedInPair.StrategyRoute.StrategyInstanceId == pairedBuy.StrategyInstanceId,
+    "MR live capability must accept a one-lot, attributed Auto resting pair");
+var otherCapabilities = (StrategyExecutionCapabilities)capabilityMethod.Invoke(null,
+    new object[] { meanReversionDefinition with { StrategyType = "WaveletScalper" } })!;
+AssertThrows<ArgumentException>(() => LiveStrategyOrderMapper.CreateBrokerLimit(
+    pairedBuy, liveInstrument, "BRK", "ACC", "PAIR-OTHER", capabilities: otherCapabilities),
+    "Opening MR live must not open paired live orders for other strategies");
 
 AssertThrows<ArgumentOutOfRangeException>(() => LiveStrategyOrderMapper.CreateBrokerLimit(
     liveBuy with { Quantity = 2 }, liveInstrument, "BRK", "ACC", "REAL-Q"),
@@ -481,6 +826,25 @@ using (var liveService = new KgiLiveStrategyExecutionService(
         _ = liveService.GetWorkingOrders("managed-live");
     };
     liveService.StateChanged += () => _ = liveService.GetWorkingOrders("managed-live");
+
+    PaperOrder localStop = liveService.Submit(liveBuy with
+    {
+        ClientOrderId = "local-stop-managed", Type = PaperOrderType.Stop,
+        Role = PaperOrderRole.StopLoss, Side = BuySell.Buy, Price = 65100m
+    }, DateTimeOffset.UtcNow);
+    Assert(liveService.LocalConditionCount == 1 &&
+           !liveService.CancelByClientOrderId("other-instance", "local-stop-managed") &&
+           liveService.CancelByClientOrderId("managed-live", "local-stop-managed") &&
+           !liveService.CancelByClientOrderId("managed-live", "local-stop-managed"),
+        "本機停損條件只能由原策略及精確 ClientOrderId 撤銷一次");
+    OrderLifecycleEvent localStopCancelled = managedLifecycles.Single(x =>
+        x.ClientOrderId == localStop.ClientOrderId && x.State == OrderLifecycleState.Cancelled);
+    Assert(localStopCancelled.HasFinalCumulativeFillWatermark &&
+           localStopCancelled.FilledQuantity == 0 &&
+           localStopCancelled.CycleId == localStop.CycleId &&
+           localStopCancelled.StrategyRunGeneration == localStop.StrategyRunGeneration &&
+           liveService.LocalConditionCount == 0,
+        "本機條件撤銷必須發出完整身分與零成交終態水位");
 
     PaperOrder managedBuy = liveService.Submit(liveBuy, DateTimeOffset.UtcNow);
     PaperOrder managedSell = liveService.Submit(
@@ -1168,6 +1532,66 @@ var atomicDefinition = new StrategyDefinition
         Tradable = new ProductSelection("225MC", "225MC"), References = Array.Empty<ProductSelection>()
     }
 };
+string priorScopePath = Path.Combine(Path.GetTempPath(), "KGIOptionPricing_OwnershipTests", Guid.NewGuid().ToString("N"));
+var priorScopeSeed = new LiveOrderOwnershipRegistry(priorScopePath);
+var priorScopeOwner = new LiveOrderOwnerKey("prior-scope", 3, "old-order");
+priorScopeSeed.Prepare(new LiveOrderOwnership { Key = priorScopeOwner, Account = "TEST", Symbol = "225MC", Quantity = 1 });
+var priorScopeRegistry = new LiveOrderOwnershipRegistry(priorScopePath);
+var priorScopeGateway = new FakeLiveStrategyOrderGateway { Account = "TEST" };
+var priorScopeLive = new LiveStrategyService(new StrategyHost(new FakeHostMarketSource()),
+    () => true, () => "TEST", _ => atomicUniverse,
+    definition => new HostManagedProbeStrategy(definition.InstanceId, "225MC"),
+    (definition, universe, commission) => CreateLiveService(priorScopeGateway, definition.InstanceId),
+    enableHeartbeat: false, routeRegistry: priorScopeRegistry);
+priorScopeLive.Add(atomicDefinition with { InstanceId = "confirm-current" }, 36m, 1000m);
+var priorScopeExpected = priorScopeLive.GetPriorProcessOrders("confirm-current");
+Assert(priorScopeExpected.SequenceEqual(new[] { priorScopeOwner }) &&
+       !priorScopeLive.ConfirmPriorProcessOrders("confirm-current", priorScopeExpected, out _),
+    "manual reconciliation must be scoped to the selected account/product and reject a running strategy");
+Assert(priorScopeLive.RequestOperatorClose("confirm-current", out _) &&
+       priorScopeLive.ConfirmPriorProcessOrders("confirm-current", priorScopeExpected, out _) &&
+       priorScopeGateway.PlaceOrderCount == 0 &&
+       priorScopeLive.GetSnapshots().Single().State == StrategyLifecycleState.Stopped &&
+       new LiveOrderOwnershipRegistry(priorScopePath).Snapshot().Routes.Single().PriorProcessReconciled,
+    "explicit prior-process confirmation must persist without submitting orders or restarting strategies");
+using (var confirmedRouter = new LiveStrategyOrderRouter(priorScopeGateway, priorScopeRegistry))
+{
+    var confirmedFacade = confirmedRouter.Register("new-after-confirm", 11);
+    confirmedFacade.PlaceOrder(LiveStrategyOrderMapper.CreateBrokerLimit(liveBuy with
+        { StrategyInstanceId = "new-after-confirm", StrategyRunGeneration = 11, CycleId = "new-cycle" },
+        liveInstrument, "BRK", "TEST", "AFTER-CONFIRM"));
+    Assert(priorScopeGateway.PlaceOrderCount == 1,
+        "a manually reconciled prior-process owner must no longer block a new independently owned order");
+}
+priorScopeLive.Dispose();
+
+string emptyScopePath = Path.Combine(Path.GetTempPath(), "KGIOptionPricing_OwnershipTests", Guid.NewGuid().ToString("N"));
+var emptyScopeSeed = new LiveOrderOwnershipRegistry(emptyScopePath);
+var emptyScopeOwner = new LiveOrderOwnerKey("deleted-prior", 4, "old-empty-order");
+emptyScopeSeed.Prepare(new LiveOrderOwnership { Key = emptyScopeOwner, Account = "TEST", Symbol = "225MC", Quantity = 1 });
+emptyScopeSeed.Prepare(new LiveOrderOwnership { Key = new("other-account", 4, "other-order"), Account = "OTHER", Symbol = "225MC", Quantity = 1 });
+var emptyScopeRegistry = new LiveOrderOwnershipRegistry(emptyScopePath);
+using (var emptyScopeLive = new LiveStrategyService(new StrategyHost(new FakeHostMarketSource()),
+    () => true, () => "TEST", _ => atomicUniverse,
+    definition => new HostManagedProbeStrategy(definition.InstanceId, "225MC"),
+    (definition, universe, commission) => throw new InvalidOperationException("Reconciliation must not create an executor"),
+    enableHeartbeat: false, routeRegistry: emptyScopeRegistry))
+{
+    Assert(emptyScopeLive.GetSnapshots().Count == 0 &&
+           emptyScopeLive.GetPriorProcessSymbols().SequenceEqual(new[] { "225MC" }),
+        "an empty strategy list must still expose prior-process products for the current account only");
+    var emptyOwners = emptyScopeLive.GetPriorProcessOrdersForSymbol("225MC");
+    Assert(emptyOwners.SequenceEqual(new[] { emptyScopeOwner }) &&
+           !emptyScopeLive.ConfirmPriorProcessOrdersForSymbol("wrong-symbol", emptyOwners, out _) &&
+           emptyScopeLive.ConfirmPriorProcessOrdersForSymbol("225MC", emptyOwners, out _) &&
+           emptyScopeLive.GetSnapshots().Count == 0 && emptyScopeLive.GetPriorProcessSymbols().Count == 0,
+        "manual confirmation without a strategy must validate the exact product and not create a strategy");
+    var emptyReload = new LiveOrderOwnershipRegistry(emptyScopePath).Snapshot();
+    Assert(emptyReload.Routes.Single(x => x.Account == "TEST").PriorProcessReconciled &&
+           !emptyReload.Routes.Single(x => x.Account == "OTHER").PriorProcessReconciled,
+        "empty-list confirmation must persist only the confirmed account's ownership");
+}
+
 Exception? atomicAddError = null;
 Task atomicAdd = Task.Factory.StartNew(() =>
 {
@@ -1225,6 +1649,120 @@ Assert(filledLive.RequestClose("live-filled-retained", true, out _),
     "Flatten fill 後必須可安全完成 retained cleanup");
 filledLive.Dispose();
 
+// Operator close must never treat a stale strategy position as authority to
+// submit another real trade after the broker account was flattened manually.
+var operatorHost = new StrategyHost(new FakeHostMarketSource());
+var operatorGateway = new FakeLiveStrategyOrderGateway { EmitFillBeforePlaceOrderRelease = true };
+string operatorJournalPath = Path.Combine(Path.GetTempPath(), "KGIOptionPricing_OwnershipTests", Guid.NewGuid().ToString("N"));
+var operatorRegistry = new LiveOrderOwnershipRegistry(operatorJournalPath);
+var operatorLive = new LiveStrategyService(
+    operatorHost, () => true, () => "TEST", _ => atomicUniverse,
+    definition => new ThrowAfterOrderStartStrategy(definition.InstanceId, "225MC"),
+    (definition, universe, commission) => CreateLiveService(operatorGateway, definition.InstanceId),
+    enableHeartbeat: false, routeRegistry: operatorRegistry);
+const string operatorId = "operator-manual-flat";
+AssertThrows<AggregateException>(() => operatorLive.Add(
+        atomicDefinition with { InstanceId = operatorId }, 36m, 1000m),
+    "operator close fixture must retain the already filled strategy position");
+operatorGateway.EmitFillBeforePlaceOrderRelease = false;
+int operatorPlacements = operatorGateway.PlaceOrderCount;
+operatorLive.RequestOperatorClose(operatorId, out _);
+operatorLive.Pulse(DateTimeOffset.UtcNow);
+Assert(operatorGateway.PlaceOrderCount == operatorPlacements &&
+       operatorLive.GetCloseStatus(operatorId).Position == 1,
+    "operator close must keep the historical ledger position without placing a flatten order");
+AssertThrows<InvalidOperationException>(
+    () => GetLiveExecution(operatorLive, operatorId).Flatten(1),
+    "operator close gate must reject a late risk flatten submission");
+Assert(operatorGateway.PlaceOrderCount == operatorPlacements,
+    "late flatten rejection must not cross the broker submission boundary");
+Assert(operatorLive.GetSnapshots().Single(x => x.InstanceId == operatorId).State == StrategyLifecycleState.Stopped,
+    "operator close should stop even with an unreconciled ledger position");
+Assert(operatorLive.RetireOperatorClosed(operatorId, out string retirementMessage) &&
+       !operatorLive.GetCloseStatus(operatorId).Exists,
+    "operator close must remove its stopped runner without placing another trade: " + retirementMessage);
+Assert(new LiveOrderOwnershipRegistry(operatorJournalPath).Snapshot().Retirements.Single().Position == 1,
+    "retired strategy must retain its unreconciled position durably");
+// A reference instrument has its own zero-position ledger row. Closing or
+// deleting must retire only the tradable position, not require a single row.
+var multiProductUniverse = atomicUniverse with
+{
+    References = new[] { new ResolvedProduct { ProductId = "225MF", Symbol = "225MF", TickSize = 5m, ContractMultiplier = 100m } }
+};
+var multiProductHost = new StrategyHost(new FakeHostMarketSource());
+var multiProductRegistry = new LiveOrderOwnershipRegistry(Path.Combine(
+    Path.GetTempPath(), "KGIOptionPricing_OwnershipTests", Guid.NewGuid().ToString("N")));
+var multiProductLive = new LiveStrategyService(
+    multiProductHost, () => true, () => "TEST", _ => multiProductUniverse,
+    definition => new HostManagedProbeStrategy(definition.InstanceId, "225MC"),
+    (definition, universe, commission) => CreateLiveService(new FakeLiveStrategyOrderGateway(), definition.InstanceId),
+    enableHeartbeat: false, routeRegistry: multiProductRegistry);
+const string multiProductId = "operator-multi-product";
+multiProductLive.Add(atomicDefinition with { InstanceId = multiProductId }, 36m, 1000m);
+Assert(multiProductLive.RequestOperatorDelete(multiProductId, out string multiProductMessage) &&
+       !multiProductLive.GetCloseStatus(multiProductId).Exists,
+    "operator delete must retire a strategy with reference products: " + multiProductMessage);
+Assert(multiProductRegistry.Snapshot().Retirements.Single().Symbol == "225MC",
+    "retirement must record the tradable product rather than a reference product");
+var closePrompt = LiveStrategyCenterForm.FormatOperatorClosePrompt("operator-manual-flat",
+    new LiveStrategyCloseStatus(true, -1, 0, 1831, 0, false, 0, false));
+Assert(closePrompt.Contains("1,831", StringComparison.Ordinal) &&
+       closePrompt.Contains("-1", StringComparison.Ordinal) &&
+       closePrompt.Contains("不會平倉", StringComparison.Ordinal),
+    "operator UI must separate terminal observations from active orders and warn without flattening");
+
+var ownedCloseHost = new StrategyHost(new FakeHostMarketSource());
+var ownedCloseGateway = new FakeLiveStrategyOrderGateway();
+var ownedCloseLive = new LiveStrategyService(
+    ownedCloseHost, () => true, () => "TEST", _ => atomicUniverse,
+    definition => new HostManagedProbeStrategy(definition.InstanceId, "225MC"),
+    (definition, universe, commission) => CreateLiveService(ownedCloseGateway, definition.InstanceId),
+    enableHeartbeat: false);
+ownedCloseLive.Add(atomicDefinition with { InstanceId = "owned-close-a" }, 36m, 1000m);
+ownedCloseLive.Add(atomicDefinition with { InstanceId = "owned-close-b" }, 36m, 1000m);
+PaperOrder ownedA = GetLiveExecution(ownedCloseLive, "owned-close-a").Submit(
+    liveBuy with { StrategyInstanceId = "owned-close-a", ClientOrderId = "owned-close-a-entry" }, DateTimeOffset.UtcNow);
+PaperOrder ownedB = GetLiveExecution(ownedCloseLive, "owned-close-b").Submit(
+    liveBuy with { StrategyInstanceId = "owned-close-b", ClientOrderId = "owned-close-b-entry" }, DateTimeOffset.UtcNow);
+Assert(!ownedCloseLive.RequestOperatorClose("owned-close-a", out _) &&
+       ownedCloseLive.GetCloseStatus("owned-close-a").ActiveBrokerOrders == 1 &&
+       ownedCloseLive.GetCloseStatus("owned-close-b").ActiveBrokerOrders == 1,
+    "operator close must wait for A's broker cancel acknowledgement without affecting B");
+ownedCloseGateway.EmitState(ownedA.OrderId, OrderStatus.Cancelled, 0, 0);
+ownedCloseLive.Pulse(DateTimeOffset.UtcNow);
+Assert(ownedCloseLive.GetSnapshots().Single(x => x.InstanceId == "owned-close-a").State == StrategyLifecycleState.Stopped &&
+       ownedCloseLive.GetCloseStatus("owned-close-a").QuarantinedBrokerOrders == 1 &&
+       ownedCloseLive.GetCloseStatus("owned-close-b").ActiveBrokerOrders == 1,
+    "terminal A order should permit stop despite late-fill observation; B must remain active");
+ownedCloseGateway.EmitState(ownedB.OrderId, OrderStatus.Cancelled, 0, 0);
+
+var deleteHost = new StrategyHost(new FakeHostMarketSource());
+var deleteGateway = new FakeLiveStrategyOrderGateway();
+var deleteLive = new LiveStrategyService(
+    deleteHost, () => true, () => "TEST", _ => atomicUniverse,
+    definition => new HostManagedProbeStrategy(definition.InstanceId, "225MC"),
+    (definition, universe, commission) => CreateLiveService(deleteGateway, definition.InstanceId),
+    enableHeartbeat: false);
+deleteLive.Add(atomicDefinition with { InstanceId = "delete-a" }, 36m, 1000m);
+deleteLive.Add(atomicDefinition with { InstanceId = "delete-b" }, 36m, 1000m);
+var retiredIds = new List<string>();
+deleteLive.StrategyRetired += retiredIds.Add;
+PaperOrder deleteA = GetLiveExecution(deleteLive, "delete-a").Submit(
+    liveBuy with { StrategyInstanceId = "delete-a", ClientOrderId = "delete-a-entry" }, DateTimeOffset.UtcNow);
+PaperOrder deleteB = GetLiveExecution(deleteLive, "delete-b").Submit(
+    liveBuy with { StrategyInstanceId = "delete-b", ClientOrderId = "delete-b-entry" }, DateTimeOffset.UtcNow);
+Assert(!deleteLive.RequestOperatorDelete("delete-a", out _) &&
+       deleteLive.GetCloseStatus("delete-a").ActiveBrokerOrders == 1 &&
+       deleteLive.GetCloseStatus("delete-b").ActiveBrokerOrders == 1,
+    "delete must wait for A's broker cancel confirmation without affecting B");
+deleteGateway.EmitState(deleteA.OrderId, OrderStatus.Cancelled, 0, 0);
+deleteLive.Pulse(DateTimeOffset.UtcNow);
+Assert(!deleteLive.GetCloseStatus("delete-a").Exists &&
+       deleteLive.GetCloseStatus("delete-b").ActiveBrokerOrders == 1 &&
+       retiredIds.SequenceEqual(new[] { "delete-a" }),
+    "confirmed cancellation must retire A automatically while B remains active");
+deleteGateway.EmitState(deleteB.OrderId, OrderStatus.Cancelled, 0, 0);
+
 var overfillHost = new StrategyHost(new FakeHostMarketSource());
 var overfillLiveGateway = new FakeLiveStrategyOrderGateway();
 var overfillLive = new LiveStrategyService(
@@ -1258,6 +1796,14 @@ var periodicProtocolClock = new MutableLiveClock(periodicProtocolStart);
 var periodicProtocolSource = new FakeHostMarketSource();
 var periodicProtocolHost = new StrategyHost(periodicProtocolSource, periodicProtocolClock);
 var periodicProtocolGateway = new FakeLiveStrategyOrderGateway();
+var closeDiagnosticLog = new log4net.Appender.MemoryAppender();
+log4net.Config.BasicConfigurator.Configure(
+    log4net.LogManager.GetRepository(typeof(LiveStrategyService).Assembly), closeDiagnosticLog);
+// Production file logging stays OFF. This test observes risk messages in memory only.
+var closeDiagnosticRepository = (log4net.Repository.Hierarchy.Hierarchy)
+    log4net.LogManager.GetRepository(typeof(LiveStrategyService).Assembly);
+closeDiagnosticRepository.Root.Level = log4net.Core.Level.All;
+closeDiagnosticRepository.RaiseConfigurationChanged(EventArgs.Empty);
 var periodicProtocolDefinition = new StrategyDefinition
 {
     StrategyType = PeriodicQueueCycleFactory.TypeName,
@@ -1303,6 +1849,62 @@ Assert(periodicProtocolStatus.ManualReconciliationRequired &&
     $"manual={periodicProtocolStatus.ManualReconciliationRequired}, state={periodicProtocolSnapshot.State}, " +
     $"place={periodicProtocolGateway.PlaceOrderCount}/{periodicPlacesAfterViolation}, " +
     $"cancel={periodicProtocolGateway.CancelOrderCount}/{periodicCancelsAfterViolation}");
+Assert(periodicProtocolStatus.ClosePending &&
+       periodicProtocolStatus.CloseReason.Contains("成交累計", StringComparison.Ordinal) &&
+       !periodicProtocolStatus.CloseReason.Contains("使用者暫停", StringComparison.Ordinal),
+    "自動風控關閉必須保留原始券商異常原因，不得顯示為使用者暫停");
+string[] closeDiagnosticMessages = closeDiagnosticLog.GetEvents()
+    .Where(x => x.LoggerName == typeof(LiveStrategyService).FullName)
+    .Select(x => x.RenderedMessage ?? string.Empty).ToArray();
+Assert(closeDiagnosticMessages.Any(x => x.Contains("RiskStopQueued", StringComparison.Ordinal) &&
+                                        x.Contains("periodic-protocol", StringComparison.Ordinal) &&
+                                        x.Contains("成交累計", StringComparison.Ordinal)) &&
+       closeDiagnosticMessages.Any(x => x.Contains("CloseRequested", StringComparison.Ordinal) &&
+                                        x.Contains("source=AutomaticRisk", StringComparison.Ordinal) &&
+                                        x.Contains("account=TEST", StringComparison.Ordinal) &&
+                                        x.Contains("position=", StringComparison.Ordinal) &&
+                                        x.Contains("activeBrokerOrders=", StringComparison.Ordinal)),
+    "自動關閉須寫入可追溯的風控來源、原始原因與委託／部位狀態日誌");
+
+var completedCycleClock = new MutableLiveClock(periodicProtocolStart);
+var completedCycleSource = new FakeHostMarketSource();
+var completedCycleGateway = new FakeLiveStrategyOrderGateway();
+using (var completedCycleLive = new LiveStrategyService(
+           new StrategyHost(completedCycleSource, completedCycleClock),
+           () => true, () => "TEST", _ => atomicUniverse,
+           definition => new PeriodicQueueCycleFactory().Create(definition),
+           (definition, universe, commission) => CreateLiveService(completedCycleGateway, definition.InstanceId),
+           enableHeartbeat: false))
+{
+    const string completedCycleId = "periodic-completed-cycle";
+    completedCycleLive.Add(periodicProtocolDefinition with { InstanceId = completedCycleId }, 36m, 1000m);
+    completedCycleSource.Emit(HealthyBook("225MC", 65000m, 1, periodicProtocolStart));
+    completedCycleClock.Now = periodicProtocolStart.AddSeconds(1);
+    completedCycleSource.Emit(HealthyBook("225MC", 65010m, 2, completedCycleClock.Now));
+    Assert(completedCycleGateway.Requests.Count == 2, "完成週期測試前置須有雙邊實盤委託");
+    string completedBuy = completedCycleGateway.Requests.Single(x => x.BuySell == BuySell.Buy).OrderId;
+    string completedSell = completedCycleGateway.Requests.Single(x => x.BuySell == BuySell.Sell).OrderId;
+    completedCycleGateway.EmitFill(completedBuy, 1, 0, OrderStatus.Filled, 1, 65000d);
+    completedCycleGateway.EmitFill(completedSell, 1, 0, OrderStatus.Filled, 1, 65020d);
+    StrategySnapshot completedCycleSnapshot = completedCycleLive.GetSnapshots().Single();
+    Assert(completedCycleSnapshot.CompletedTrades == 1 &&
+           completedCycleSnapshot.State == StrategyLifecycleState.Running &&
+           completedCycleSnapshot.Reason == "CoolingDown" &&
+           !completedCycleLive.GetCloseStatus(completedCycleId).ClosePending,
+        "正常雙邊成交應進入冷卻並保留運作，不得因完成一筆交易進入關閉流程");
+    string[] completedCycleLogs = closeDiagnosticLog.GetEvents()
+        .Where(x => x.LoggerName == typeof(LiveStrategyService).FullName)
+        .Select(x => x.RenderedMessage ?? string.Empty)
+        .Where(x => x.Contains(completedCycleId, StringComparison.Ordinal)).ToArray();
+    Assert(completedCycleLogs.Count(x => x.Contains("FillReceived", StringComparison.Ordinal) &&
+                                         x.Contains("clientOrderId=", StringComparison.Ordinal) &&
+                                         x.Contains("cycle=", StringComparison.Ordinal)) == 2 &&
+           completedCycleLogs.Count(x => x.Contains("OrderLifecycle", StringComparison.Ordinal) &&
+                                         x.Contains("state=Filled", StringComparison.Ordinal) &&
+                                         x.Contains("brokerOrderId=", StringComparison.Ordinal)) == 2 &&
+           !completedCycleLogs.Any(x => x.Contains("CloseRequested", StringComparison.Ordinal)),
+        "正常完整交易須留下可關聯的委託生命週期與成交紀錄，但不能出現關閉事件");
+}
 
 // The flatten token is the ownership gate: while the winning caller is still
 // inside the gateway, a concurrent close attempt must not submit a second exit.
@@ -1474,6 +2076,11 @@ AssertThrows<AggregateException>(() => startRiskLive.Add(startRiskDefinition, 36
 Assert(startRiskGateway.PlaceOrderCount == 2 &&
        startRiskLive.GetCloseStatus("live-start-risk").Position == 0,
     "Start lease 內 daily-loss snapshot 必須在 lease 退出後可靠觸發一次 EmergencyStop/Flatten");
+Assert(closeDiagnosticLog.GetEvents().Any(x =>
+           x.LoggerName == typeof(LiveStrategyService).FullName &&
+           (x.RenderedMessage ?? string.Empty).Contains("RiskStopQueued source=DailyLoss instance=live-start-risk",
+               StringComparison.Ordinal)),
+    "單日虧損風控日誌必須和執行失敗分開標記來源");
 Assert(startRiskLive.RequestClose("live-start-risk", true, out _),
     "延後風控 Flatten 歸零後 retained runner 必須可完成 close");
 startRiskLive.Dispose();
@@ -1654,7 +2261,8 @@ raceService.Dispose();
 
 // ClientOrderId ownership must retire with the exact safe resource. Fully
 // reconciled tombstones and unsent local conditions may release their ids;
-// quarantined broker orders must retain them indefinitely.
+// cancelled broker orders retain their ids only for the bounded late-fill
+// observation window.
 DateTimeOffset registryNow = new(2026, 9, 22, 0, 0, 0, TimeSpan.Zero);
 var registryGateway = new FakeLiveStrategyOrderGateway();
 var registryService = CreateLiveService(registryGateway, "registry-live", () => registryNow);
@@ -1675,9 +2283,11 @@ PaperOrder quarantinedId = registryService.Submit(
 registryGateway.EmitState(quarantinedId.OrderId, OrderStatus.Cancelled, 0, 0);
 registryNow = registryNow.AddMinutes(11);
 _ = registryService.ActiveBrokerOrderCount;
-AssertThrows<InvalidOperationException>(() => registryService.Submit(
-        liveBuy with { StrategyInstanceId = "registry-live", ClientOrderId = "quarantine-id" }, registryNow),
-    "Cancelled quarantine的ClientOrderId不得退休或重用");
+PaperOrder reusedCancelled = registryService.Submit(
+    liveBuy with { StrategyInstanceId = "registry-live", ClientOrderId = "quarantine-id" }, registryNow);
+registryGateway.EmitFill(reusedCancelled.OrderId, 1, 0, OrderStatus.Filled, 1, 65000d);
+Assert(reusedCancelled.ClientOrderId == "quarantine-id" && registryService.ActiveBrokerOrderCount == 0,
+    "超過 late-fill 觀察期且無協定異常的 Cancelled tombstone 必須釋放 ClientOrderId供新委託使用");
 
 PaperOrder localCondition = registryService.Submit(
     liveBuy with
@@ -1695,13 +2305,11 @@ PaperOrder reusedCondition = registryService.Submit(
 Assert(registryService.Cancel(reusedCondition.OrderId),
     "未送broker的local condition取消後必須釋放ClientOrderId供重用");
 
-// Cancelled tombstone 沒有 definitive settlement 時不可因時間經過而猜測安全。
+// A cancelled broker order remains observable for the bounded late-fill window,
+// then retires so it cannot permanently block a safe shutdown.
 DateTimeOffset retentionNow = new(2026, 9, 22, 1, 0, 0, TimeSpan.Zero);
 var retentionGateway = new FakeLiveStrategyOrderGateway();
-var retentionExecutions = new List<ExecutionEvent>();
 var retentionService = CreateLiveService(retentionGateway, "retention-live", () => retentionNow);
-retentionService.Filled += retentionExecutions.Add;
-var expiredOrders = new List<PaperOrder>();
 for (int i = 0; i < 25; i++)
 {
     PaperOrder item = retentionService.Submit(
@@ -1710,24 +2318,174 @@ for (int i = 0; i < 25; i++)
             StrategyInstanceId = "retention-live", ClientOrderId = $"expired-{i}", Price = 65000m + i * 5m
         },
         retentionNow);
-    expiredOrders.Add(item);
     retentionGateway.EmitState(item.OrderId, OrderStatus.Cancelled, 0, 0);
 }
 Assert(retentionService.ActiveBrokerOrderCount == 0,
     "終結 tombstone 不得計入 active count");
 retentionNow = retentionNow.AddMinutes(11);
-PaperOrder retainedNew = retentionService.Submit(
-    liveBuy with { StrategyInstanceId = "retention-live", ClientOrderId = "retained-new" },
-    retentionNow);
-retentionGateway.EmitFill(expiredOrders[0].OrderId, 1, 0, OrderStatus.Filled, 1, 65000d);
-Assert(retentionExecutions.Count == 1 && retentionService.ActiveBrokerOrderCount == 1 &&
-       retentionService.QuarantinedBrokerOrderCount == 24,
-    "超過十分鐘仍須保留 Cancelled quarantine，late fill 必須繼續路由");
-retentionGateway.EmitState(retainedNew.OrderId, OrderStatus.Cancelled, 0, 0);
-AssertThrows<InvalidOperationException>(retentionService.Dispose,
-    "無 definitive settlement 的 Cancelled quarantine 必須永久 fail closed");
+Assert(retentionService.ActiveBrokerOrderCount == 0 &&
+       retentionService.QuarantinedBrokerOrderCount == 0 &&
+       ClientOrderRegistryCount(retentionService) == 0,
+    "超過十分鐘且未收到 late fill 的 Cancelled quarantine 必須結束觀察並可安全關閉");
+retentionService.Dispose();
+
+// A user may cancel a broker order outside this process.  Only an explicit
+// reconciliation action may retire the local active record, and it must keep
+// the tombstone observable for a late fill.
+DateTimeOffset manualReconcileNow = new(2026, 9, 22, 2, 0, 0, TimeSpan.Zero);
+var manualReconcileGateway = new FakeLiveStrategyOrderGateway();
+var manualReconcileLifecycles = new List<OrderLifecycleEvent>();
+var manualReconcileService = CreateLiveService(manualReconcileGateway, "manual-reconcile-live", () => manualReconcileNow);
+manualReconcileService.OrderLifecycleChanged += manualReconcileLifecycles.Add;
+PaperOrder externallyCancelled = manualReconcileService.Submit(
+    liveBuy with { StrategyInstanceId = "manual-reconcile-live", ClientOrderId = "manual-cancel-g1" },
+    manualReconcileNow);
+Assert(manualReconcileService.ActiveBrokerOrderCount == 1,
+    "人工核對前，本機必須繼續將未收到券商回呼的委託視為有效");
+Assert(manualReconcileService.ReconcileExternallyCancelledOrders() == 1 &&
+       manualReconcileService.ActiveBrokerOrderCount == 0 &&
+       manualReconcileService.QuarantinedBrokerOrderCount == 1 &&
+       manualReconcileLifecycles.Last().ClientOrderId == "manual-cancel-g1" &&
+       manualReconcileLifecycles.Last().State == OrderLifecycleState.Cancelled &&
+       manualReconcileLifecycles.Last().ReasonCode == "ManualBrokerReconciled",
+    "明確人工核對後必須只將本機未終結委託標記取消，並保留 late-fill tombstone");
+manualReconcileGateway.EmitFill(externallyCancelled.OrderId, 1, 0, OrderStatus.Filled, 1, 65000d);
+Assert(manualReconcileService.QuarantinedBrokerOrderCount == 0,
+    "人工核對取消後的 late fill 仍必須正常結算，不得被遺失");
+manualReconcileService.Dispose();
+
+// The live service exposes manual reconciliation only while an explicit close
+// is pending; after the ghost order is reconciled, it may submit one flatten
+// for the real ledger position and closes only after the observation window.
+DateTimeOffset manualCloseNow = new(2026, 9, 22, 3, 0, 0, TimeSpan.Zero);
+var manualCloseGateway = new FakeLiveStrategyOrderGateway();
+var manualCloseHost = new StrategyHost(new FakeHostMarketSource());
+var manualCloseLive = new LiveStrategyService(
+    manualCloseHost, () => true, () => "TEST", _ => atomicUniverse,
+    definition => new HostManagedProbeStrategy(definition.InstanceId, "225MC"),
+    (definition, universe, commission) => CreateLiveService(manualCloseGateway, definition.InstanceId, () => manualCloseNow),
+    enableHeartbeat: false);
+var manualCloseDefinition = new StrategyDefinition
+{
+    StrategyType = "HostManagedProbe", InstanceId = "manual-close-live",
+    Universe = new StrategyUniverse { Tradable = new ProductSelection("225MC", "225MC") }
+};
+manualCloseLive.Add(manualCloseDefinition, 36m, 1000m);
+KgiLiveStrategyExecutionService manualCloseExecution = GetLiveExecution(manualCloseLive, "manual-close-live");
+PaperOrder manualCloseEntry = manualCloseExecution.Submit(
+    liveBuy with { StrategyInstanceId = "manual-close-live", ClientOrderId = "manual-close-entry" }, manualCloseNow);
+manualCloseGateway.EmitFill(manualCloseEntry.OrderId, 1, 0, OrderStatus.Filled, 1, 65000d);
+PaperOrder manualCloseGhost = manualCloseExecution.Submit(
+    liveBuy with { StrategyInstanceId = "manual-close-live", ClientOrderId = "manual-close-ghost", Side = BuySell.Sell }, manualCloseNow);
+Assert(!manualCloseLive.RequestClose("manual-close-live", true, out _) &&
+       manualCloseLive.GetCloseStatus("manual-close-live").ClosePending &&
+       manualCloseLive.GetCloseStatus("manual-close-live").ActiveBrokerOrders == 1,
+    "人工刪單前 Close 必須仍保留活動委託並拒絕直接平倉");
+Assert(manualCloseLive.ReconcileExternallyCancelledOrders("manual-close-live", out string manualCloseMessage) &&
+       manualCloseGateway.PlaceOrderCount == 2 &&
+       manualCloseLive.GetCloseStatus("manual-close-live").ActiveBrokerOrders == 0 &&
+       manualCloseMessage.Contains("人工核對", StringComparison.Ordinal),
+    "人工核對同步後不得立刻 Flatten；必須先保留 late-fill 觀察，避免取消競速造成雙重回補");
+manualCloseNow = manualCloseNow.AddMinutes(11);
+manualCloseLive.Pulse(manualCloseNow);
+Assert(manualCloseGateway.PlaceOrderCount == 3 &&
+       manualCloseLive.GetCloseStatus("manual-close-live").ActiveBrokerOrders == 1,
+    $"late-fill 觀察期結束後，才可依權威帳本部位送出一張 Flatten；placed={manualCloseGateway.PlaceOrderCount}, active={manualCloseLive.GetCloseStatus("manual-close-live").ActiveBrokerOrders}, position={manualCloseLive.GetCloseStatus("manual-close-live").Position}, quarantined={manualCloseLive.GetCloseStatus("manual-close-live").QuarantinedBrokerOrders}");
+manualCloseGateway.EmitFill(manualCloseGateway.LastOrderId, 1, 0, OrderStatus.Filled, 1, 64995d);
+Assert(manualCloseLive.RequestClose("manual-close-live", true, out _) &&
+       !manualCloseLive.GetCloseStatus("manual-close-live").ClosePending,
+    "late-fill 觀察期結束且平倉成交後必須允許實盤策略正常關閉");
+manualCloseLive.Dispose();
+
+// A live snapshot subscriber is allowed to ask for the close status.  Initial
+// snapshots published while Add still owns its lifecycle lease must therefore
+// be deferred; otherwise a UI can add a blank row before the guarded status
+// lookup throws.
+var snapshotDuringAddHost = new StrategyHost(new FakeHostMarketSource());
+var snapshotDuringAddGateway = new FakeLiveStrategyOrderGateway();
+var snapshotDuringAddLive = new LiveStrategyService(
+    snapshotDuringAddHost, () => true, () => "TEST", _ => atomicUniverse,
+    definition => new HostManagedProbeStrategy(definition.InstanceId, "225MC"),
+    (definition, universe, commission) => CreateLiveService(snapshotDuringAddGateway, definition.InstanceId),
+    enableHeartbeat: false);
+int usableSnapshotCallbacks = 0;
+snapshotDuringAddLive.SnapshotChanged += snapshot =>
+{
+    if (!string.Equals(snapshot.InstanceId, "live-snapshot-ready", StringComparison.Ordinal)) return;
+    LiveStrategyCloseStatus close = snapshotDuringAddLive.GetCloseStatus(snapshot.InstanceId);
+    Assert(close.Exists && !close.ClosePending && close.ActiveBrokerOrders == 0,
+        "已發布給UI的初始實盤快照必須已完成 Add lifecycle，且可安全讀取關閉狀態");
+    usableSnapshotCallbacks++;
+};
+snapshotDuringAddLive.Add(
+    atomicDefinition with { StrategyType = "HostManagedProbe", InstanceId = "live-snapshot-ready" },
+    36m, 1000m);
+Assert(usableSnapshotCallbacks == 1,
+    $"實盤 Add 完成後只應發布一筆可用初始快照，避免UI留下空白列；actual={usableSnapshotCallbacks}");
+Assert(snapshotDuringAddLive.RequestClose("live-snapshot-ready", false, out _),
+    "快照驗證策略必須可安全關閉");
+snapshotDuringAddLive.Dispose();
 
 Console.WriteLine("OrderManagement smoke tests passed.");
+
+static void TestForeignCancelWaitsForBrokerIdentity()
+{
+    string storagePath = Path.Combine(Path.GetTempPath(), "KGIOptionPricing_OrderTests", Guid.NewGuid().ToString("N"));
+    var gateway = new FakeGateway { NextRequestId = "early-cancel-request" };
+    var manager = new OrderManager(gateway, new OrderStorageManager(storagePath));
+    int cancelFailures = 0;
+    manager.OnCancelFailed += (_, _) => cancelFailures++;
+    manager.PlaceOrder(new OrderRequest
+    {
+        OrderId = "early-cancel-order", Instrument = ForeignInstrument(), BuySell = BuySell.Buy,
+        Price = 67570, Quantity = 1, BrokerId = "F004000", Account = "TESTACCOUNT"
+    });
+    gateway.Emit(new OrderEvent
+    {
+        Identity = new ExternalOrderIdentity { RequestId = "early-cancel-request", Cnt = "early-cnt" },
+        EventType = OrderEventType.Ack, ErrorCode = "0"
+    });
+
+    manager.CancelOrder("early-cancel-order");
+    Assert(gateway.CancelCount == 0 && cancelFailures == 0,
+        "只有 CNT、尚缺上手券商與委託書號時，刪單應等待完整回報，不得誤報刪單失敗");
+
+    gateway.Emit(NewReport("early-cnt", "early-cnt", "broker-ord", "204", OrderOperationType.New,
+        OrderEventType.Accepted, "0", string.Empty, 67570, 1, new ForeignOrderContext
+        {
+            Fcm = "JPXGW", ClearingAccount = "KGI Taiwan-JPX", TradeDate = "20260930", Cp = 'F'
+        }));
+    Assert(gateway.CancelCount == 1 && gateway.LastCancel?.Identity.OrdNo == "broker-ord" &&
+           gateway.LastCancel.ForeignContext?.Fcm == "JPXGW" && cancelFailures == 0,
+        "完整券商回報到達後，原委託應自動送出一次具正確上手資料的刪單");
+}
+
+static void TestForeignCancelReportsIncompleteAcceptedIdentity()
+{
+    string storagePath = Path.Combine(Path.GetTempPath(), "KGIOptionPricing_OrderTests", Guid.NewGuid().ToString("N"));
+    var gateway = new FakeGateway { NextRequestId = "incomplete-request" };
+    var manager = new OrderManager(gateway, new OrderStorageManager(storagePath));
+    string failure = string.Empty;
+    manager.OnCancelFailed += (_, reason) => failure = reason;
+    manager.PlaceOrder(new OrderRequest
+    {
+        OrderId = "incomplete-order", Instrument = ForeignInstrument(), BuySell = BuySell.Buy,
+        Price = 67570, Quantity = 1, BrokerId = "F004000", Account = "TESTACCOUNT"
+    });
+    gateway.Emit(new OrderEvent
+    {
+        Identity = new ExternalOrderIdentity { RequestId = "incomplete-request", Cnt = "incomplete-cnt" },
+        EventType = OrderEventType.Ack, ErrorCode = "0"
+    });
+    manager.CancelOrder("incomplete-order");
+    gateway.Emit(NewReport("incomplete-cnt", "incomplete-cnt", "broker-ord", "204", OrderOperationType.New,
+        OrderEventType.Accepted, "0", string.Empty, 67570, 1, new ForeignOrderContext
+        {
+            ClearingAccount = "KGI Taiwan-JPX", TradeDate = "20260930", Cp = 'F'
+        }));
+    Assert(gateway.CancelCount == 0 && failure == "上手券商不可為空",
+        "正式接受回報仍缺上手券商時，延後刪單應轉為可見失敗，不能無限等待");
+}
 
 static KgiLiveStrategyExecutionService CreateLiveService(
     ILiveStrategyOrderGateway gateway,
@@ -1828,7 +2586,7 @@ static OrderEvent NewReport(
     UpdatedPrice = price,
     UpdatedQty = leaves,
     BrokerId = "F004000",
-    Account = "9819113",
+    Account = "TESTACCOUNT",
     OperationType = operation,
     EventType = eventType,
     ErrorCode = errorCode,
@@ -1840,6 +2598,302 @@ static OrderInfo Single(OrderInfo[] orders, string message)
 {
     Assert(orders.Length == 1, message);
     return orders[0];
+}
+
+static void TestManagedRestingPair()
+{
+    var coordinator = new ManagedRestingPairCoordinator();
+    var keyA = new RestingPairKey("MR-A", 7, "cycle-1", "pair-1");
+    var keyB = new RestingPairKey("MR-B", 7, "cycle-1", "pair-1");
+    coordinator.RegisterLeg(keyA, "a-buy", "broker-a-buy", BuySell.Buy, PaperOrderRole.EntryLong);
+    coordinator.RegisterLeg(keyA, "a-sell", "broker-a-sell", BuySell.Sell, PaperOrderRole.EntryShort);
+    coordinator.RegisterLeg(keyB, "b-buy", "broker-b-buy", BuySell.Buy, PaperOrderRole.EntryLong);
+    coordinator.RegisterLeg(keyB, "b-sell", "broker-b-sell", BuySell.Sell, PaperOrderRole.EntryShort);
+
+    var first = coordinator.RecordFill(keyA, "a-buy", "broker-a-buy", "a-fill-1", 1, 1, 10);
+    Assert(first.EffectiveRole == PaperOrderRole.EntryLong &&
+           !first.Actions.Any(x => x.Kind == RestingPairActionKind.CancelExactOpposite),
+        "the first paired fill enters without cancelling the opposite original order");
+    var duplicate = coordinator.RecordFill(keyA, "a-buy", "broker-a-buy", "a-fill-1", 1, 1, 10);
+    Assert(duplicate.EffectiveRole == null && duplicate.Actions.Count == 0,
+        "a repeated execution ID must not book again");
+    var second = coordinator.RecordFill(keyA, "a-sell", "broker-a-sell", "a-fill-1", 1, 1, 11);
+    Assert(second.EffectiveRole == PaperOrderRole.TakeProfit && second.Actions.Count == 0,
+        "execution IDs reused by a different original order must still form the sole limit exit");
+    RestingPairSnapshot checkpoint = coordinator.Snapshot(keyA);
+    var restored = new ManagedRestingPairCoordinator();
+    restored.Restore(checkpoint);
+    bool rejectedCorruptLeg = false;
+    try
+    {
+        var corrupt = new ManagedRestingPairCoordinator();
+        corrupt.Restore(checkpoint with { Buy = checkpoint.Buy! with { Side = BuySell.Sell } });
+    }
+    catch (InvalidDataException) { rejectedCorruptLeg = true; }
+    Assert(rejectedCorruptLeg, "recovery must reject either wrong side or wrong original role");
+    Assert(restored.RecordFill(keyA, "a-sell", "broker-a-sell", "a-fill-1", 1, 1, 11)
+               .EffectiveRole == null,
+        "restart must restore per-order execution deduplication before processing late reports");
+    var other = coordinator.RecordFill(keyB, "b-sell", "broker-b-sell", "b-fill-1", 1, 1, 5);
+    Assert(other.EffectiveRole == PaperOrderRole.EntryShort,
+        "another strategy on the same contract retains independent ownership");
+
+    var stopKey = new RestingPairKey("MR-stop", 8, "cycle-stop", "pair-stop");
+    coordinator.RegisterLeg(stopKey, "stop-buy", "broker-stop-buy", BuySell.Buy, PaperOrderRole.EntryLong);
+    coordinator.RegisterLeg(stopKey, "stop-sell", "broker-stop-sell", BuySell.Sell, PaperOrderRole.EntryShort);
+    coordinator.RecordFill(stopKey, "stop-buy", "broker-stop-buy", "stop-fill-1", 1, 1, 20);
+    var stop = coordinator.RequestFlatten(stopKey, "StopLoss");
+    Assert(stop.Actions.Count(x => x.Kind == RestingPairActionKind.CancelExactOpposite &&
+                                   x.ClientOrderId == "stop-sell" &&
+                                   x.BrokerOrderId == "broker-stop-sell") == 1,
+        "stop must cancel only the exact opposite resting order");
+    var market = coordinator.ConfirmTerminal(stopKey, "stop-sell", "broker-stop-sell", 0, 0, 1);
+    Assert(market.Actions.Count(x => x.Kind == RestingPairActionKind.SubmitResidualMarketStop &&
+                                     x.Quantity == 1) == 1,
+        "only settled cancellation may release the residual market stop");
+    var repeated = coordinator.ConfirmTerminal(stopKey, "stop-sell", "broker-stop-sell", 0, 0, 1);
+    Assert(repeated.Actions.Count == 0, "repeated terminal report must not duplicate the market stop");
+    Assert(coordinator.RecordFill(stopKey, "stop-sell", "broker-stop-sell",
+            "stop-late-fill", 1, 1, 21).Phase == RestingPairPhase.Quarantined,
+        "a fill contradicting the settled cancel watermark must quarantine the cycle");
+
+    var badKey = new RestingPairKey("MR-bad", 9, "cycle-bad", "pair-bad");
+    coordinator.RegisterLeg(badKey, "bad-buy", "broker-bad-buy", BuySell.Buy, PaperOrderRole.EntryLong);
+    coordinator.RegisterLeg(badKey, "bad-sell", "broker-bad-sell", BuySell.Sell, PaperOrderRole.EntryShort);
+    coordinator.RecordFill(badKey, "bad-buy", "broker-bad-buy", "bad-fill-1", 1, 1, 30);
+    coordinator.RequestFlatten(badKey, "StopLoss");
+    var mismatch = coordinator.ConfirmTerminal(badKey, "bad-sell", "broker-bad-sell", 1, 0, 1);
+    Assert(mismatch.Phase == RestingPairPhase.Quarantined &&
+           mismatch.Actions.All(x => x.Kind != RestingPairActionKind.SubmitResidualMarketStop),
+        "final and delivered fill watermarks must match before market stop");
+
+    var flatKey = new RestingPairKey("MR-flat", 9, "cycle-flat", "pair-flat");
+    coordinator.RegisterLeg(flatKey, "flat-buy", "broker-flat-buy", BuySell.Buy, PaperOrderRole.EntryLong);
+    coordinator.RegisterLeg(flatKey, "flat-sell", "broker-flat-sell", BuySell.Sell, PaperOrderRole.EntryShort);
+    coordinator.RecordFill(flatKey, "flat-buy", "broker-flat-buy", "flat-fill-1", 1, 1, 40);
+    coordinator.RequestFlatten(flatKey, "StopLoss");
+    var lateExit = coordinator.RecordFill(flatKey, "flat-sell", "broker-flat-sell", "flat-fill-2", 1, 1, 41);
+    Assert(lateExit.EffectiveRole == PaperOrderRole.TakeProfit,
+        "opposite fill during cancel wait must first enter the shared ledger as a limit exit");
+    var alreadyFlat = coordinator.ConfirmTerminal(flatKey, "flat-sell", "broker-flat-sell", 1, 1, 0);
+    Assert(alreadyFlat.Phase == RestingPairPhase.Settled &&
+           alreadyFlat.Actions.All(x => x.Kind != RestingPairActionKind.SubmitResidualMarketStop),
+        "no market stop may be sent when the strategy position is flat after late fill");
+
+    var missingKey = new RestingPairKey("MR-missing", 9, "cycle-missing", "pair-missing");
+    coordinator.RegisterLeg(missingKey, "missing-buy", "broker-missing-buy", BuySell.Buy, PaperOrderRole.EntryLong);
+    coordinator.RegisterLeg(missingKey, "missing-sell", "broker-missing-sell", BuySell.Sell, PaperOrderRole.EntryShort);
+    coordinator.RecordFill(missingKey, "missing-buy", "broker-missing-buy", "missing-fill-1", 1, 1, 50);
+    coordinator.RequestFlatten(missingKey, "StopLoss");
+    Assert(coordinator.ConfirmTerminal(missingKey, "missing-sell", "broker-missing-sell",
+            null, 0, 1, false).Phase == RestingPairPhase.Quarantined,
+        "missing final broker watermark must quarantine rather than infer cancellation");
+
+    var orderKey = new RestingPairKey("MR-order", 9, "cycle-order", "pair-order");
+    coordinator.RegisterLeg(orderKey, "order-buy", "broker-order-buy", BuySell.Buy, PaperOrderRole.EntryLong);
+    coordinator.RegisterLeg(orderKey, "order-sell", "broker-order-sell", BuySell.Sell, PaperOrderRole.EntryShort);
+    coordinator.RecordFill(orderKey, "order-buy", "broker-order-buy", "order-fill-1", 1, 1, 60);
+    Assert(coordinator.RecordFill(orderKey, "order-sell", "broker-order-sell",
+            "order-fill-2", 1, 1, 59).Phase == RestingPairPhase.Quarantined,
+        "contradictory cross-leg ordering must quarantine");
+
+    var rejectKey = new RestingPairKey("MR-reject", 9, "cycle-reject", "pair-reject");
+    coordinator.RegisterLeg(rejectKey, "reject-buy", "broker-reject-buy", BuySell.Buy, PaperOrderRole.EntryLong);
+    coordinator.RegisterLeg(rejectKey, "reject-sell", "broker-reject-sell", BuySell.Sell, PaperOrderRole.EntryShort);
+    coordinator.RecordFill(rejectKey, "reject-buy", "broker-reject-buy", "reject-fill-1", 1, 1, 70);
+    coordinator.RequestFlatten(rejectKey, "StopLoss");
+    Assert(coordinator.CancelRejected(rejectKey, "reject-sell", "broker-reject-sell").Phase ==
+           RestingPairPhase.Quarantined, "cancel rejection must not release a market stop");
+
+    var resultKey = new RestingPairKey("MR-result", 9, "cycle-result", "pair-result");
+    coordinator.RegisterLeg(resultKey, "result-buy", "broker-result-buy", BuySell.Buy, PaperOrderRole.EntryLong);
+    coordinator.RegisterLeg(resultKey, "result-sell", "broker-result-sell", BuySell.Sell, PaperOrderRole.EntryShort);
+    coordinator.RecordFill(resultKey, "result-buy", "broker-result-buy", "result-fill-1", 1, 1, 80);
+    coordinator.RequestFlatten(resultKey, "StopLoss");
+    var stopIntent = coordinator.ConfirmTerminal(resultKey, "result-sell", "broker-result-sell", 0, 0, 1)
+        .Actions.Single(x => x.Kind == RestingPairActionKind.SubmitResidualMarketStop);
+    Assert(coordinator.ConfirmMarketResult(resultKey, stopIntent.ClientOrderId, null, null).Phase ==
+           RestingPairPhase.Quarantined,
+        "unknown market-stop result requires reconciliation instead of retry");
+
+    string pairJournalDirectory = Path.Combine(Path.GetTempPath(),
+        "KGIOptionPricing_PairedOwnershipTests", Guid.NewGuid().ToString("N"));
+    var pairRegistry = new LiveOrderOwnershipRegistry(pairJournalDirectory);
+    pairRegistry.UpdateRestingPairState(checkpoint);
+    var replayedPairRegistry = new LiveOrderOwnershipRegistry(pairJournalDirectory);
+    Assert(replayedPairRegistry.Snapshot().RestingPairs.Single().Key == keyA &&
+           replayedPairRegistry.Snapshot().RestingPairs.Single().Sell?.ClientOrderId == "a-sell",
+        "durable ownership journal must retain both original paired order identities");
+    Console.WriteLine("PASS managed resting pair");
+}
+
+static void TestLiveRestingPair()
+{
+    var gateway = new FakeLiveStrategyOrderGateway();
+    var service = new KgiLiveStrategyExecutionService(
+        gateway, "MR-live-pair",
+        new ResolvedProduct { ProductId = "225MC", Symbol = "225MC-Z26",
+            TickSize = 5m, ContractMultiplier = 10m },
+        new ContractInfo { ExchangeNm = "JPX", ProductId = "225MC",
+            Symbol = "225MC-Z26", ComYM2 = "202612", CPF = CPFEnum.Futures, ComType = '0' },
+        36m, capabilities: new StrategyExecutionCapabilities(AllowPairedRestingLive: true));
+    var fills = new List<ExecutionEvent>();
+    service.Filled += fills.Add;
+    PaperOrderRequest buyRequest = new()
+    {
+        StrategyInstanceId = "MR-live-pair", StrategyRunGeneration = 1,
+        CycleId = "cycle-1", PairId = "pair-1", OcoGroupId = "cycle-1",
+        RestingPairMode = RestingPairMode.OppositeLegIsExit,
+        ClientOrderId = "pair-buy", Symbol = "225MC-Z26", Side = BuySell.Buy,
+        Type = PaperOrderType.BrokerLimit, Role = PaperOrderRole.EntryLong,
+        Price = 65000m, Quantity = 1
+    };
+    PaperOrder buy = service.Submit(buyRequest, DateTimeOffset.UtcNow);
+    PaperOrder sell = service.Submit(buyRequest with
+    {
+        ClientOrderId = "pair-sell", Side = BuySell.Sell,
+        Role = PaperOrderRole.EntryShort, Price = 65020m
+    }, DateTimeOffset.UtcNow);
+    Assert(gateway.GetRestingPairStates("MR-live-pair", 1).Single().Sell?.ClientOrderId ==
+           "pair-sell", "both paired identities must be journaled before broker callbacks");
+    gateway.EmitFill(buy.OrderId, 1, 0, OrderStatus.Filled, 1, 65000d);
+    Assert(gateway.GetRestingPairStates("MR-live-pair", 1).Single().Phase ==
+           RestingPairPhase.Held, "first fill must persist the held phase before ledger publication");
+    Assert(gateway.CancelOrderCount == 0 &&
+           service.GetWorkingOrders("MR-live-pair").Any(x => x.OrderId == sell.OrderId),
+        "a paired live entry fill must not activate legacy OCO sibling cancellation");
+    gateway.EmitFill(sell.OrderId, 1, 0, OrderStatus.Filled, 1, 65020d);
+    Assert(fills.Count == 2 && fills[0].Role == PaperOrderRole.EntryLong &&
+           fills[1].Role == PaperOrderRole.TakeProfit &&
+           fills[1].OriginalOrderRole == PaperOrderRole.EntryShort &&
+           fills[1].OrderId == sell.OrderId && fills[1].PairId == "pair-1",
+        "the same original live sell order must report as effective limit exit");
+    service.Dispose();
+    Console.WriteLine("PASS paired live fake gateway");
+}
+
+static void TestLiveRestingPairStop()
+{
+    var gateway = new FakeLiveStrategyOrderGateway();
+    var testClock = new MutableLiveClock(DateTimeOffset.UtcNow);
+    var ledger = new KGIOptionPricing.StrategyFramework.Performance.PaperPortfolioLedger();
+    ledger.RegisterProduct("MR-stop-live", 2, new ResolvedProduct
+    { ProductId = "225MC", Symbol = "225MC-Z26", TickSize = 5m, ContractMultiplier = 10m });
+    using var service = new KgiLiveStrategyExecutionService(gateway, "MR-stop-live",
+        new ResolvedProduct { ProductId = "225MC", Symbol = "225MC-Z26",
+            TickSize = 5m, ContractMultiplier = 10m },
+        new ContractInfo { ExchangeNm = "JPX", ProductId = "225MC", Symbol = "225MC-Z26",
+            ComYM2 = "202612", CPF = CPFEnum.Futures, ComType = '0' },
+        36m, now: () => testClock.Now,
+        capabilities: new StrategyExecutionCapabilities(AllowPairedRestingLive: true),
+        strategyNetPosition: generation =>
+            ledger.GetPosition("MR-stop-live", generation, "225MC-Z26").NetQuantity);
+    service.Filled += ledger.ApplyExecution;
+    PaperOrderRequest buyRequest = new()
+    {
+        StrategyInstanceId = "MR-stop-live", StrategyRunGeneration = 2,
+        CycleId = "stop-cycle", PairId = "stop-pair", OcoGroupId = "stop-cycle",
+        RestingPairMode = RestingPairMode.OppositeLegIsExit,
+        ClientOrderId = "stop-buy", Symbol = "225MC-Z26", Side = BuySell.Buy,
+        Type = PaperOrderType.BrokerLimit, Role = PaperOrderRole.EntryLong,
+        Price = 65000m, Quantity = 1
+    };
+    PaperOrder buy = service.Submit(buyRequest, DateTimeOffset.UtcNow);
+    PaperOrder sell = service.Submit(buyRequest with
+    { ClientOrderId = "stop-sell", Side = BuySell.Sell,
+        Role = PaperOrderRole.EntryShort, Price = 65020m }, DateTimeOffset.UtcNow);
+    gateway.EmitFill(buy.OrderId, 1, 0, OrderStatus.Filled, 1, 65000d);
+    service.Submit(buyRequest with
+    {
+        ClientOrderId = "stop-trigger", Type = PaperOrderType.Stop,
+        RestingPairMode = RestingPairMode.None, Side = BuySell.Sell,
+        Role = PaperOrderRole.StopLoss, Price = 64990m
+    }, DateTimeOffset.UtcNow);
+    service.OnMarketEvent(new MarketEvent
+    { Kind = MarketEventKind.Trade, Symbol = "225MC-Z26", ProductId = "225MC",
+        LastPrice = 64985m, Sequence = 100, Timestamp = DateTimeOffset.UtcNow });
+    Assert(gateway.CancelOrderCount == 1 && gateway.PlaceOrderCount == 2,
+        "paired local stop must first cancel opposite limit, never send market immediately");
+    Assert(gateway.GetRestingPairStates("MR-stop-live", 2).Single().Phase ==
+           RestingPairPhase.CancelPending,
+        "cancel intent must be journaled before the broker cancel call");
+    gateway.EmitState(sell.OrderId, OrderStatus.Cancelled, 0, 0);
+    Assert(gateway.GetRestingPairStates("MR-stop-live", 2).Single().Phase ==
+           RestingPairPhase.StopIntentSent,
+        "market stop intent must be journaled before broker placement");
+    Assert(gateway.PlaceOrderCount == 3 &&
+           gateway.Requests[2].TimeInForce == TimeInForce.IOC &&
+           gateway.Requests[2].Price == 0d &&
+           gateway.Requests[2].BuySell == BuySell.Sell,
+        "only confirmed terminal zero-fill watermark may release one residual market stop");
+    gateway.EmitFill(gateway.LastOrderId, 1, 0, OrderStatus.Filled, 1, 64985d);
+    Assert(ledger.GetPosition("MR-stop-live", 2, "225MC-Z26").NetQuantity == 0,
+        "shared ledger must finish flat after the settled stop market fill");
+    testClock.Advance(testClock.Now.AddMinutes(11));
+    _ = service.GetWorkingOrders("MR-stop-live");
+    Console.WriteLine("PASS paired live stop settlement");
+}
+
+static void TestRestingPairRecoveryHalt()
+{
+    var gateway = new FakeLiveStrategyOrderGateway();
+    var coordinator = new ManagedRestingPairCoordinator();
+    var key = new RestingPairKey("MR-restart", 9, "old-cycle", "old-pair");
+    coordinator.RegisterLeg(key, "old-buy", "real-buy", BuySell.Buy, PaperOrderRole.EntryLong);
+    coordinator.RegisterLeg(key, "old-sell", "real-sell", BuySell.Sell, PaperOrderRole.EntryShort);
+    coordinator.RecordFill(key, "old-buy", "real-buy", "fill-1", 1, 1, 1);
+    gateway.AppendRestingPairState(coordinator.Snapshot(key));
+    using var recovered = new KgiLiveStrategyExecutionService(gateway, "MR-restart",
+        new ResolvedProduct { ProductId = "225MC", Symbol = "225MC-Z26",
+            TickSize = 5m, ContractMultiplier = 10m },
+        new ContractInfo { ExchangeNm = "JPX", ProductId = "225MC", Symbol = "225MC-Z26",
+            ComYM2 = "202612", CPF = CPFEnum.Futures, ComType = '0' },
+        36m, capabilities: new StrategyExecutionCapabilities(AllowPairedRestingLive: true),
+        strategyRunGeneration: 9);
+    Assert(recovered.GetRestingPairStates().Single().FirstFilledClientOrderId == "old-buy",
+        "restart must restore the original held leg and leave it visible for reconciliation");
+    AssertThrows<BrokerReconciliationRequiredException>(() => recovered.Submit(new PaperOrderRequest
+    {
+        StrategyInstanceId = "MR-restart", StrategyRunGeneration = 9,
+        CycleId = "new-cycle", PairId = "new-pair", RestingPairMode = RestingPairMode.OppositeLegIsExit,
+        ClientOrderId = "new-buy", Symbol = "225MC-Z26", Side = BuySell.Buy,
+        Type = PaperOrderType.BrokerLimit, Role = PaperOrderRole.EntryLong,
+        Price = 65000m, Quantity = 1
+    }, DateTimeOffset.UtcNow), "restarted paired instance must not send fresh orders without broker reconciliation");
+    Assert(gateway.PlaceOrderCount == 0, "recovery halt must precede every broker mutation");
+    Console.WriteLine("PASS paired recovery halt");
+}
+
+static void TestLiveRestingPairSecondRejected()
+{
+    var gateway = new FakeLiveStrategyOrderGateway();
+    gateway.PlaceOutcomes.Enqueue(FakePlaceOutcome.None);
+    gateway.PlaceOutcomes.Enqueue(FakePlaceOutcome.Rejected);
+    var service = new KgiLiveStrategyExecutionService(gateway, "MR-reject-pair",
+        new ResolvedProduct { ProductId = "225MC", Symbol = "225MC-Z26",
+            TickSize = 5m, ContractMultiplier = 10m },
+        new ContractInfo { ExchangeNm = "JPX", ProductId = "225MC", Symbol = "225MC-Z26",
+            ComYM2 = "202612", CPF = CPFEnum.Futures, ComType = '0' },
+        36m, capabilities: new StrategyExecutionCapabilities(AllowPairedRestingLive: true));
+    PaperOrderRequest first = new()
+    {
+        StrategyInstanceId = "MR-reject-pair", StrategyRunGeneration = 3,
+        CycleId = "reject-cycle", PairId = "reject-pair",
+        RestingPairMode = RestingPairMode.OppositeLegIsExit,
+        ClientOrderId = "reject-buy", Symbol = "225MC-Z26", Side = BuySell.Buy,
+        Type = PaperOrderType.BrokerLimit, Role = PaperOrderRole.EntryLong,
+        Price = 65000m, Quantity = 1
+    };
+    PaperOrder buy = service.Submit(first, DateTimeOffset.UtcNow);
+    service.Submit(first with { ClientOrderId = "reject-sell", Side = BuySell.Sell,
+        Role = PaperOrderRole.EntryShort, Price = 65020m }, DateTimeOffset.UtcNow);
+    Assert(gateway.CancelOrderCount == 1 && gateway.PlaceOrderCount == 2 &&
+           service.GetWorkingOrders("MR-reject-pair").Any(x => x.OrderId == buy.OrderId),
+        "rejected second leg must immediately request exact first-leg cancellation");
+    Assert(gateway.GetRestingPairStates("MR-reject-pair", 3).Single().Phase ==
+           RestingPairPhase.Quarantined,
+        "failed non-atomic pair must remain blocked until broker reconciliation");
+    Console.WriteLine("PASS paired second-leg rejection guard");
 }
 
 static void Assert(bool condition, string message)
@@ -1880,6 +2934,7 @@ sealed class FakeGateway : IOrderGateway
     public string NextRequestId { get; set; } = "request";
     public ModifyOrderRequest? LastModify { get; private set; }
     public CancelOrderRequest? LastCancel { get; private set; }
+    public int CancelCount { get; private set; }
 
     public event Action<OrderEvent>? OrderEventReceived;
     public event Action<FillEvent>? FillEventReceived;
@@ -1893,6 +2948,7 @@ sealed class FakeGateway : IOrderGateway
     }
     public OrderResult CancelOrder(CancelOrderRequest request)
     {
+        CancelCount++;
         LastCancel = request;
         return new OrderResult { IsSuccess = true, RequestId = NextRequestId };
     }
@@ -1903,6 +2959,13 @@ sealed class FakeGateway : IOrderGateway
 sealed class FakeLiveStrategyOrderGateway : ILiveStrategyOrderGateway
 {
     private readonly Dictionary<string, OrderInfo> _orders = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<RestingPairKey, RestingPairSnapshot> _pairs = new();
+
+    public void AppendRestingPairState(RestingPairSnapshot state) => _pairs[state.Key] = state;
+    public IReadOnlyList<RestingPairSnapshot> GetRestingPairStates(string strategyInstanceId,
+        long strategyRunGeneration) => _pairs.Values.Where(state =>
+            state.Key.StrategyInstanceId == strategyInstanceId &&
+            state.Key.StrategyRunGeneration == strategyRunGeneration).ToArray();
 
     public bool IsLoggedIn { get; set; } = true;
     public string BrokerId { get; set; } = "BRK";
@@ -1915,6 +2978,7 @@ sealed class FakeLiveStrategyOrderGateway : ILiveStrategyOrderGateway
     public string LastOrderId { get; private set; } = string.Empty;
     public int PlaceOrderCount { get; private set; }
     public int CancelOrderCount { get; private set; }
+    public List<OrderRequest> Requests { get; } = new();
     public Queue<FakePlaceOutcome> PlaceOutcomes { get; } = new();
 
     public event Action<OrderInfo>? OrderStateChanged;
@@ -1924,6 +2988,7 @@ sealed class FakeLiveStrategyOrderGateway : ILiveStrategyOrderGateway
 
     public void PlaceOrder(OrderRequest request)
     {
+        Requests.Add(request);
         var order = new OrderInfo
         {
             OrderId = request.OrderId,

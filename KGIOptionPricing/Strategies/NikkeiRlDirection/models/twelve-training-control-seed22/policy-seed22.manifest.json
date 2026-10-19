@@ -1,0 +1,215 @@
+{
+  "schema": "nikkei-rl-research-v1",
+  "modelSha256": "AD5CA0E0CA3704259285B1D32611D6EAFC5BC420C266255F3ACBB2691FC8A5D5",
+  "observationSize": 60,
+  "featureNames": [
+    "225MC_return5s",
+    "225MC_return15s",
+    "225MC_return30s",
+    "225MC_return60s",
+    "225MC_spread",
+    "225MC_obi1",
+    "225MC_obi5",
+    "225MC_bookAgeSeconds",
+    "225MC_logVolume5s",
+    "225MC_uptickVolumeRatio5s",
+    "225M_return5s",
+    "225M_return15s",
+    "225M_return30s",
+    "225M_return60s",
+    "225M_spread",
+    "225M_obi1",
+    "225M_obi5",
+    "225M_bookAgeSeconds",
+    "225M_logVolume5s",
+    "225M_uptickVolumeRatio5s",
+    "225MC_buyPower30s",
+    "225MC_shortPower60s",
+    "225MC_longPower180s",
+    "225MC_biasPower",
+    "225MC_movementDirection",
+    "225M_buyPower30s",
+    "225M_shortPower60s",
+    "225M_longPower180s",
+    "225M_biasPower",
+    "225M_movementDirection",
+    "position",
+    "holdingSecondsDiv60",
+    "unrealizedTicks",
+    "netPnlTicks",
+    "drawdownTicks",
+    "cooldownSecondsDiv30",
+    "pendingEntry",
+    "pendingExit",
+    "validData",
+    "hoursToSessionClose",
+    "mc_log_visible_depth5",
+    "mc_weighted_mid_offset_ticks",
+    "mc_gap_asymmetry",
+    "mc_sweep5_cost_skew",
+    "mc_depth_centroid_asymmetry",
+    "mc_depth_spatial_dispersion_ticks",
+    "mc_max_depth_position_asymmetry",
+    "mc_depth_curvature_asymmetry",
+    "mc_ofi5s_depth_normalized",
+    "mc_quote_signed_volume5s",
+    "mc_log_arrival_rate5s",
+    "mc_trade_sign_autocorrelation30s",
+    "mc_signed_trade_run_length",
+    "mc_trade_size_hhi30s",
+    "mc_mid_momentum15s_ticks",
+    "mc_signed_path_efficiency30s",
+    "mc_log_realized_variance30s",
+    "mc_downside_semivariance_share30s",
+    "mc_return_autocorrelation30s",
+    "mc_abs_return_autocorrelation30s"
+  ],
+  "actionNames": [
+    "Wait",
+    "LongSignal",
+    "ShortSignal",
+    "Flatten",
+    "CancelEntry"
+  ],
+  "trainingEpisodes": [
+    "20260928-postgap-day",
+    "20260929-day",
+    "20260930-day",
+    "20261005-postgap-day"
+  ],
+  "validationEpisodes": [
+    "20261006-day",
+    "20261007-day"
+  ],
+  "seed": 22,
+  "versions": {
+    "torch": "2.9.1+cpu",
+    "gymnasium": "1.2.2",
+    "stable-baselines3": "2.7.1",
+    "sb3-contrib": "2.7.1",
+    "numpy": "1.26.4",
+    "onnx": "1.19.1"
+  },
+  "deterministic": true,
+  "reward": {
+    "drawdownPenalty": 0.25,
+    "costWeight": 1
+  },
+  "costs": {
+    "commissionPerSide": 36,
+    "tickSize": 5,
+    "multiplier": 10
+  },
+  "normalizationEmbedded": true,
+  "trainingActionLatencyMs": 1,
+  "actorExcludedFeatures": [
+    48,
+    49,
+    50,
+    51,
+    52,
+    53
+  ],
+  "environmentConfig": {
+    "cooldownSeconds": 10,
+    "decisionLatencyMs": 1,
+    "rewardCostWeight": 1,
+    "observationSize": 60,
+    "decisionIntervalSeconds": 3,
+    "featureProfile": "mini-micro-research",
+    "directionDrivenHolding": true,
+    "maxHoldingSeconds": 0,
+    "stopMode": "fixed",
+    "fixedStopPoints": 150,
+    "minStopPoints": 5,
+    "maxStopPoints": 150,
+    "stopVolatilitySeconds": 60,
+    "stopVolatilityMultiplier": 2
+  },
+  "predictionHorizonSeconds": 15,
+  "discount": {
+    "gamma": 0.9939879436616983,
+    "gaeLambda": 0.9696927825876808,
+    "referenceIntervalSeconds": 5
+  },
+  "directionWarmstartEpochs": 0,
+  "usage": "DevelopmentPreviouslyInspected",
+  "deploymentEligible": false,
+  "resumeProvenance": {
+    "files": {
+      "C:\\Users\\user\\.codex\\visualizations\\2026\\10\\07\\01a1161a-64d8-7c81-9e7d-b725164d7ff5\\nikkei-rl-quality-reward-20261009\\models\\quality80\\policy-seed22.onnx": "701102557ECE834B5452E55BB7B182CFED2A6D923B925FBA53D83DAC203EAD6B",
+      "C:\\Users\\user\\.codex\\visualizations\\2026\\10\\07\\01a1161a-64d8-7c81-9e7d-b725164d7ff5\\nikkei-rl-quality-reward-20261009\\models\\quality80\\policy-seed22.manifest.json": "4F1B97B6F9C7989C4825BB7D1B0809AC26EC41FAEC09E1BFFA2D11E599145520",
+      "C:\\Users\\user\\.codex\\visualizations\\2026\\10\\07\\01a1161a-64d8-7c81-9e7d-b725164d7ff5\\nikkei-rl-quality-reward-20261009\\models\\quality80\\ppo-seed22.zip": "79F927690BA5FDBF18DD556B762CB0A574BC3C91114DD2B817E4B2EA675B1C3A",
+      "C:\\Users\\user\\.codex\\visualizations\\2026\\10\\07\\01a1161a-64d8-7c81-9e7d-b725164d7ff5\\nikkei-rl-quality-reward-20261009\\models\\quality80\\normalizer-seed22.pkl": "2ACF88FB5340B04BB188A4AD22A0DFF5425D4C0741038E66A92CD738B8C4A2C0"
+    },
+    "seed": 22,
+    "additionalRequestedSteps": 131072,
+    "learningRate": 0.0001,
+    "repeatWarmstart": false,
+    "factorTransfer": false,
+    "parentExcludedFeatures": [
+      48,
+      49,
+      50,
+      51,
+      52,
+      53
+    ],
+    "targetExcludedFeatures": [
+      48,
+      49,
+      50,
+      51,
+      52,
+      53
+    ],
+    "entryTransfer": false,
+    "earlierTrainingExtension": false,
+    "initialSteps": 98304,
+    "totalSteps": 229376,
+    "additionalSteps": 131072
+  },
+  "trainingObjective": {
+    "mode": "constrained-gross",
+    "tradeIncentive": 20.0,
+    "frequencyCap": 50,
+    "winWeight": 80.0,
+    "grossWeight": 4.0,
+    "accounting": "Unchanged authoritative C# ledger; shaping affects training only",
+    "scope": "Training-only projected multiplier feedback; does not certify hard constraints",
+    "episodeOrder": "Cyclic"
+  },
+  "dualFeedback": {
+    "rates": [
+      10.0,
+      20.0,
+      2.0
+    ],
+    "caps": [
+      80,
+      200,
+      20
+    ],
+    "completedTrainingEpisodes": 17,
+    "finalWeights": {
+      "trade_incentive": 80,
+      "win_weight": 89.91999999999997,
+      "gross_weight": 17.68
+    },
+    "inferenceAdaptive": false,
+    "assessmentMode": "GreedyReplay"
+  },
+  "trainingRewardNormalization": {
+    "enabled": false,
+    "parentNormalized": false,
+    "parentReturnStd": 20.17288297457705,
+    "criticRescaled": false,
+    "criticScaleFactor": 1,
+    "criticOptimizerReset": false,
+    "normalizationGamma": 0.99,
+    "clipReward": 10.0,
+    "observationStatisticsUnchanged": true,
+    "scope": "Training reward and critic only; authoritative execution, costs, raw JPY performance and ONNX actor inputs unchanged"
+  },
+  "normalizationFrozenDuringContinuation": false
+}

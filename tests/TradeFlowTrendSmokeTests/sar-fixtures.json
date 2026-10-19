@@ -1,0 +1,465 @@
+[
+  {
+    "name": "up-cap-reverse",
+    "bars": [
+      [
+        "105",
+        "95",
+        "100"
+      ],
+      [
+        "115",
+        "105",
+        "110"
+      ],
+      [
+        "125",
+        "115",
+        "120"
+      ],
+      [
+        "135",
+        "125",
+        "130"
+      ],
+      [
+        "145",
+        "135",
+        "140"
+      ],
+      [
+        "155",
+        "145",
+        "150"
+      ],
+      [
+        "165",
+        "155",
+        "160"
+      ],
+      [
+        "175",
+        "165",
+        "170"
+      ],
+      [
+        "185",
+        "175",
+        "180"
+      ],
+      [
+        "195",
+        "185",
+        "190"
+      ],
+      [
+        "205",
+        "195",
+        "200"
+      ],
+      [
+        "215",
+        "205",
+        "210"
+      ],
+      [
+        "225",
+        "215",
+        "220"
+      ],
+      [
+        "235",
+        "225",
+        "230"
+      ],
+      [
+        "245",
+        "235",
+        "240"
+      ],
+      [
+        "255",
+        "245",
+        "250"
+      ],
+      [
+        "245",
+        "180",
+        "185"
+      ],
+      [
+        "200",
+        "170",
+        "175"
+      ],
+      [
+        "240",
+        "172",
+        "235"
+      ]
+    ],
+    "expected": [
+      null,
+      {
+        "value": "95",
+        "isLong": true,
+        "extreme": "115",
+        "acceleration": "0.02"
+      },
+      {
+        "value": "95",
+        "isLong": true,
+        "extreme": "125",
+        "acceleration": "0.04"
+      },
+      {
+        "value": "96.20",
+        "isLong": true,
+        "extreme": "135",
+        "acceleration": "0.06"
+      },
+      {
+        "value": "98.5280",
+        "isLong": true,
+        "extreme": "145",
+        "acceleration": "0.08"
+      },
+      {
+        "value": "102.245760",
+        "isLong": true,
+        "extreme": "155",
+        "acceleration": "0.10"
+      },
+      {
+        "value": "107.52118400",
+        "isLong": true,
+        "extreme": "165",
+        "acceleration": "0.12"
+      },
+      {
+        "value": "114.4186419200",
+        "isLong": true,
+        "extreme": "175",
+        "acceleration": "0.14"
+      },
+      {
+        "value": "122.900032051200",
+        "isLong": true,
+        "extreme": "185",
+        "acceleration": "0.16"
+      },
+      {
+        "value": "132.83602692300800",
+        "isLong": true,
+        "extreme": "195",
+        "acceleration": "0.18"
+      },
+      {
+        "value": "144.0255420768665600",
+        "isLong": true,
+        "extreme": "205",
+        "acceleration": "0.20"
+      },
+      {
+        "value": "156.220433661493248000",
+        "isLong": true,
+        "extreme": "215",
+        "acceleration": "0.20"
+      },
+      {
+        "value": "167.97634692919459840000",
+        "isLong": true,
+        "extreme": "225",
+        "acceleration": "0.20"
+      },
+      {
+        "value": "179.3810775433556787200000",
+        "isLong": true,
+        "extreme": "235",
+        "acceleration": "0.20"
+      },
+      {
+        "value": "190.504862034684542976000000",
+        "isLong": true,
+        "extreme": "245",
+        "acceleration": "0.20"
+      },
+      {
+        "value": "201.4038896277476343808000000",
+        "isLong": true,
+        "extreme": "255",
+        "acceleration": "0.20"
+      },
+      {
+        "value": "255",
+        "isLong": false,
+        "extreme": "180",
+        "acceleration": "0.02"
+      },
+      {
+        "value": "255",
+        "isLong": false,
+        "extreme": "170",
+        "acceleration": "0.04"
+      },
+      {
+        "value": "251.60",
+        "isLong": false,
+        "extreme": "170",
+        "acceleration": "0.04"
+      }
+    ]
+  },
+  {
+    "name": "down-cap-reverse",
+    "bars": [
+      [
+        "305",
+        "295",
+        "300"
+      ],
+      [
+        "295",
+        "285",
+        "290"
+      ],
+      [
+        "285",
+        "275",
+        "280"
+      ],
+      [
+        "275",
+        "265",
+        "270"
+      ],
+      [
+        "265",
+        "255",
+        "260"
+      ],
+      [
+        "255",
+        "245",
+        "250"
+      ],
+      [
+        "245",
+        "235",
+        "240"
+      ],
+      [
+        "235",
+        "225",
+        "230"
+      ],
+      [
+        "225",
+        "215",
+        "220"
+      ],
+      [
+        "215",
+        "205",
+        "210"
+      ],
+      [
+        "205",
+        "195",
+        "200"
+      ],
+      [
+        "195",
+        "185",
+        "190"
+      ],
+      [
+        "185",
+        "175",
+        "180"
+      ],
+      [
+        "175",
+        "165",
+        "170"
+      ],
+      [
+        "165",
+        "155",
+        "160"
+      ],
+      [
+        "155",
+        "145",
+        "150"
+      ],
+      [
+        "220",
+        "155",
+        "215"
+      ],
+      [
+        "230",
+        "200",
+        "225"
+      ],
+      [
+        "228",
+        "160",
+        "165"
+      ]
+    ],
+    "expected": [
+      null,
+      {
+        "value": "305",
+        "isLong": false,
+        "extreme": "285",
+        "acceleration": "0.02"
+      },
+      {
+        "value": "305",
+        "isLong": false,
+        "extreme": "275",
+        "acceleration": "0.04"
+      },
+      {
+        "value": "303.80",
+        "isLong": false,
+        "extreme": "265",
+        "acceleration": "0.06"
+      },
+      {
+        "value": "301.4720",
+        "isLong": false,
+        "extreme": "255",
+        "acceleration": "0.08"
+      },
+      {
+        "value": "297.754240",
+        "isLong": false,
+        "extreme": "245",
+        "acceleration": "0.10"
+      },
+      {
+        "value": "292.47881600",
+        "isLong": false,
+        "extreme": "235",
+        "acceleration": "0.12"
+      },
+      {
+        "value": "285.5813580800",
+        "isLong": false,
+        "extreme": "225",
+        "acceleration": "0.14"
+      },
+      {
+        "value": "277.099967948800",
+        "isLong": false,
+        "extreme": "215",
+        "acceleration": "0.16"
+      },
+      {
+        "value": "267.16397307699200",
+        "isLong": false,
+        "extreme": "205",
+        "acceleration": "0.18"
+      },
+      {
+        "value": "255.9744579231334400",
+        "isLong": false,
+        "extreme": "195",
+        "acceleration": "0.20"
+      },
+      {
+        "value": "243.779566338506752000",
+        "isLong": false,
+        "extreme": "185",
+        "acceleration": "0.20"
+      },
+      {
+        "value": "232.02365307080540160000",
+        "isLong": false,
+        "extreme": "175",
+        "acceleration": "0.20"
+      },
+      {
+        "value": "220.6189224566443212800000",
+        "isLong": false,
+        "extreme": "165",
+        "acceleration": "0.20"
+      },
+      {
+        "value": "209.495137965315457024000000",
+        "isLong": false,
+        "extreme": "155",
+        "acceleration": "0.20"
+      },
+      {
+        "value": "198.5961103722523656192000000",
+        "isLong": false,
+        "extreme": "145",
+        "acceleration": "0.20"
+      },
+      {
+        "value": "145",
+        "isLong": true,
+        "extreme": "220",
+        "acceleration": "0.02"
+      },
+      {
+        "value": "145",
+        "isLong": true,
+        "extreme": "230",
+        "acceleration": "0.04"
+      },
+      {
+        "value": "148.40",
+        "isLong": true,
+        "extreme": "230",
+        "acceleration": "0.04"
+      }
+    ]
+  },
+  {
+    "name": "equal-init-boundary",
+    "bars": [
+      [
+        "105",
+        "95",
+        "100"
+      ],
+      [
+        "105",
+        "95",
+        "100"
+      ],
+      [
+        "110",
+        "99",
+        "108"
+      ],
+      [
+        "115",
+        "95.3",
+        "114"
+      ]
+    ],
+    "expected": [
+      null,
+      null,
+      {
+        "value": "95",
+        "isLong": true,
+        "extreme": "110",
+        "acceleration": "0.02"
+      },
+      {
+        "value": "95",
+        "isLong": true,
+        "extreme": "115",
+        "acceleration": "0.04"
+      }
+    ]
+  }
+]

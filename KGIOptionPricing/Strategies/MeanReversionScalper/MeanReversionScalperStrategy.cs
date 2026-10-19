@@ -2,10 +2,9 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
-using System.Text.Json;
 using KGIOptionPricing.OrderManagement.Core;
 using KGIOptionPricing.StrategyFramework;
-using KGIOptionPricing.StrategyFramework.Recovery;
+using KGIOptionPricing.StrategyFramework.Storage;
 
 namespace KGIOptionPricing.Strategies.MeanReversionScalper;
 
@@ -18,27 +17,33 @@ public sealed class MeanReversionScalperFactory : IStrategyFactory
 }
 
 public sealed class MeanReversionScalperStrategy : ISimulationStrategy, IManagedOrderStrategy,
-    IManagedOrderSubmissionObserver, IStrategyRecoveryParticipant
+    IManagedOrderSubmissionObserver, IStrategyHeartbeat, IStrategyHeartbeatWhilePaused,
+    IStrategyDecisionSource
 {
     private sealed record RangeSample(DateTimeOffset Time, decimal Price);
-    private sealed record RecoveryState(RangeSample[] RangeSamples, KeyValuePair<string, MarketEvent>[] Latest,
-        DateTimeOffset? FirstTradableTradeAt, DateTimeOffset CooldownUntil, decimal Center, decimal Range,
-        decimal BracketRange, decimal BuyEntry, decimal SellEntry, decimal LongStop, decimal ShortStop,
-        decimal StopPrice, string Reason, int CompletedTrades, bool BracketWorking, int CycleSequence,
-        string CurrentCycleId, PaperOrderRole? FilledEntryRole, bool TakeProfitSubmitted,
-        Dictionary<string, int> DeliveredEntryFillQuantities, StrategyLifecycleState State,
-        ManagedOrderBookCheckpoint OrderBook);
+    private enum ClosePhase { Open, CancellingGeneral, CancellingStop, FlattenPending, Closed, Blocked }
     private readonly StrategyDefinition _definition;
     private readonly Queue<RangeSample> _rangeSamples = new();
+    private readonly Dictionary<string, Queue<RangeSample>> _referenceSamples = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, MarketEvent> _latest = new(StringComparer.OrdinalIgnoreCase);
     private StrategyRuntimeContext? _context;
     private readonly int _horizonSeconds;
     private readonly decimal _f;
     private readonly decimal _k;
     private readonly int _minimumRangeTicks;
+    private readonly int _maximumRangeTicks;
     private readonly int _maximumSpreadTicks;
     private readonly int _freshnessSeconds;
     private readonly int _cooldownSeconds;
+    private readonly bool _useMovingAverage;
+    private readonly int _trendShiftTicks;
+    private readonly string _movingAverageReferenceProductId;
+    private readonly MeanReversionMovingAverage _movingAverage = new();
+    private decimal _referenceSma;
+    private int _appliedShiftTicks;
+    private readonly MeanReversionSessionSchedule _schedule;
+    private string? _sessionId;
+    private MeanReversionSessionWindow? _sessionWindow;
     private DateTimeOffset? _firstTradableTradeAt;
     private DateTimeOffset _cooldownUntil;
     private decimal _center;
@@ -55,64 +60,95 @@ public sealed class MeanReversionScalperStrategy : ISimulationStrategy, IManaged
     private string _reason = "尚未啟動";
     private int _completedTrades;
     private bool _bracketWorking;
+    private bool _submissionQuarantined;
+    private int _observedDirection;
     private ManagedStrategyOrderBook? _orderBook;
     private long _strategyRunGeneration;
     private int _cycleSequence;
     private string _currentCycleId = string.Empty;
     private PaperOrderRole? _filledEntryRole;
-    private bool _takeProfitSubmitted;
     private readonly Dictionary<string, int> _deliveredEntryFillQuantities = new(StringComparer.Ordinal);
-    private bool _restoredBeforeStart;
+    private readonly Dictionary<string, int> _deliveredFillQuantities = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _cancelRequested = new(StringComparer.Ordinal);
+    private ClosePhase _closePhase = ClosePhase.Open;
+    private bool _flattenSubmitted;
+    private decimal _lastValidTradePrice;
+    private DateTimeOffset _lastValidTradeAt;
+    private DateTimeOffset _observationTime;
+    private string _lastDecisionKey = string.Empty;
+    private long _decisionSequence;
 
     public string StrategyType => _definition.StrategyType;
     public string InstanceId => _definition.InstanceId;
     public StrategyLifecycleState State { get; private set; } = StrategyLifecycleState.Created;
+    public bool ShouldPulseWhilePaused => true;
     public event Action<PaperOrderRequest>? OrderRequested;
     public event Action? CancelAllRequested;
     public event Action<StrategySnapshot>? SnapshotChanged;
     public event Action<string>? CancelOrderRequested;
-    public string RecoverySchema => "mean-reversion-scalper/v2";
+    public event Action<StrategyDecisionObservation>? DecisionObserved;
 
     public MeanReversionScalperStrategy(StrategyDefinition definition)
     {
         _definition = definition;
-        _horizonSeconds = Int("HorizonSeconds", 900, 10, 86400);
-        _f = Decimal("F", 0.75m, 0.01m, 4m);
-        _k = Decimal("K", 0.87m, _f + 0.01m, 8m);
-        _minimumRangeTicks = Int("MinimumRangeTicks", 4, 1, 100000);
+        _horizonSeconds = Int("HorizonSeconds", 600, 10, 86400);
+        _f = Decimal("F", 0.60m, 0.01m, 4m);
+        _k = Decimal("K", 1.20m, _f + 0.01m, 8m);
+        _minimumRangeTicks = Int("MinimumRangeTicks", 8, 1, 100000);
+        _maximumRangeTicks = Int("MaximumRangeTicks", 20, 1, 100000);
+        if (_maximumRangeTicks < _minimumRangeTicks)
+            throw new ArgumentException("最大 R ticks 不得小於最小 R ticks。", nameof(definition));
         _maximumSpreadTicks = Int("MaximumSpreadTicks", 4, 1, 1000);
         _freshnessSeconds = Int("FreshnessSeconds", 3, 1, 60);
         _cooldownSeconds = Int("CooldownSeconds", 5, 0, 3600);
+        _useMovingAverage = definition.Parameters.TryGetValue("UseMovingAverage", out string? useMa) &&
+            bool.TryParse(useMa, out bool enabled) && enabled;
+        _trendShiftTicks = Int("TrendShiftTicks", 1, 0, 20);
+        _movingAverageReferenceProductId = definition.Parameters.TryGetValue("MovingAverageReferenceProductId", out string? reference) &&
+            !string.IsNullOrWhiteSpace(reference) ? reference.Trim() : "225M";
+        _schedule = MeanReversionSessionSchedule.Parse(definition.Parameters);
     }
 
     public void Start(StrategyRuntimeContext context)
     {
-        if (State != StrategyLifecycleState.Created && !_restoredBeforeStart) throw new InvalidOperationException("策略已啟動。");
+        if (State != StrategyLifecycleState.Created) throw new InvalidOperationException("策略已啟動。");
         _context = context;
-        if (_orderBook == null)
-        {
-            _strategyRunGeneration = context.StrategyRunGeneration;
-            _orderBook = new ManagedStrategyOrderBook(InstanceId, _strategyRunGeneration);
-        }
-        else if (_strategyRunGeneration != context.StrategyRunGeneration)
-            throw new InvalidOperationException("MR recovery run generation does not match runtime.");
-        if (_restoredBeforeStart) _restoredBeforeStart = false;
-        else
-        {
-            State = StrategyLifecycleState.WarmingUp;
-            _reason = $"累積 {_horizonSeconds} 秒成交資料";
-        }
+        _strategyRunGeneration = context.StrategyRunGeneration;
+        _orderBook = new ManagedStrategyOrderBook(InstanceId, _strategyRunGeneration);
+        State = StrategyLifecycleState.WarmingUp;
+        _reason = $"累積 {_horizonSeconds} 秒成交資料";
         Publish();
     }
 
     public void OnMarketEvent(MarketEvent marketEvent)
     {
         if (_context == null || State is StrategyLifecycleState.Stopped or StrategyLifecycleState.Faulted) return;
-        _latest[marketEvent.Symbol] = marketEvent;
-        if (!IsTradable(marketEvent.Symbol)) { Publish(); return; }
-
-        if (marketEvent.Kind == MarketEventKind.Trade && marketEvent.LastPrice > 0m)
+        AdvanceSession(marketEvent.Timestamp);
+        _observationTime = marketEvent.Timestamp;
+        MeanReversionSessionWindow? window = _schedule.Resolve(marketEvent.Timestamp);
+        if (!string.Equals(window?.SessionId, _sessionId, StringComparison.Ordinal))
         {
+            _sessionId = window?.SessionId;
+            _rangeSamples.Clear();
+            _referenceSamples.Clear();
+            _movingAverage.Reset();
+            _firstTradableTradeAt = null;
+            _range = 0m;
+            _latest.Clear();
+        }
+        _sessionWindow = window;
+        _latest[marketEvent.Symbol] = marketEvent;
+        if (!IsTradable(marketEvent.Symbol))
+        {
+            ObserveReference(marketEvent);
+            Publish();
+            return;
+        }
+
+        if (window != null && marketEvent.Kind == MarketEventKind.Trade && marketEvent.LastPrice > 0m)
+        {
+            _lastValidTradePrice = marketEvent.LastPrice;
+            _lastValidTradeAt = marketEvent.Timestamp;
             _firstTradableTradeAt ??= marketEvent.Timestamp;
             _rangeSamples.Enqueue(new RangeSample(marketEvent.Timestamp, marketEvent.LastPrice));
             DateTimeOffset cutoff = marketEvent.Timestamp.AddSeconds(-_horizonSeconds);
@@ -120,16 +156,40 @@ public sealed class MeanReversionScalperStrategy : ISimulationStrategy, IManaged
             _range = _rangeSamples.Count == 0 ? 0m : _rangeSamples.Max(x => x.Price) - _rangeSamples.Min(x => x.Price);
         }
 
+        if (_closePhase != ClosePhase.Open)
+        {
+            TryAdvanceClose();
+            Publish();
+            return;
+        }
+
+        if (_submissionQuarantined)
+        {
+            State = StrategyLifecycleState.Suspended;
+            Publish();
+            return;
+        }
+
         PositionSnapshot position = Position();
         if (position.NetQuantity != 0 || _bracketWorking)
         {
             State = StrategyLifecycleState.Running;
-            _reason = position.NetQuantity == 0 ? "雙邊模擬掛單中" : position.NetQuantity > 0 ? "模擬多單持有中" : "模擬空單持有中";
+            _reason = position.NetQuantity == 0 ? "雙側限價單工作中" :
+                position.NetQuantity > 0 ? "多單持有；原賣單作限價出場" : "空單持有；原買單作限價出場";
             Publish();
             return;
         }
 
         if (marketEvent.Kind != MarketEventKind.Trade) { Publish(); return; }
+        if (window == null || marketEvent.Timestamp < window.TradingStart || marketEvent.Timestamp >= window.Stop)
+        {
+            State = StrategyLifecycleState.Suspended;
+            _reason = window == null ? "非交易時段，禁止進場" :
+                marketEvent.Timestamp < window.TradingStart ? $"PreStart：{window.TradingStart:HH:mm} 前暖機，禁止進場" :
+                "SessionStop：禁止新進場";
+            Publish();
+            return;
+        }
         if (marketEvent.Timestamp < _cooldownUntil)
         {
             State = StrategyLifecycleState.Ready;
@@ -155,12 +215,27 @@ public sealed class MeanReversionScalperStrategy : ISimulationStrategy, IManaged
     {
         if (_context == null || State is StrategyLifecycleState.Stopped or StrategyLifecycleState.Faulted ||
             !string.Equals(execution.StrategyInstanceId, InstanceId, StringComparison.OrdinalIgnoreCase)) return;
+        if (_orderBook == null || !_orderBook.TryGet(execution.ClientOrderId, out PaperOrderRequest? owned) ||
+            owned == null || owned.StrategyRunGeneration != execution.StrategyRunGeneration ||
+            !string.Equals(owned.CycleId, execution.CycleId, StringComparison.Ordinal) ||
+            (!string.IsNullOrWhiteSpace(execution.PairId) &&
+             !string.Equals(owned.PairId, execution.PairId, StringComparison.Ordinal))) return;
+        _observationTime = execution.Timestamp;
         if (execution.Role is PaperOrderRole.EntryLong or PaperOrderRole.EntryShort && string.IsNullOrEmpty(_currentCycleId))
             _currentCycleId = string.IsNullOrWhiteSpace(execution.CycleId) ? $"cycle-{++_cycleSequence}" : execution.CycleId;
         if (execution.Role is PaperOrderRole.EntryLong or PaperOrderRole.EntryShort &&
             !string.IsNullOrWhiteSpace(execution.ClientOrderId))
             _deliveredEntryFillQuantities[execution.ClientOrderId] =
                 _deliveredEntryFillQuantities.GetValueOrDefault(execution.ClientOrderId) + execution.Quantity;
+        if (!string.IsNullOrWhiteSpace(execution.ClientOrderId))
+            _deliveredFillQuantities[execution.ClientOrderId] =
+                _deliveredFillQuantities.GetValueOrDefault(execution.ClientOrderId) + execution.Quantity;
+        if (_closePhase != ClosePhase.Open)
+        {
+            TryAdvanceClose();
+            Publish();
+            return;
+        }
         switch (execution.Role)
         {
             case PaperOrderRole.EntryLong:
@@ -170,12 +245,10 @@ public sealed class MeanReversionScalperStrategy : ISimulationStrategy, IManaged
                     break;
                 }
                 _filledEntryRole = PaperOrderRole.EntryLong;
-                _takeProfitSubmitted = false;
-                _bracketWorking = false;
                 SubmitExit(BuySell.Sell, PaperOrderType.Stop, PaperOrderRole.StopLoss, _longStop);
                 _stopPrice = _longStop;
                 State = StrategyLifecycleState.Running;
-                _reason = $"多單成交 {execution.Price}，固定停損已保護，等待進場撤單結算";
+                _reason = $"多單成交 {execution.Price}，原賣單維持掛單作停利，固定停損監控中";
                 break;
             case PaperOrderRole.EntryShort:
                 if (_filledEntryRole is PaperOrderRole.EntryLong)
@@ -184,27 +257,28 @@ public sealed class MeanReversionScalperStrategy : ISimulationStrategy, IManaged
                     break;
                 }
                 _filledEntryRole = PaperOrderRole.EntryShort;
-                _takeProfitSubmitted = false;
-                _bracketWorking = false;
                 SubmitExit(BuySell.Buy, PaperOrderType.Stop, PaperOrderRole.StopLoss, _shortStop);
                 _stopPrice = _shortStop;
                 State = StrategyLifecycleState.Running;
-                _reason = $"空單成交 {execution.Price}，固定停損已保護，等待進場撤單結算";
+                _reason = $"空單成交 {execution.Price}，原買單維持掛單作停利，固定停損監控中";
                 break;
             case PaperOrderRole.TakeProfit:
             case PaperOrderRole.StopLoss:
             case PaperOrderRole.Flatten:
-                _bracketWorking = false;
                 _completedTrades++;
                 _cooldownUntil = execution.Timestamp.AddSeconds(_cooldownSeconds);
                 _stopPrice = 0m;
                 _bracketRange = 0m;
                 _filledEntryRole = null;
-                _takeProfitSubmitted = false;
                 State = StrategyLifecycleState.Ready;
-                _reason = execution.Role == PaperOrderRole.TakeProfit ? "停利完成，進入冷卻" : "停損完成，進入冷卻";
+                _reason = execution.Role == PaperOrderRole.TakeProfit ? "停利成交，撤銷本週期停損監控" : "停損成交，等待本週期委託結清";
+                if (execution.Role == PaperOrderRole.TakeProfit)
+                    CancelCycleStops();
+                else if (execution.Role == PaperOrderRole.StopLoss)
+                    CancelCycleEntryOrders();
                 break;
         }
+        TryCompletePairedCycle();
         Publish();
     }
 
@@ -233,9 +307,19 @@ public sealed class MeanReversionScalperStrategy : ISimulationStrategy, IManaged
     public void Resume()
     {
         if (State != StrategyLifecycleState.Suspended) return;
+        if (_submissionQuarantined) return;
         DateTimeOffset now = _context?.Clock.Now ?? DateTimeOffset.Now;
         State = WarmupComplete(now) ? StrategyLifecycleState.Ready : StrategyLifecycleState.WarmingUp;
         _reason = State == StrategyLifecycleState.Ready ? "已繼續，等待下一筆行情" : $"繼續暖機：累積 {_horizonSeconds} 秒成交資料";
+        Publish();
+    }
+
+    public void OnHeartbeat(DateTimeOffset now)
+    {
+        if (_context == null || State is StrategyLifecycleState.Stopped or StrategyLifecycleState.Faulted) return;
+        _observationTime = now;
+        AdvanceSession(now);
+        if (_closePhase != ClosePhase.Open) TryAdvanceClose();
         Publish();
     }
 
@@ -251,19 +335,39 @@ public sealed class MeanReversionScalperStrategy : ISimulationStrategy, IManaged
         decimal last = 0m;
         if (_context != null && _latest.TryGetValue(_context.Universe.Tradable.Symbol, out MarketEvent? tradable))
             last = tradable.LastPrice > 0m ? tradable.LastPrice : tradable.MidPrice;
+        _latest.TryGetValue(_context?.Universe.Tradable.Symbol ?? string.Empty, out MarketEvent? lastBook);
         return new StrategySnapshot
         {
             StrategyType = StrategyType,
             InstanceId = InstanceId,
-            ParameterSummary = $"H={_horizonSeconds}s; F={_f}; K={_k}; MinR={_minimumRangeTicks}t; MaxSpread={_maximumSpreadTicks}t; Fresh={_freshnessSeconds}s; Cooldown={_cooldownSeconds}s",
+            ParameterSummary = $"H={_horizonSeconds}s; F={_f}; K={_k}; MinR={_minimumRangeTicks}t; MaxR={_maximumRangeTicks}t; MA={_useMovingAverage}; MARef={_movingAverageReferenceProductId}; N={_trendShiftTicks}/{_appliedShiftTicks}t; SMA={_referenceSma}; Buy={_buyEntry}; Sell={_sellEntry}; LongStop={_longStop}; ShortStop={_shortStop}; MaxSpread={_maximumSpreadTicks}t; Fresh={_freshnessSeconds}s; Cooldown={_cooldownSeconds}s; DayStart={_schedule.DayStartTime:HH:mm}; DayStop={_schedule.DayStopTime:HH:mm}; NightStart={_schedule.NightStartTime:HH:mm}; NightStop={_schedule.NightStopTime:HH:mm}",
             TradableProductId = _context?.Universe.Tradable.ProductId ?? _definition.Universe.Tradable.ProductId,
             TradableSymbol = _context?.Universe.Tradable.Symbol ?? string.Empty,
             ReferenceSummary = references,
             State = State,
             Reason = _reason,
+            Features = new Dictionary<string, decimal?>
+            {
+                ["RollingRangePoints"] = _range, ["FrozenRangePoints"] = _bracketRange,
+                ["ReferenceSma"] = _referenceSma, ["TrendSign"] = _observedDirection,
+                ["RequestedShiftTicks"] = _useMovingAverage ? _trendShiftTicks : 0,
+                ["AppliedShiftTicks"] = _appliedShiftTicks,
+                ["Bid1"] = lastBook?.BestBid, ["Ask1"] = lastBook?.BestAsk,
+                ["FrozenBuy"] = _buyEntry, ["FrozenSell"] = _sellEntry,
+                ["FrozenLongStop"] = _longStop, ["FrozenShortStop"] = _shortStop
+            },
+            Diagnostics = new Dictionary<string, string>
+            {
+                ["PairId"] = _currentCycleId,
+                ["MovingAverageReferenceProductId"] = _movingAverageReferenceProductId,
+                ["UseMovingAverage"] = _useMovingAverage.ToString(),
+                ["LocalCycleState"] = _closePhase != ClosePhase.Open ? _closePhase.ToString() :
+                    _filledEntryRole == null ? (_bracketWorking ? "Working" : "Idle") : "Held"
+            },
             LastPrice = last,
             CenterPrice = _center,
             Range = _bracketWorking || position.NetQuantity != 0 ? _bracketRange : _range,
+            RollingRange = _range,
             BuyEntry = _buyEntry,
             SellEntry = _sellEntry,
             StopPrice = _stopPrice,
@@ -282,19 +386,35 @@ public sealed class MeanReversionScalperStrategy : ISimulationStrategy, IManaged
         MarketEvent book = _latest[_context.Universe.Tradable.Symbol];
         _center = book.MidPrice;
         _bracketRange = _range;
-        _buyEntry = RoundDown(_center - _bracketRange * _f / 2m);
-        _sellEntry = RoundUp(_center + _bracketRange * _f / 2m);
-        _longStop = RoundDown(_center - _bracketRange * _k / 2m);
-        _shortStop = RoundUp(_center + _bracketRange * _k / 2m);
+        if (!MeanReversionPairPricing.TryCompute(_center, _bracketRange, _f, _k,
+            TickSize(), book.BestBid, book.BestAsk, _observedDirection,
+            _useMovingAverage ? _trendShiftTicks : 0, out MeanReversionPairPrices prices))
+            throw new InvalidOperationException("No passive paired prices at the validated book.");
+        _buyEntry = prices.Buy;
+        _sellEntry = prices.Sell;
+        _longStop = prices.LongStop;
+        _shortStop = prices.ShortStop;
+        _appliedShiftTicks = prices.AppliedShiftTicks;
         _currentCycleId = $"cycle-{++_cycleSequence}";
         _filledEntryRole = null;
-        _takeProfitSubmitted = false;
         _deliveredEntryFillQuantities.Clear();
-        SubmitExit(BuySell.Buy, PaperOrderType.BrokerLimit, PaperOrderRole.EntryLong, _buyEntry);
-        SubmitExit(BuySell.Sell, PaperOrderType.BrokerLimit, PaperOrderRole.EntryShort, _sellEntry);
         _bracketWorking = true;
         State = StrategyLifecycleState.Running;
-        _reason = $"雙邊限價掛單：買 {_buyEntry}／賣 {_sellEntry}";
+        _reason = $"雙側限價掛單：買 {_buyEntry}、賣 {_sellEntry}，MA 位移 {_appliedShiftTicks} 跳";
+        try
+        {
+            SubmitExit(BuySell.Buy, PaperOrderType.BrokerLimit, PaperOrderRole.EntryLong, _buyEntry);
+            if (_submissionQuarantined) return;
+            SubmitExit(BuySell.Sell, PaperOrderType.BrokerLimit, PaperOrderRole.EntryShort, _sellEntry);
+        }
+        catch (Exception error)
+        {
+            _bracketWorking = true;
+            _submissionQuarantined = true;
+            State = StrategyLifecycleState.Suspended;
+            _reason = $"雙側委託提交不完整：{error.Message}；等待已送委託撤銷及人工核對";
+            CancelCycleEntryOrders();
+        }
     }
 
     private void SubmitExit(BuySell side, PaperOrderType type, PaperOrderRole role, decimal price)
@@ -306,6 +426,9 @@ public sealed class MeanReversionScalperStrategy : ISimulationStrategy, IManaged
                 .NextClientOrderId(role.ToString(), _currentCycleId),
             CycleId = _currentCycleId,
             OcoGroupId = _currentCycleId,
+            PairId = _currentCycleId,
+            RestingPairMode = role is PaperOrderRole.EntryLong or PaperOrderRole.EntryShort
+                ? RestingPairMode.OppositeLegIsExit : RestingPairMode.None,
             StrategyRunGeneration = _strategyRunGeneration,
             Generation = 0,
             StrategyInstanceId = InstanceId,
@@ -332,8 +455,16 @@ public sealed class MeanReversionScalperStrategy : ISimulationStrategy, IManaged
         decimal tick = TickSize();
         if (_range < tick * _minimumRangeTicks)
         { reason = $"R={_range} 小於 {_minimumRangeTicks} ticks"; return false; }
+        if (_range > tick * _maximumRangeTicks)
+        { reason = $"R={_range} 大於 {_maximumRangeTicks} ticks"; return false; }
 
-        foreach (ResolvedProduct product in _context.Universe.AllProducts)
+        IEnumerable<ResolvedProduct> required = _useMovingAverage
+            ? new[] { _context.Universe.Tradable }.Concat(_context.Universe.References.Where(x =>
+                string.Equals(x.ProductId, _movingAverageReferenceProductId, StringComparison.OrdinalIgnoreCase)))
+            : new[] { _context.Universe.Tradable };
+        if (_useMovingAverage && !required.Skip(1).Any())
+        { reason = $"找不到均線參考商品 {_movingAverageReferenceProductId}"; return false; }
+        foreach (ResolvedProduct product in required)
         {
             if (!_latest.TryGetValue(product.Symbol, out MarketEvent? market))
             { reason = $"等待 {product.ProductId} 行情"; return false; }
@@ -346,8 +477,41 @@ public sealed class MeanReversionScalperStrategy : ISimulationStrategy, IManaged
         MarketEvent primary = _latest[_context.Universe.Tradable.Symbol];
         if ((primary.BestAsk - primary.BestBid) / tick > _maximumSpreadTicks)
         { reason = "交易商品價差過大"; return false; }
+        _observedDirection = 0;
+        _referenceSma = 0m;
+        if (_useMovingAverage)
+        {
+            ResolvedProduct reference = required.Skip(1).First();
+            MarketEvent referenceQuote = _latest[reference.Symbol];
+            if (!_movingAverage.TryGet(now, _horizonSeconds, _freshnessSeconds,
+                referenceQuote.MidPrice, out _referenceSma, out _observedDirection))
+            { reason = $"均線參考 {_movingAverageReferenceProductId} 尚無完整 H 秒報價"; return false; }
+        }
+        if (!MeanReversionPairPricing.TryCompute(primary.MidPrice, _range, _f, _k,
+            tick, primary.BestBid, primary.BestAsk, _observedDirection,
+            _useMovingAverage ? _trendShiftTicks : 0, out _))
+        { reason = "目前買賣盤無可行的被動雙側價格"; return false; }
         reason = string.Empty;
         return true;
+    }
+
+    private void ObserveReference(MarketEvent market)
+    {
+        if (_context == null || _sessionWindow == null ||
+            !_context.Universe.References.Any(x => string.Equals(x.Symbol, market.Symbol, StringComparison.OrdinalIgnoreCase)) ||
+            market.BestBid <= 0m || market.BestAsk <= market.BestBid) return;
+        if (string.Equals(market.ProductId, _movingAverageReferenceProductId, StringComparison.OrdinalIgnoreCase))
+            _movingAverage.Observe(market.Timestamp, market.BestBid, market.BestAsk);
+        if (!_referenceSamples.TryGetValue(market.Symbol, out Queue<RangeSample>? samples))
+            _referenceSamples[market.Symbol] = samples = new Queue<RangeSample>();
+        // Direction does not need tick-by-tick depth history. One quote per second
+        // bounds memory while the latest valid quote remains in _latest.
+        if (samples.Count == 0 || (market.Timestamp - samples.Last().Time).TotalSeconds >= 1)
+            samples.Enqueue(new RangeSample(market.Timestamp, market.MidPrice));
+        DateTimeOffset cutoff = market.Timestamp.AddSeconds(-_horizonSeconds);
+        // Keep the most recent observation at/before the start of H, so a full
+        // horizon is measured rather than the first conveniently available quote.
+        while (samples.Count > 1 && samples.Skip(1).First().Time <= cutoff) samples.Dequeue();
     }
 
     private bool IsTradable(string symbol) => _context != null &&
@@ -359,7 +523,85 @@ public sealed class MeanReversionScalperStrategy : ISimulationStrategy, IManaged
     private decimal TickSize() => Math.Max(0.00001m, _context?.Universe.Tradable.TickSize ?? 1m);
     private decimal RoundDown(decimal price) => Math.Floor(price / TickSize()) * TickSize();
     private decimal RoundUp(decimal price) => Math.Ceiling(price / TickSize()) * TickSize();
-    private void Publish() => SnapshotChanged?.Invoke(GetSnapshot());
+    private void Publish()
+    {
+        SnapshotChanged?.Invoke(GetSnapshot());
+        if (_context == null) return;
+        DateTimeOffset at = _observationTime == default ? _context.Clock.Now : _observationTime;
+        string reasonCode = DecisionReasonCode();
+        string key = $"{_sessionId}|{State}|{reasonCode}|{_currentCycleId}|{_observedDirection}";
+        if (key == _lastDecisionKey) return;
+        _lastDecisionKey = key;
+        decimal elapsed = _firstTradableTradeAt.HasValue
+            ? Math.Max(0m, (decimal)(at - _firstTradableTradeAt.Value).TotalSeconds) : 0m;
+        decimal minRange = TickSize() * _minimumRangeTicks;
+        decimal maxRange = TickSize() * _maximumRangeTicks;
+        bool inEntryWindow = _sessionWindow != null && at >= _sessionWindow.TradingStart && at < _sessionWindow.Stop;
+        var features = new Dictionary<string, decimal?>
+        {
+            ["HorizonSeconds"] = _horizonSeconds, ["RangePoints"] = _range,
+            ["MinimumRangePoints"] = minRange, ["MaximumRangePoints"] = maxRange,
+            ["ReferenceDirection"] = _observedDirection, ["ReferenceSma"] = _referenceSma,
+            ["RequestedShiftTicks"] = _useMovingAverage ? _trendShiftTicks : 0,
+            ["AppliedShiftTicks"] = _appliedShiftTicks,
+            ["Position"] = Position().NetQuantity,
+            ["InEntryWindow"] = inEntryWindow ? 1m : 0m
+        };
+        foreach (ResolvedProduct reference in _context.Universe.References)
+            features[$"{reference.ProductId}ChangePoints"] =
+                _referenceSamples.TryGetValue(reference.Symbol, out Queue<RangeSample>? samples) &&
+                samples.Count > 0 && _latest.TryGetValue(reference.Symbol, out MarketEvent? latest) &&
+                latest.BestBid > 0m && latest.BestAsk > latest.BestBid ?
+                    latest.MidPrice - samples.Peek().Price : null;
+        DecisionObserved?.Invoke(new StrategyDecisionObservation
+        {
+            Sequence = ++_decisionSequence,
+            Timestamp = at,
+            StrategyType = StrategyType,
+            StrategyInstanceId = InstanceId,
+            CandidateId = _currentCycleId,
+            IsCandidate = reasonCode == "EntryBracket",
+            CycleId = _currentCycleId,
+            Symbol = _context.Universe.Tradable.Symbol,
+            Direction = _observedDirection > 0 ? "long" : _observedDirection < 0 ? "short" : string.Empty,
+            State = State,
+            Decision = reasonCode == "EntryBracket" ? StrategyDecision.Accept :
+                reasonCode == "Warmup" ? StrategyDecision.Warmup :
+                reasonCode is "SessionStop" or "CancelPending" or "FlattenPending" or "CloseBlocked"
+                    ? StrategyDecision.Halt : State == StrategyLifecycleState.Suspended
+                        ? StrategyDecision.Reject : StrategyDecision.Hold,
+            Features = features,
+            Thresholds = new[]
+            {
+                new ThresholdObservation("HorizonSeconds", elapsed, _horizonSeconds, "s", WarmupComplete(at)),
+                new ThresholdObservation("MinimumRangePoints", _range, minRange, "points", _range >= minRange),
+                new ThresholdObservation("MaximumRangePoints", _range, maxRange, "points", _range <= maxRange),
+                new ThresholdObservation("MovingAverageReady", !_useMovingAverage || _referenceSma > 0m ? 1m : 0m,
+                    1m, "bool", !_useMovingAverage || _referenceSma > 0m),
+                new ThresholdObservation("EntryWindow", inEntryWindow ? 1m : 0m, 1m, "bool", inEntryWindow)
+            },
+            PrimaryReasonCode = reasonCode
+        });
+    }
+
+    private string DecisionReasonCode()
+    {
+        if (_closePhase == ClosePhase.Blocked) return "CloseBlocked";
+        if (_closePhase == ClosePhase.FlattenPending) return "FlattenPending";
+        if (_closePhase is ClosePhase.CancellingGeneral or ClosePhase.CancellingStop) return "CancelPending";
+        if (_closePhase == ClosePhase.Closed) return "SessionStop";
+        if (_reason.StartsWith("PreStart", StringComparison.Ordinal)) return "PreStart";
+        if (State == StrategyLifecycleState.WarmingUp) return "Warmup";
+        if (_reason.StartsWith("雙側限價掛單", StringComparison.Ordinal)) return "EntryBracket";
+        if (_reason.StartsWith("冷卻", StringComparison.Ordinal)) return "Cooldown";
+        if (_reason.StartsWith("R=", StringComparison.Ordinal))
+            return _reason.Contains("大於", StringComparison.Ordinal) ? "MaximumRange" : "MinimumRange";
+        if (_reason.StartsWith("方向", StringComparison.Ordinal)) return "ReferenceDirection";
+        if (_reason.Contains("行情過期", StringComparison.Ordinal)) return "StaleMarketData";
+        if (_reason.Contains("委託簿無效", StringComparison.Ordinal)) return "InvalidBook";
+        if (_reason.Contains("價差過大", StringComparison.Ordinal)) return "SpreadTooWide";
+        return State.ToString();
+    }
 
     public void OnOrderSubmitted(PaperOrderRequest request) =>
         (_orderBook ?? throw new InvalidOperationException("Order book not initialized.")).Track(request);
@@ -367,10 +609,36 @@ public sealed class MeanReversionScalperStrategy : ISimulationStrategy, IManaged
     public void OnOrderLifecycle(OrderLifecycleEvent orderEvent)
     {
         if (_orderBook == null || !_orderBook.TryGet(orderEvent.ClientOrderId, out PaperOrderRequest? request) ||
-            request == null || !_orderBook.Apply(orderEvent)) return;
+            request == null) return;
+        _observationTime = orderEvent.Timestamp;
+        if (_closePhase != ClosePhase.Open &&
+            orderEvent.ReasonCode == "CancelRequestNotRouted" &&
+            string.Equals(orderEvent.StrategyInstanceId, InstanceId, StringComparison.Ordinal) &&
+            orderEvent.StrategyRunGeneration == _strategyRunGeneration)
+        {
+            BlockClose($"委託 {orderEvent.ClientOrderId} 撤單無法路由");
+            Publish();
+            return;
+        }
+        if (!_orderBook.Apply(orderEvent)) return;
+        if (_closePhase != ClosePhase.Open)
+        {
+            TryAdvanceClose();
+            Publish();
+            return;
+        }
         if (request.Role is PaperOrderRole.EntryLong or PaperOrderRole.EntryShort)
         {
             if (orderEvent.State is not (OrderLifecycleState.Filled or OrderLifecycleState.Cancelled or OrderLifecycleState.Rejected)) return;
+            if (orderEvent.State == OrderLifecycleState.Rejected)
+            {
+                _submissionQuarantined = true;
+                State = StrategyLifecycleState.Suspended;
+                _reason = "雙側委託有一邊被拒，撤銷另一邊並等待人工核對";
+                CancelCycleEntryOrders();
+                Publish();
+                return;
+            }
             if (!orderEvent.HasFinalCumulativeFillWatermark ||
                 orderEvent.FilledQuantity != _deliveredEntryFillQuantities.GetValueOrDefault(orderEvent.ClientOrderId))
             {
@@ -380,51 +648,154 @@ public sealed class MeanReversionScalperStrategy : ISimulationStrategy, IManaged
                 return;
             }
             if (string.Equals(request.CycleId, _currentCycleId, StringComparison.Ordinal))
-                TrySubmitTakeProfitAfterEntrySettlement();
+            {
+                TryCompletePairedCycle();
+                Publish();
+            }
             return;
         }
+        TryCompletePairedCycle();
         if (orderEvent.State is not (OrderLifecycleState.Cancelled or OrderLifecycleState.Rejected)) return;
         if (request.Role is PaperOrderRole.TakeProfit or PaperOrderRole.StopLoss && Position().NetQuantity != 0)
         { State = StrategyLifecycleState.Suspended; _reason = $"保護單{(orderEvent.State == OrderLifecycleState.Rejected ? "遭拒" : "已撤銷")}，需人工處理"; Publish(); }
     }
 
-    public StrategyRecoveryCheckpoint CaptureRecoveryCheckpoint()
+    private void AdvanceSession(DateTimeOffset now)
     {
-        if (_orderBook == null) throw new InvalidOperationException("MR strategy has not initialized its managed order book.");
-        var state = new RecoveryState(_rangeSamples.ToArray(), _latest.ToArray(), _firstTradableTradeAt,
-            _cooldownUntil, _center, _range, _bracketRange, _buyEntry, _sellEntry, _longStop, _shortStop,
-            _stopPrice, _reason, _completedTrades, _bracketWorking, _cycleSequence, _currentCycleId,
-            _filledEntryRole, _takeProfitSubmitted, new Dictionary<string, int>(_deliveredEntryFillQuantities, StringComparer.Ordinal),
-            State, _orderBook.Capture());
-        return new StrategyRecoveryCheckpoint(StrategyType, InstanceId, _strategyRunGeneration, RecoverySchema,
-            DateTimeOffset.UtcNow, JsonSerializer.Serialize(state));
+        MeanReversionSessionWindow? window = _schedule.Resolve(now);
+        MeanReversionSessionWindow? ending = _sessionWindow ?? window;
+        if (_closePhase == ClosePhase.Open && ending != null && now >= ending.Stop)
+        {
+            _sessionId ??= ending.SessionId;
+            _sessionWindow ??= ending;
+            _closePhase = ClosePhase.CancellingGeneral;
+            _reason = "SessionStop：撤銷既有委託";
+            State = StrategyLifecycleState.Suspended;
+            TryAdvanceClose();
+        }
+        if (_closePhase == ClosePhase.Closed && _sessionId != null && window != null &&
+            !string.Equals(window.SessionId, _sessionId, StringComparison.Ordinal) &&
+            Position().NetQuantity == 0 &&
+            _orderBook?.Snapshot().Orders.All(IsSettled) != false)
+        {
+            _closePhase = ClosePhase.Open;
+            _flattenSubmitted = false;
+            _cancelRequested.Clear();
+            _bracketWorking = false;
+            _sessionId = window.SessionId;
+            _sessionWindow = window;
+            _rangeSamples.Clear();
+            _referenceSamples.Clear();
+            _firstTradableTradeAt = null;
+            _range = 0m;
+            _latest.Clear();
+            _lastValidTradePrice = 0m;
+            _lastValidTradeAt = default;
+            _reason = "新時段重新暖機";
+            State = StrategyLifecycleState.WarmingUp;
+        }
     }
 
-    public void RestoreRecoveryCheckpoint(StrategyRecoveryCheckpoint checkpoint)
+    private void TryAdvanceClose()
     {
-        StrategyRecoveryCheckpointValidator.EnsureCompatible(checkpoint, StrategyType, InstanceId,
-            checkpoint.StrategyRunGeneration, RecoverySchema);
-        RecoveryState state = JsonSerializer.Deserialize<RecoveryState>(checkpoint.PayloadJson)
-            ?? throw new InvalidOperationException("MR recovery payload is empty.");
-        if (_strategyRunGeneration != 0 && _strategyRunGeneration != checkpoint.StrategyRunGeneration)
-            throw new InvalidOperationException("MR checkpoint run generation conflicts with the runtime.");
-        _strategyRunGeneration = checkpoint.StrategyRunGeneration;
-        _orderBook ??= new ManagedStrategyOrderBook(InstanceId, _strategyRunGeneration);
-        _orderBook.Restore(state.OrderBook);
-        _rangeSamples.Clear(); foreach (RangeSample sample in state.RangeSamples) _rangeSamples.Enqueue(sample);
-        _latest.Clear(); foreach (var item in state.Latest) _latest[item.Key] = item.Value;
-        _firstTradableTradeAt = state.FirstTradableTradeAt; _cooldownUntil = state.CooldownUntil;
-        _center = state.Center; _range = state.Range; _bracketRange = state.BracketRange;
-        _buyEntry = state.BuyEntry; _sellEntry = state.SellEntry; _longStop = state.LongStop; _shortStop = state.ShortStop;
-        _stopPrice = state.StopPrice; _reason = state.Reason; _completedTrades = state.CompletedTrades;
-        _bracketWorking = state.BracketWorking; _cycleSequence = state.CycleSequence; _currentCycleId = state.CurrentCycleId;
-        _filledEntryRole = state.FilledEntryRole; _takeProfitSubmitted = state.TakeProfitSubmitted;
-        _deliveredEntryFillQuantities.Clear();
-        foreach ((string clientOrderId, int quantity) in state.DeliveredEntryFillQuantities)
-            _deliveredEntryFillQuantities[clientOrderId] = quantity;
-        State = state.State;
-        _restoredBeforeStart = _context == null;
+        if (_closePhase is ClosePhase.Open or ClosePhase.Blocked || _orderBook == null || _context == null) return;
+        ManagedOrderRecord[] records = _orderBook.Snapshot().Orders.ToArray();
+        ManagedOrderRecord[] general = records.Where(x => x.Request.Role is not
+            (PaperOrderRole.StopLoss or PaperOrderRole.Flatten)).ToArray();
+        if (general.Any(HasProtocolGap)) { BlockClose("一般委託成交水位或撤單路由未確認"); return; }
+        if (!general.All(IsSettled))
+        {
+            _closePhase = ClosePhase.CancellingGeneral;
+            _reason = "CancelPending：等待一般委託撤單及成交水位";
+            CancelActive(general);
+            return;
+        }
+
+        ManagedOrderRecord[] stops = records.Where(x => x.Request.Role == PaperOrderRole.StopLoss).ToArray();
+        if (stops.Any(HasProtocolGap)) { BlockClose("停損委託成交水位或撤單路由未確認"); return; }
+        if (!stops.All(IsSettled))
+        {
+            _closePhase = ClosePhase.CancellingStop;
+            _reason = "CancelPending：等待保護停損撤單及成交水位";
+            CancelActive(stops);
+            return;
+        }
+
+        ManagedOrderRecord[] flatten = records.Where(x => x.Request.Role == PaperOrderRole.Flatten).ToArray();
+        if (flatten.Length > 0)
+        {
+            if (flatten.Any(HasProtocolGap)) { BlockClose("平倉委託成交水位未確認"); return; }
+            if (flatten.All(IsSettled))
+            {
+                if (Position().NetQuantity != 0) { BlockClose("平倉回報已終結，但策略帳本仍有部位"); return; }
+                CloseCompleted();
+            }
+            else
+            {
+                _closePhase = ClosePhase.FlattenPending;
+                _reason = "FlattenPending：等待風險平倉成交";
+            }
+            return;
+        }
+        PositionSnapshot position = Position();
+        if (position.NetQuantity == 0) { CloseCompleted(); return; }
+        // Market flatten uses this price only as a required request reference;
+        // its executable price is determined by the broker. A stale last trade
+        // must not suppress a risk-reducing close after all orders settle.
+        if (_flattenSubmitted || _lastValidTradePrice <= 0m || _lastValidTradeAt == default)
+        { BlockClose("缺少有效成交價或平倉已送出，需人工核對"); return; }
+        _flattenSubmitted = true;
+        _closePhase = ClosePhase.FlattenPending;
+        _reason = "FlattenPending：送出一次風險市價平倉";
+        try
+        {
+            SubmitExit(position.NetQuantity > 0 ? BuySell.Sell : BuySell.Buy,
+                PaperOrderType.Market, PaperOrderRole.Flatten, _lastValidTradePrice);
+        }
+        catch (Exception error)
+        {
+            BlockClose($"風險平倉送單失敗：{error.Message}");
+        }
     }
+
+    private void CancelActive(IEnumerable<ManagedOrderRecord> records)
+    {
+        foreach (ManagedOrderRecord record in records.Where(x => !IsSettled(x)))
+            if (_cancelRequested.Add(record.Request.ClientOrderId))
+            {
+                try { CancelOrderRequested?.Invoke(record.Request.ClientOrderId); }
+                catch (Exception error) { BlockClose($"委託 {record.Request.ClientOrderId} 撤單失敗：{error.Message}"); return; }
+            }
+    }
+
+    private bool IsSettled(ManagedOrderRecord record) =>
+        record.LastLifecycle is { State: OrderLifecycleState.Filled or
+            OrderLifecycleState.Cancelled or OrderLifecycleState.Rejected,
+            HasFinalCumulativeFillWatermark: true } terminal &&
+        terminal.FilledQuantity == _deliveredFillQuantities.GetValueOrDefault(record.Request.ClientOrderId);
+
+    private bool HasProtocolGap(ManagedOrderRecord record) =>
+        record.LastLifecycle is { ReasonCode: "CancelRequestNotRouted" } ||
+        record.LastLifecycle is { State: OrderLifecycleState.Filled or
+            OrderLifecycleState.Cancelled or OrderLifecycleState.Rejected } terminal &&
+        (!terminal.HasFinalCumulativeFillWatermark ||
+         terminal.FilledQuantity != _deliveredFillQuantities.GetValueOrDefault(record.Request.ClientOrderId));
+
+    private void BlockClose(string detail)
+    {
+        _closePhase = ClosePhase.Blocked;
+        State = StrategyLifecycleState.Suspended;
+        _reason = $"CloseBlocked：{detail}";
+    }
+
+    private void CloseCompleted()
+    {
+        _closePhase = ClosePhase.Closed;
+        _bracketWorking = false;
+        State = StrategyLifecycleState.Suspended;
+        _reason = "SessionStop：委託已結清，策略部位為零；本時段禁止新進場";
+    }
+
 
     private void CancelActiveOrders()
     {
@@ -433,52 +804,36 @@ public sealed class MeanReversionScalperStrategy : ISimulationStrategy, IManaged
             CancelOrderRequested?.Invoke(clientOrderId);
     }
 
-    private void TrySubmitTakeProfitAfterEntrySettlement()
+    private void CancelCycleStops()
     {
-        if (_orderBook == null || _filledEntryRole is not (PaperOrderRole.EntryLong or PaperOrderRole.EntryShort) ||
-            _takeProfitSubmitted || State == StrategyLifecycleState.Suspended)
-            return;
+        if (_orderBook == null) return;
+        foreach (ManagedOrderRecord record in _orderBook.Snapshot().Orders.Where(x =>
+            x.Request.CycleId == _currentCycleId && x.Request.Role == PaperOrderRole.StopLoss && !IsSettled(x)))
+            if (_cancelRequested.Add(record.Request.ClientOrderId))
+                CancelOrderRequested?.Invoke(record.Request.ClientOrderId);
+    }
 
-        PositionSnapshot position = Position();
-        bool directionMatches = _filledEntryRole == PaperOrderRole.EntryLong ? position.NetQuantity > 0 : position.NetQuantity < 0;
-        if (!directionMatches)
-        {
-            SuspendForEntryRace("進場委託已結算，但策略淨部位與首筆成交方向不符");
-            return;
-        }
+    private void CancelCycleEntryOrders()
+    {
+        if (_orderBook == null) return;
+        foreach (ManagedOrderRecord record in _orderBook.Snapshot().Orders.Where(x =>
+            x.Request.CycleId == _currentCycleId &&
+            x.Request.Role is PaperOrderRole.EntryLong or PaperOrderRole.EntryShort &&
+            x.LastLifecycle?.State is not OrderLifecycleState.Rejected && !IsSettled(x)))
+            if (_cancelRequested.Add(record.Request.ClientOrderId))
+                CancelOrderRequested?.Invoke(record.Request.ClientOrderId);
+    }
 
-        ManagedOrderRecord[] entries = _orderBook.Capture().Orders
-            .Where(record => string.Equals(record.Request.CycleId, _currentCycleId, StringComparison.Ordinal) &&
-                record.Request.Role is PaperOrderRole.EntryLong or PaperOrderRole.EntryShort)
-            .ToArray();
-        if (entries.Length != 2) return;
-        foreach (ManagedOrderRecord entry in entries)
-        {
-            OrderLifecycleEvent? terminal = entry.LastLifecycle;
-            if (terminal == null || terminal.State is not (OrderLifecycleState.Filled or OrderLifecycleState.Cancelled or OrderLifecycleState.Rejected))
-                return;
-            int delivered = _deliveredEntryFillQuantities.GetValueOrDefault(entry.Request.ClientOrderId);
-            if (!terminal.HasFinalCumulativeFillWatermark || terminal.FilledQuantity != delivered)
-            {
-                State = StrategyLifecycleState.Suspended;
-                _reason = $"進場單 {entry.Request.ClientOrderId} 終態成交水位與帳本未對平，需人工核對";
-                Publish();
-                return;
-            }
-            if (entry.Request.Role != _filledEntryRole && delivered != 0)
-            {
-                SuspendForEntryRace("撤單競態造成反向進場成交，禁止建立一般停利單");
-                return;
-            }
-        }
-
-        decimal takeProfitPrice = _filledEntryRole == PaperOrderRole.EntryLong ? _sellEntry : _buyEntry;
-        BuySell takeProfitSide = _filledEntryRole == PaperOrderRole.EntryLong ? BuySell.Sell : BuySell.Buy;
-        SubmitExit(takeProfitSide, PaperOrderType.BrokerLimit, PaperOrderRole.TakeProfit, takeProfitPrice);
-        _takeProfitSubmitted = true;
-        State = StrategyLifecycleState.Running;
-        _reason = $"進場撤單及成交水位已結算，停利限價單 {takeProfitPrice} 工作中";
-        Publish();
+    private void TryCompletePairedCycle()
+    {
+        if (!_bracketWorking || _orderBook == null || Position().NetQuantity != 0) return;
+        ManagedOrderRecord[] cycle = _orderBook.Snapshot().Orders.Where(x =>
+            x.Request.CycleId == _currentCycleId).ToArray();
+        if (cycle.Length < 2 || !cycle.All(IsSettled)) return;
+        _bracketWorking = false;
+        State = _submissionQuarantined ? StrategyLifecycleState.Suspended : StrategyLifecycleState.Ready;
+        _reason = _submissionQuarantined ? "雙側提交失敗：委託已結清，需人工核對後重啟" :
+            "雙側委託及保護單已結清，等待冷卻";
     }
 
     private void SuspendForEntryRace(string reason)

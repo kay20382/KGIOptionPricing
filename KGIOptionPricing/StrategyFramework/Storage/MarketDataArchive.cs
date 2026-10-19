@@ -221,33 +221,83 @@ public sealed class RecordingMarketEventSource : IMarketEventSource
     }
 }
 
+public sealed class HistoricalReplayControl
+{
+    private readonly object _sync = new();
+    private TaskCompletionSource<bool> _resumed = CompletedSignal();
+    private bool _isPaused;
+
+    public bool IsPaused { get { lock (_sync) return _isPaused; } }
+
+    public bool Pause()
+    {
+        lock (_sync)
+        {
+            if (_isPaused) return false;
+            _isPaused = true;
+            _resumed = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            return true;
+        }
+    }
+
+    public bool Resume()
+    {
+        lock (_sync)
+        {
+            if (!_isPaused) return false;
+            _isPaused = false;
+            _resumed.TrySetResult(true);
+            return true;
+        }
+    }
+
+    internal Task WaitIfPausedAsync(CancellationToken cancellationToken)
+    {
+        lock (_sync) return _isPaused ? _resumed.Task.WaitAsync(cancellationToken) : Task.CompletedTask;
+    }
+
+    private static TaskCompletionSource<bool> CompletedSignal()
+    {
+        var signal = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        signal.SetResult(true);
+        return signal;
+    }
+}
+
 public sealed class ArchiveReplayMarketDataSource : IMarketEventSource
 {
     private readonly string _eventFilePath;
     private bool _disposed;
 
     public event Action<MarketEvent>? MarketEventReceived;
+    public event Action<DateTimeOffset>? BeforeMarketEvent;
     public ArchiveReplayMarketDataSource(string eventFilePath) => _eventFilePath = Path.GetFullPath(eventFilePath);
     public void Subscribe(IEnumerable<ResolvedProduct> products) { }
 
-    public async Task ReplayAsync(double speed = 0d, CancellationToken cancellationToken = default)
+    public async Task ReplayAsync(double speed = 0d, CancellationToken cancellationToken = default,
+        HistoricalReplayControl? control = null)
     {
+        var causal = new MarketData.CausalBookTracker();
         DateTimeOffset? previous = null;
         using var stream = new FileStream(_eventFilePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
         using var reader = new StreamReader(stream, Encoding.UTF8);
         while (!_disposed)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            if (control is not null) await control.WaitIfPausedAsync(cancellationToken);
             string? line = await reader.ReadLineAsync(cancellationToken);
             if (line == null) break;
             if (string.IsNullOrWhiteSpace(line)) continue;
             if (!MarketDataArchiveCodec.TryDeserialize(line, out MarketEvent marketEvent)) continue;
+            marketEvent = causal.Observe(marketEvent);
             if (speed > 0d && previous.HasValue)
             {
                 double delay = (marketEvent.Timestamp - previous.Value).TotalMilliseconds / speed;
                 if (delay > 1d) await Task.Delay(TimeSpan.FromMilliseconds(Math.Min(delay, 10000d)), cancellationToken);
             }
+            if (control is not null) await control.WaitIfPausedAsync(cancellationToken);
             previous = marketEvent.Timestamp;
+            BeforeMarketEvent?.Invoke(marketEvent.Timestamp);
             MarketEventReceived?.Invoke(marketEvent);
         }
     }

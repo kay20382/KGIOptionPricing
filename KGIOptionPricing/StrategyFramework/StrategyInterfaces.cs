@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using KGIOptionPricing.StrategyFramework.Recovery;
 
 namespace KGIOptionPricing.StrategyFramework;
 
@@ -56,16 +55,29 @@ public interface IManagedOrderSubmissionObserver
     void OnOrderSubmitted(PaperOrderRequest request);
 }
 
-public interface IStrategyRecoveryParticipant
-{
-    string RecoverySchema { get; }
-    StrategyRecoveryCheckpoint CaptureRecoveryCheckpoint();
-    void RestoreRecoveryCheckpoint(StrategyRecoveryCheckpoint checkpoint);
-}
-
 public interface IStrategyHeartbeat
 {
     void OnHeartbeat(DateTimeOffset now);
+}
+
+// Called before marking or matching this event; used by causal actors to emit
+// boundaries from prior data and release delayed intents. False rejects this
+// event for this instance only (including its broker and ledger).
+public interface IStrategyBeforeMarketExecution
+{ bool BeforeMarketExecution(MarketEvent marketEvent); }
+
+public interface IStrategyScheduledPulseSource
+{ IReadOnlyList<DateTimeOffset> GetPulseTimes(DateTimeOffset exclusiveStart, DateTimeOffset inclusiveEnd); }
+public interface IStrategyRiskExit { void RequestRiskExit(string reason); }
+public interface IStrategyCloseRequest { void RequestClose(string reason); }
+// Called only after the live executor confirms this instance has no active broker orders.
+// Unlike Stop, an operator close must not turn a stale ledger position into a new trade.
+public interface IStrategyOperatorStop { void OperatorStop(string reason); }
+public interface IStrategyResumeGate { bool CanResume { get; } }
+
+public interface IStrategyHeartbeatWhilePaused
+{
+    bool ShouldPulseWhilePaused { get; }
 }
 
 public interface IStrategyFactory

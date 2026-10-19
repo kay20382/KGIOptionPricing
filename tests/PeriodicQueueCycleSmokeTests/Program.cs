@@ -5,6 +5,8 @@ using KGIOptionPricing.Strategies.MiniLeadMicro;
 using KGIOptionPricing.Strategies.PeriodicQueueCycle;
 using KGIOptionPricing.StrategyFramework;
 
+TestQueueInitialRequiresStrictAheadAcrossVisibleDepth();
+TestValid225McDepthUsesCurrentThreeLevelThresholds();
 TestParameterDefaultsAndSummary();
 TestPeriodicQueueLegacyPriceBoundaryIsIgnored();
 TestPeriodicQueueLegacyMaxChaseSettingIsIgnored();
@@ -13,6 +15,9 @@ TestParameterSafetyRanges();
 TestParameterSafetyBoundariesAreAccepted();
 TestParameterCrossConstraints();
 TestDirectionalAssessments();
+TestDirectionWindowUsesOnlyFirstThreeLevelsAndSkipsMissingDepth();
+TestSideDepthUsesTenVisibleLevels();
+TestZeroPaddedTopThreeDepthIsSkipped();
 TestNeutralDirectionConditions();
 TestHealthRejectionCodes();
 TestUtcSecondSamplingAndWarmup();
@@ -23,9 +28,11 @@ TestQueuePricingFollowsBookWithoutBoundary();
 TestQueuePricingHandlesZeroTargetOneTickSpreadAndInvalidBooks();
 TestQueuePricingSupportsDifferentTickSizes();
 TestQueuePricingRejectsOffTickBooksAndInvalidTickSize();
+TestQueuePricingUsesVisibleDepthAndSkipsMissingDepth();
 TestPeriodicStrategyWarmsUpAndSubmitsBothSidesTogether();
 TestPeriodicStrategyMapsDirectionalQueueParameters();
 TestPeriodicStrategyRepricesOnlyAfterExactCancellation();
+TestPeriodicStrategyCountsQueueBeyondThirdLevel();
 TestPeriodicStrategyIsNotOcoWhenOneSideFills();
 TestPeriodicStrategySuppressesReplacementAfterCancelFillRace();
 TestPeriodicStrategyCancelsBothOnConfirmedPreFillReversal();
@@ -42,6 +49,7 @@ TestPeriodicStrategyPauseCancelsFlatPairAndKeepsPositionProtection();
 TestPeriodicStrategyPreservesFaultDuringReentrantExitCancelFailure();
 TestPeriodicStrategyDoesNotRepriceOnUnhealthyBook();
 TestPeriodicStrategyStopsOnlyAfterOrdersAndPositionAreZero();
+TestPeriodicOperatorStopPreservesResidualPositionWithoutFlatten();
 TestPeriodicStrategySnapshotExposesFrozenCycleAndLegState();
 TestPeriodicStrategyFaultsWhenRunnerCannotRouteTargetedCancel();
 TestPeriodicStrategyPreservesFaultDuringReentrantStopCancelFailure();
@@ -54,25 +62,54 @@ TestPeriodicStrategyFaultsOnLateFillFromRetiredCycle();
 TestPeriodicStrategyDoesNotStartCycleWithExistingPosition();
 TestPeriodicStrategyFixedStopsUseLedgerAndWaitForPeerTerminal();
 TestPeriodicFixedStopWaitsForFreshCounterpartyQuote();
-TestPeriodicStrategyOneLegTimeoutHasExactBoundaryAndFlattens();
-TestPeriodicStrategyUnhealthyBookRecoversOrFlattensWithoutFalseStop();
+TestPeriodicStrategyKeepsPeerWorkingAfterOneLegFills();
+TestPeriodicStrategyUnhealthyBookDoesNotCancelPeerOrFlatten();
 TestPeriodicStrategyCancelFillRaceRereadsLedgerBeforeExit();
 TestPeriodicStrategyCooldownsClearDirectionWindow();
 TestPeriodicStrategyPauseProtectsHeldPositionAndStopFlattensSafely();
 TestPeriodicStrategyAcceptsFilledLifecycleAfterExecutionStartsCooldown();
 TestPeriodicStrategyIgnoresDuplicateBookForRiskTriggers();
-TestPeriodicHeartbeatAdvancesTimeoutAndHealthRecoveryWithoutMarketEvents();
+TestPeriodicHeartbeatKeepsPeerWorkingWithoutMarketEvents();
 TestPeriodicLifecycleFirstWaitsForAuthoritativeExecutions();
 TestPeriodicLifecycleFirstStopWaitsForExecutionAndProtection();
 TestPeriodicFixedStopDoesNotTriggerBelowSixTicks();
 TestPeriodicExitCallbacksAreIdempotentOutOfOrder();
-TestPeriodicHealthFlattenUsesNextTradePriceThroughRealPaperBroker();
+TestPeriodicHealthTimeoutKeepsPeerWorkingThroughRealPaperBroker();
 TestPeriodicStrategyPublishesTypedDecisionEvidence();
 TestPeriodicRegistrationAndResearchValidationGate();
 TestPeriodicControlSurfaceDefaultsAndResearchGate();
 TestPeriodicLiveTestingDoesNotRequireResearchValidation();
 
 Console.WriteLine("PeriodicQueueCycle smoke tests passed.");
+
+static void TestQueueInitialRequiresStrictAheadAcrossVisibleDepth()
+{
+    var policy = new QueueCyclePricingPolicy();
+    MarketEvent book = QueueBook(5m, 67550m, 67555m,
+        new[] { 50, 169, 88, 81, 126, 125 }, new[] { 50, 169, 88, 81, 126, 125 });
+    Assert(policy.SelectInitial(BuySell.Buy, book, 600, 5m).Price == 67525m &&
+           policy.SelectInitial(BuySell.Sell, book, 600, 5m).Price == 67580m,
+        "A=600 must select the sixth visible level with 639 lots, not fall back to the third level");
+    Assert(policy.SelectInitial(BuySell.Buy, book, 514, 5m).Price == 67525m,
+        "cumulative quantity equal to A is not sufficient; initial ahead must strictly exceed A");
+    Assert(policy.SelectInitial(BuySell.Buy, book, 639, 5m).Action == QueuePriceAction.Hold,
+        "insufficient visible depth must not silently place at the last level");
+    MarketEvent hole = book with { BidPrices = new[] { 67550m, 67545m, 67540m, 0m, 67530m, 67525m } };
+    Assert(policy.SelectInitial(BuySell.Buy, hole, 600, 5m).Action == QueuePriceAction.Hold,
+        "missing intermediate depth must not be crossed to invent an ahead quantity");
+    QueuePriceDecision moved = policy.EvaluateReprice(BuySell.Buy, book, 67520m, 0, 600, 600, 5m);
+    Assert(moved.Action == QueuePriceAction.Reprice && moved.Price == 67525m && moved.BetterPriceQuantity == 639,
+        "B and C must include the visible depth beyond the third level");
+    Assert(policy.EvaluateReprice(BuySell.Buy, book, 67520m, 0, 600, 640, 5m).Action == QueuePriceAction.Hold,
+        "unavailable C target must retain the existing order instead of selecting a fallback price");
+    var start = new DateTimeOffset(2026, 9, 30, 1, 0, 0, TimeSpan.Zero);
+    var parameters = Values(("DirectionWindowSeconds", "2"), ("ObiConfirmSeconds", "1"),
+        ("MinSideDepth", "1"), ("MinNearDepth", "1"), ("TrendInitialAheadA", "5"), ("OppositeInitialAheadA", "100"));
+    var noPair = RunInitialPair("insufficient-pair", parameters, start,
+        StrategyBook(100m, 105m, 20, 10, 1, start),
+        StrategyBook(110m, 115m, 20, 10, 2, start.AddSeconds(1)));
+    Assert(noPair.Count == 0, "one side lacking enough A depth must prevent both orders, not submit a one-sided pair");
+}
 
 static void TestPeriodicStrategyPublishesTypedDecisionEvidence()
 {
@@ -89,8 +126,10 @@ static void TestPeriodicStrategyPublishesTypedDecisionEvidence()
     {
         Sequence = 2, Timestamp = clock.Now, Symbol = "225MC", ProductId = "225MC",
         Kind = MarketEventKind.Book,
-        BidPrices = new[] { 110m }, BidQuantities = new[] { 1 },
-        AskPrices = new[] { 115m }, AskQuantities = new[] { 1 }
+        BidPrices = new[] { 110m, 105m, 0m, 0m, 0m, 0m, 0m, 0m, 0m, 0m },
+        BidQuantities = new[] { 1, 1, 0, 0, 0, 0, 0, 0, 0, 0 },
+        AskPrices = new[] { 115m, 120m, 125m, 0m, 0m, 0m, 0m, 0m, 0m, 0m },
+        AskQuantities = new[] { 1, 1, 1, 0, 0, 0, 0, 0, 0, 0 }
     });
     clock.Advance(start.AddSeconds(2));
     strategy.OnMarketEvent(StrategyBook(110m, 115m, 20, 10, 3, clock.Now));
@@ -101,7 +140,6 @@ static void TestPeriodicStrategyPublishesTypedDecisionEvidence()
 
     StrategyDecisionObservation warmup = decisions.First(x => x.Decision == StrategyDecision.Warmup && x.Thresholds.Count > 0);
     StrategyDecisionObservation noBook = decisions.First(x => x.Sequence == 0);
-    StrategyDecisionObservation rejected = decisions.First(x => x.PrimaryReasonCode == "InvalidBook");
     StrategyDecisionObservation accepted = decisions.First(x => x.Decision == StrategyDecision.Accept);
     Assert(warmup.Thresholds.Any(x => x.Name == "DirectionWindowSeconds" && !x.Passed),
         "暖機 observation 必須包含尚未通過的方向窗門檻");
@@ -109,8 +147,8 @@ static void TestPeriodicStrategyPublishesTypedDecisionEvidence()
            noBook.UnavailableReasons["requiredProductsPresent"] == "NoBookData" &&
            noBook.UnavailableReasons["crossProductReceiveSkewSeconds"] == "NotApplicableSingleProduct",
         "尚無 book 時不得伪造 required-products=true 或 cross-product skew");
-    Assert(rejected.DataQualityFlags.Contains("InvalidBook"),
-        "健康拒絕 observation 必須包含穩定資料品質原因");
+    Assert(!decisions.Any(x => x.Sequence == 2),
+        "缺少前三檔的委託簿應直接略過，不得產生指標拒絕觀測");
     Assert(accepted.PrimaryReasonCode == "SignalAccepted" && accepted.CycleId == "cycle-1",
         $"接受 observation 必須關聯真正 cycle；actual={accepted.PrimaryReasonCode}/{accepted.CycleId}");
     Assert(accepted.Thresholds.Any(x => x.Name == "MinTrendEfficiency" && x.Passed) &&
@@ -204,11 +242,15 @@ static void TestPeriodicControlSurfaceDefaultsAndResearchGate()
                    simulationDefinition.Parameters["OppositeInitialAheadA"] == "600" &&
                    simulationDefinition.Parameters["OppositeRepriceThresholdB"] == "700" &&
                    simulationDefinition.Parameters["OppositeRepriceTargetC"] == "600" &&
+                   simulationDefinition.Parameters["MinSideDepth"] == "100" &&
+                   simulationDefinition.Parameters["MinNearDepth"] == "5" &&
                    liveDefinition.Parameters["TrendInitialAheadA"] == "100" &&
-                   liveDefinition.Parameters["OppositeInitialAheadA"] == "600",
+                   liveDefinition.Parameters["OppositeInitialAheadA"] == "600" &&
+                   liveDefinition.Parameters["MinSideDepth"] == "100" &&
+                   liveDefinition.Parameters["MinNearDepth"] == "5",
                 "模擬與實盤控制頁必須使用相同的順勢與逆勢 A/B/C 預設值");
-            Assert(!simulation.Controls.OfType<CheckBox>().Any(control => control.Name == "ResearchValidated") &&
-                   live.Controls.OfType<CheckBox>().Single(control => control.Name == "ResearchValidated").Checked == false &&
+            Assert(!simulation.ResearchValidated.Visible &&
+                   live.ResearchValidated.Visible && !live.ResearchValidated.Checked &&
                    LiveStrategyService.TryValidateResearchStrategy(liveDefinition, out string? reason) &&
                    reason == null,
                 "實盤週期控制頁的研究欄位只供紀錄，不得再鎖定測試啟動");
@@ -233,7 +275,7 @@ static void TestParameterDefaultsAndSummary()
     Assert(p.DirectionWindowSeconds == 15 && p.MinMoveTicks == 2m &&
            p.MinTrendEfficiency == 0.40m && p.MinDepthObi == 0.10m &&
            p.ObiConfirmSeconds == 3 && p.DirectionReverseSeconds == 3 &&
-           p.MinSideDepth == 827 && p.MinNearDepth == 165 && p.MinDepthRatio == 0.35m &&
+           p.MinSideDepth == 100 && p.MinNearDepth == 5 && p.MinDepthRatio == 0.35m &&
            p.MaxSpreadTicks == 2m && p.MaxVolatilityTicks == 5m &&
            p.QuoteFreshnessSeconds == 2m &&
            p.StopLossTicks == 6m && p.MaxOneLegSeconds == 30 &&
@@ -244,7 +286,7 @@ static void TestParameterDefaultsAndSummary()
            p.OppositeInitialAheadA == 600 && p.OppositeRepriceThresholdB == 700 && p.OppositeRepriceTargetC == 600,
         "週期策略預設參數不符設計規格");
 
-    const string expected = "DirectionWindowSeconds=15;MinMoveTicks=2;MinTrendEfficiency=0.40;MinDepthObi=0.10;ObiConfirmSeconds=3;DirectionReverseSeconds=3;MinSideDepth=827;MinNearDepth=165;MinDepthRatio=0.35;MaxSpreadTicks=2;MaxVolatilityTicks=5;QuoteFreshnessSeconds=2;StopLossTicks=6;MaxOneLegSeconds=30;CycleCooldownSeconds=45;StopLossCooldownSeconds=60;ShockCooldownSeconds=45;MarketDataRecoverySeconds=2;CommissionPerContract=36;ResearchValidated=false;TrendInitialAheadA=100;TrendRepriceThresholdB=200;TrendRepriceTargetC=100;OppositeInitialAheadA=600;OppositeRepriceThresholdB=700;OppositeRepriceTargetC=600";
+    const string expected = "DirectionWindowSeconds=15;MinMoveTicks=2;MinTrendEfficiency=0.40;MinDepthObi=0.10;ObiConfirmSeconds=3;DirectionReverseSeconds=3;MinSideDepth=100;MinNearDepth=5;MinDepthRatio=0.35;MaxSpreadTicks=2;MaxVolatilityTicks=5;QuoteFreshnessSeconds=2;StopLossTicks=6;MaxOneLegSeconds=disabled;peerCompletion=untilFixedStop;CycleCooldownSeconds=45;StopLossCooldownSeconds=60;ShockCooldownSeconds=disabled;MarketDataRecoverySeconds=disabledForOneLeg;CommissionPerContract=36;ResearchValidated=false;TrendInitialAheadA=100;TrendRepriceThresholdB=200;TrendRepriceTargetC=100;OppositeInitialAheadA=600;OppositeRepriceThresholdB=700;OppositeRepriceTargetC=600";
     Assert(p.ParameterSummary == expected, $"參數摘要必須完整且穩定。實際：{p.ParameterSummary}");
 }
 
@@ -383,7 +425,8 @@ static void TestParameterCrossConstraints()
 
 static void TestDirectionalAssessments()
 {
-    PeriodicQueueCycleParameters parameters = PeriodicQueueCycleParameters.Parse(new Dictionary<string, string>());
+    PeriodicQueueCycleParameters parameters = PeriodicQueueCycleParameters.Parse(Values(
+        ("MinSideDepth", "1"), ("MinNearDepth", "1")));
     DateTimeOffset start = new(2026, 9, 21, 0, 0, 0, TimeSpan.Zero);
 
     var up = new DirectionWindow(5m, parameters);
@@ -447,7 +490,8 @@ static void TestDirectionalAssessments()
 
 static void TestNeutralDirectionConditions()
 {
-    PeriodicQueueCycleParameters parameters = PeriodicQueueCycleParameters.Parse(new Dictionary<string, string>());
+    PeriodicQueueCycleParameters parameters = PeriodicQueueCycleParameters.Parse(Values(
+        ("MinSideDepth", "1"), ("MinNearDepth", "1")));
     DateTimeOffset start = new(2026, 9, 21, 1, 0, 0, TimeSpan.Zero);
 
     var lowEfficiency = new DirectionWindow(5m, parameters);
@@ -477,6 +521,77 @@ static void TestNeutralDirectionConditions()
         "價格向上但 OBI 向下時不得以多數決接受方向");
 }
 
+static void TestDirectionWindowUsesOnlyFirstThreeLevelsAndSkipsMissingDepth()
+{
+    PeriodicQueueCycleParameters parameters = PeriodicQueueCycleParameters.Parse(Values(
+        ("MinDepthObi", "0"), ("MinSideDepth", "1"), ("MinNearDepth", "1"), ("MinDepthRatio", "0")));
+    DateTimeOffset start = new(2026, 9, 21, 0, 30, 0, TimeSpan.Zero);
+    var ordinaryDepth = new DirectionWindow(5m, parameters);
+    var deepLiquidityNoise = new DirectionWindow(5m, parameters);
+
+    for (int i = 0; i < 15; i++)
+    {
+        MarketEvent ordinary = Book(100m, 20, 10, i + 1, start.AddSeconds(i)) with
+        {
+            BidQuantities = new[] { 20, 20, 20, 1, 1, 1, 1, 1, 1, 1 },
+            AskQuantities = new[] { 10, 10, 10, 1, 1, 1, 1, 1, 1, 1 }
+        };
+        MarketEvent alteredBeyondThird = ordinary with
+        {
+            BidQuantities = new[] { 20, 20, 20, 900, 900, 900, 900, 900, 900, 900 },
+            AskQuantities = new[] { 10, 10, 10, 2, 2, 2, 2, 2, 2, 2 }
+        };
+        Assert(ordinaryDepth.TryAdd(ordinary, start.AddSeconds(i)), "前三檔有效資料應加入方向窗");
+        Assert(deepLiquidityNoise.TryAdd(alteredBeyondThird, start.AddSeconds(i)), "第四檔後的深度差異不應使前三檔樣本失效");
+    }
+
+    DirectionAssessment ordinaryAssessment = ordinaryDepth.Evaluate(start.AddSeconds(14), 5m, parameters);
+    DirectionAssessment altered = deepLiquidityNoise.Evaluate(start.AddSeconds(14), 5m, parameters);
+    AssertNear(ordinaryAssessment.AverageObi, 1m / 3m, 0.000001m, "前三檔 OBI 應採前三檔加權量計算");
+    Assert(altered.AverageObi == ordinaryAssessment.AverageObi,
+        "第四檔以後的委託量不得影響方向指標 OBI");
+
+    var missingDepth = new DirectionWindow(5m, parameters);
+    Assert(missingDepth.TryAdd(Book(100m, 20, 10, 1, start), start), "基準有效樣本應加入");
+    MarketEvent incomplete = Book(120m, 20, 10, 99, start.AddMilliseconds(200)) with
+    {
+        BidPrices = new[] { 97.5m, 92.5m },
+        BidQuantities = new[] { 20, 20 }
+    };
+    Assert(!missingDepth.TryAdd(incomplete, start.AddMilliseconds(200)), "不足前三檔的事件應直接略過");
+    Assert(missingDepth.SampleCount == 1 && missingDepth.LatestSequence == 1,
+        "缺檔事件不得改寫方向窗樣本或最新序號");
+    MarketEvent validAfterMissing = Book(100m, 20, 10, 2, start.AddMilliseconds(500));
+    Assert(missingDepth.TryAdd(validAfterMissing, start.AddMilliseconds(500)),
+        "被略過的缺檔事件不得污染序號追蹤，後續有效樣本仍應加入");
+}
+
+static void TestSideDepthUsesTenVisibleLevels()
+{
+    var parameters = PeriodicQueueCycleParameters.Parse(Values(("MinDepthObi", "0")));
+    DateTimeOffset time = new(2026, 9, 30, 1, 0, 0, TimeSpan.Zero);
+    var fullBook = Book(100m, 10, 10, 1, time);
+    var window = new DirectionWindow(5m, parameters);
+    Assert(window.TryAdd(fullBook, time),
+        "ten levels with 10 lots each side must satisfy the 100-lot side-depth gate");
+    DirectionAssessment accepted = window.Evaluate(time, 5m, parameters);
+    Assert(accepted.Thresholds.Single(x => x.Name == "MinSideDepth").Observed == 100m &&
+           accepted.PrimaryReasonCode == "WarmupIncomplete",
+        "side-depth threshold must report the ten-level total while direction still warms up");
+
+    var shallow = Book(100m, 10, 10, 2, time.AddSeconds(1)) with
+    { BidQuantities = Enumerable.Repeat(9, 10).ToArray() };
+    AssertRejected("InsufficientSideDepth", shallow, time.AddSeconds(1), parameters);
+
+    var gap = fullBook with
+    {
+        Sequence = 3,
+        BidPrices = fullBook.BidPrices.Select((price, index) => index == 3 ? 0m : price).ToArray(),
+        BidQuantities = new[] { 10, 10, 10, 0, 100, 100, 100, 100, 100, 100 }
+    };
+    AssertRejected("InsufficientSideDepth", gap, time, parameters);
+}
+
 static void TestHealthRejectionCodes()
 {
     PeriodicQueueCycleParameters parameters = PeriodicQueueCycleParameters.Parse(new Dictionary<string, string>());
@@ -485,8 +600,8 @@ static void TestHealthRejectionCodes()
     AssertRejected("StaleQuote", Book(100m, 130, 90, 1, t), t.AddSeconds(3), parameters);
     AssertRejected("InvalidBook", Book(100m, 130, 90, 1, t) with
     {
-        BidPrices = new[] { 97.5m }, BidQuantities = new[] { 130 },
-        AskPrices = new[] { 102.5m }, AskQuantities = new[] { 90 }
+        BidPrices = new[] { 97.5m, 92.5m, 92.5m },
+        BidQuantities = new[] { 130, 130, 130 }
     }, t, parameters);
     AssertRejected("InvalidBook", Book(100m, 130, 90, 1, t) with
     {
@@ -500,30 +615,77 @@ static void TestHealthRejectionCodes()
     {
         AskPrices = new[] { 102.5m, 107.5m, 105m, 117.5m, 122.5m, 127.5m, 132.5m, 137.5m, 142.5m, 147.5m }
     }, t, parameters);
-    AssertRejected("InsufficientSideDepth", Book(100m, 80, 90, 1, t), t, parameters);
+    AssertRejected("InsufficientSideDepth", Book(100m, 9, 20, 1, t), t, parameters);
 
     MarketEvent nearShallow = Book(100m, 200, 200, 1, t) with
     {
-        BidQuantities = new[] { 10, 10, 10, 200, 200, 200, 200, 200, 200, 200 },
-        AskQuantities = new[] { 10, 10, 10, 200, 200, 200, 200, 200, 200, 200 }
+        BidQuantities = new[] { 1, 500, 500, 200, 200, 200, 200, 200, 200, 200 },
+        AskQuantities = new[] { 1, 500, 500, 200, 200, 200, 200, 200, 200, 200 }
     };
     AssertRejected("InsufficientNearDepth", nearShallow, t, parameters);
-    AssertRejected("DepthImbalance", Book(100m, 90, 300, 1, t), t, parameters);
-    AssertRejected("SpreadTooWide", Book(100m, 130, 90, 1, t, spreadTicks: 3m), t, parameters);
+    AssertRejected("DepthImbalance", Book(100m, 300, 1000, 1, t), t, parameters);
+    AssertRejected("SpreadTooWide", Book(100m, 300, 300, 1, t, spreadTicks: 3m), t, parameters);
 
     var volatileWindow = new DirectionWindow(5m, parameters);
     for (int i = 0; i < 14; i++)
     {
-        Assert(volatileWindow.TryAdd(Book(100m, 130, 90, i + 1, t.AddSeconds(i)), t.AddSeconds(i)), "波動測試的基準樣本應健康");
+        Assert(volatileWindow.TryAdd(Book(100m, 300, 300, i + 1, t.AddSeconds(i)), t.AddSeconds(i)), "波動測試的基準樣本應健康");
     }
-    Assert(!volatileWindow.TryAdd(Book(130m, 130, 90, 15, t.AddSeconds(14)), t.AddSeconds(14)), "超過五跳的樣本不得加入方向窗");
+    Assert(!volatileWindow.TryAdd(Book(130m, 300, 300, 15, t.AddSeconds(14)), t.AddSeconds(14)), "超過五跳的樣本不得加入方向窗");
     Assert(volatileWindow.Evaluate(t.AddSeconds(14), 5m, parameters).PrimaryReasonCode == "VolatilityTooHigh",
         "過度波動必須回報穩定拒絕原因");
 }
 
+static void TestZeroPaddedTopThreeDepthIsSkipped()
+{
+    PeriodicQueueCycleParameters parameters = PeriodicQueueCycleParameters.Parse(Values(
+        ("MinSideDepth", "1"), ("MinNearDepth", "1")));
+    DateTimeOffset t = new(2026, 9, 21, 2, 30, 0, TimeSpan.Zero);
+    MarketEvent basis = Book(100m, 20, 10, 1, t);
+    MarketEvent[] incompleteBooks =
+    {
+        Book(100m, 20, 10, 99, t.AddMilliseconds(200)) with
+        {
+            BidPrices = new[] { 97.5m, 92.5m, 0m, 0m, 0m, 0m, 0m, 0m, 0m, 0m }
+        },
+        Book(100m, 20, 10, 99, t.AddMilliseconds(200)) with
+        {
+            AskQuantities = new[] { 10, 10, 0, 0, 0, 0, 0, 0, 0, 0 }
+        }
+    };
+
+    foreach (MarketEvent incomplete in incompleteBooks)
+    {
+        var window = new DirectionWindow(5m, parameters);
+        Assert(window.TryAdd(basis, t), "基準委託簿應加入方向窗");
+        Assert(!window.TryAdd(incomplete, t.AddMilliseconds(200)), "補零的缺檔行情應略過");
+        Assert(window.SampleCount == 1 && window.LatestSequence == 1,
+            "補零的缺檔行情不得更動方向樣本");
+        Assert(window.TryAdd(Book(100m, 20, 10, 2, t.AddMilliseconds(500)), t.AddMilliseconds(500)),
+            "補零的缺檔行情不得污染後續有效行情的序號追蹤");
+    }
+}
+
+static void TestValid225McDepthUsesCurrentThreeLevelThresholds()
+{
+    DateTimeOffset t = new(2026, 9, 29, 9, 0, 0, TimeSpan.FromHours(8));
+    var parameters = PeriodicQueueCycleParameters.Parse(new Dictionary<string, string>());
+    var window = new DirectionWindow(5m, parameters);
+    MarketEvent ordinary = Book(100m, 20, 20, 1, t) with
+    {
+        BidQuantities = new[] { 14, 50, 103, 41, 67, 93, 156, 273, 109, 119 },
+        AskQuantities = new[] { 46, 131, 58, 35, 69, 118, 126, 112, 137, 111 }
+    };
+    Assert(window.TryAdd(ordinary, t),
+        "有效 225MC 前三檔深度 167、最佳檔 14 不應被舊門檻誤判不足");
+    Assert(window.SampleCount == 1 && window.Evaluate(t, 5m, parameters).PrimaryReasonCode == "WarmupIncomplete",
+        "有效報價應用於方向窗，而非留下 InsufficientSideDepth 提示");
+}
+
 static void TestUtcSecondSamplingAndWarmup()
 {
-    PeriodicQueueCycleParameters parameters = PeriodicQueueCycleParameters.Parse(new Dictionary<string, string>());
+    PeriodicQueueCycleParameters parameters = PeriodicQueueCycleParameters.Parse(Values(
+        ("MinSideDepth", "1"), ("MinNearDepth", "1")));
     DateTimeOffset t = new(2026, 9, 21, 3, 0, 0, TimeSpan.Zero);
     var window = new DirectionWindow(5m, parameters);
 
@@ -563,7 +725,7 @@ static void TestUtcSecondSamplingAndWarmup()
 static void TestPeriodicQueueLegacyPriceBoundaryIsIgnored()
 {
     var policy = new QueueCyclePricingPolicy();
-    MarketEvent book = QueueBook(5m, 100m, 110m, new[] { 10, 15 }, new[] { 10, 15 });
+    MarketEvent book = QueueBook(5m, 100m, 110m, new[] { 10, 15, 20 }, new[] { 10, 15, 20 });
 
     QueuePriceDecision decision = policy.EvaluateReprice(
         BuySell.Buy, book, 85m, 40, 10, 22, 5m);
@@ -634,7 +796,7 @@ static void TestQueueRepriceNeverBecomesLessAggressive()
 static void TestQueuePricingFollowsBookWithoutBoundary()
 {
     var policy = new QueueCyclePricingPolicy();
-    MarketEvent buyBook = QueueBook(5m, 100m, 110m, new[] { 10, 15 }, new[] { 10, 15 });
+    MarketEvent buyBook = QueueBook(5m, 100m, 110m, new[] { 10, 15, 20 }, new[] { 10, 15, 20 });
     QueuePriceDecision buy = policy.EvaluateReprice(BuySell.Buy, buyBook, 85m, 40, 10, 22, 5m);
     Assert(buy.Action == QueuePriceAction.Reprice && buy.Price == 95m,
         "買單改價不受舊價格邊界限制，必須跟隨目前十檔的 C 目標");
@@ -648,7 +810,7 @@ static void TestQueuePricingFollowsBookWithoutBoundary()
 static void TestQueuePricingHandlesZeroTargetOneTickSpreadAndInvalidBooks()
 {
     var policy = new QueueCyclePricingPolicy();
-    MarketEvent oneTick = QueueBook(5m, 100m, 105m, new[] { 10 }, new[] { 10 });
+    MarketEvent oneTick = QueueBook(5m, 100m, 105m, new[] { 10, 10, 10 }, new[] { 10, 10, 10 });
 
     QueuePriceDecision buy = policy.SelectInitial(BuySell.Buy, oneTick, 0, 5m);
     QueuePriceDecision sell = policy.SelectInitial(BuySell.Sell, oneTick, 0, 5m);
@@ -671,7 +833,7 @@ static void TestQueuePricingHandlesZeroTargetOneTickSpreadAndInvalidBooks()
 static void TestQueuePricingSupportsDifferentTickSizes()
 {
     var policy = new QueueCyclePricingPolicy();
-    MarketEvent book = QueueBook(2.5m, 100m, 102.5m, new[] { 10 }, new[] { 10 });
+    MarketEvent book = QueueBook(2.5m, 100m, 102.5m, new[] { 10, 10, 10 }, new[] { 10, 10, 10 });
     QueuePriceDecision buy = policy.SelectInitial(BuySell.Buy, book, 0, 2.5m);
     QueuePriceDecision sell = policy.SelectInitial(BuySell.Sell, book, 0, 2.5m);
     Assert(buy.Price == 102.5m && sell.Price == 100m,
@@ -682,9 +844,9 @@ static void TestQueuePricingRejectsOffTickBooksAndInvalidTickSize()
 {
     var policy = new QueueCyclePricingPolicy();
 
-    MarketEvent offTick = QueueBook(5m, 100m, 110m, new[] { 10, 15 }, new[] { 7, 9 }) with
+    MarketEvent offTick = QueueBook(5m, 100m, 110m, new[] { 10, 15, 20 }, new[] { 7, 9, 30 }) with
     {
-        BidPrices = new[] { 100m, 92.5m }
+        BidPrices = new[] { 100m, 92.5m, 90m }
     };
     QueuePriceDecision offTickInitial = policy.SelectInitial(BuySell.Buy, offTick, 22, 5m);
     QueuePriceDecision offTickReprice = policy.EvaluateReprice(BuySell.Buy, offTick, 90m, 40, 10, 22, 5m);
@@ -695,9 +857,9 @@ static void TestQueuePricingRejectsOffTickBooksAndInvalidTickSize()
            offTickReprice.ReasonCode == "InvalidBook",
         "任一正價 Book level 未對齊 Tick 時不得猜測修正或改掛");
 
-    MarketEvent offTickAsk = QueueBook(5m, 100m, 110m, new[] { 10, 15 }, new[] { 7, 30 }) with
+    MarketEvent offTickAsk = QueueBook(5m, 100m, 110m, new[] { 10, 15, 20 }, new[] { 7, 9, 30 }) with
     {
-        AskPrices = new[] { 110m, 117.5m }
+        AskPrices = new[] { 110m, 117.5m, 120m }
     };
     QueuePriceDecision offTickSell = policy.SelectInitial(BuySell.Sell, offTickAsk, 22, 5m);
     Assert(offTickSell.Action == QueuePriceAction.Hold && offTickSell.Price == 0m &&
@@ -721,6 +883,28 @@ static void TestQueuePricingRejectsOffTickBooksAndInvalidTickSize()
         BuySell.Buy, QueueBook(5m, 100m, 110m, new[] { 10 }, new[] { 7 }), 1, 0m);
     Assert(invalidTick.Action == QueuePriceAction.Hold && invalidTick.ReasonCode == "InvalidBook",
         "零 TickSize 不得產生猜測價格");
+}
+
+static void TestQueuePricingUsesVisibleDepthAndSkipsMissingDepth()
+{
+    var policy = new QueueCyclePricingPolicy();
+    MarketEvent book = QueueBook(5m, 100m, 110m,
+        new[] { 10, 15, 20, 900 }, new[] { 7, 9, 30, 900 });
+
+    QueuePriceDecision initial = policy.SelectInitial(BuySell.Buy, book, 100, 5m);
+    QueuePriceDecision reprice = policy.EvaluateReprice(BuySell.Buy, book, 80m, 0, 44, 100, 5m);
+    Assert(initial.Action == QueuePriceAction.Place && initial.Price == 85m,
+        "初始價必須包含第四檔，不能在未達 A 時停在第三檔");
+    Assert(reprice.Action == QueuePriceAction.Reprice && reprice.Price == 85m &&
+           reprice.BetterPriceQuantity == 945,
+        "改價前方量與目標價都必須包含完整可用深度");
+
+    MarketEvent incomplete = QueueBook(5m, 100m, 110m,
+        new[] { 10, 15 }, new[] { 7, 9 });
+    Assert(policy.SelectInitial(BuySell.Buy, incomplete, 22, 5m).ReasonCode == "InvalidBook",
+        "任一邊缺少前三檔時不得推算掛單價格");
+    Assert(policy.EvaluateReprice(BuySell.Sell, incomplete, 120m, 10, 5, 22, 5m).ReasonCode == "InvalidBook",
+        "任一邊缺少前三檔時不得推算改價價格");
 }
 
 static void TestPeriodicStrategyWarmsUpAndSubmitsBothSidesTogether()
@@ -786,14 +970,14 @@ static void TestPeriodicStrategyMapsDirectionalQueueParameters()
         StrategyBook(100m, 105m, 20, 10, 1, start),
         StrategyBook(110m, 115m, 20, 10, 2, start.AddSeconds(1)));
     Assert(up.Single(x => x.Side == BuySell.Buy).Price == 110m &&
-           up.Single(x => x.Side == BuySell.Sell).Price == 120m,
+           up.Single(x => x.Side == BuySell.Sell).Price == 125m,
         "向上時買方必須採趨勢 A、賣方採反方向 A");
 
     List<PaperOrderRequest> down = RunInitialPair(
         "mapping-down", parameters, start,
         StrategyBook(110m, 115m, 10, 20, 1, start),
         StrategyBook(100m, 105m, 10, 20, 2, start.AddSeconds(1)));
-    Assert(down.Single(x => x.Side == BuySell.Buy).Price == 95m &&
+    Assert(down.Single(x => x.Side == BuySell.Buy).Price == 90m &&
            down.Single(x => x.Side == BuySell.Sell).Price == 105m,
         "向下時買方必須採反方向 A、賣方採趨勢 A");
 }
@@ -823,6 +1007,32 @@ static void TestPeriodicStrategyRepricesOnlyAfterExactCancellation()
         "只有目標舊世代 Cancelled 才能建立 g+1 替代單");
     strategy.OnOrderLifecycle(Cancelled(oldBuy, strategy.InstanceId, clock.Now));
     Assert(orders.Count == 3, "重複或過期的舊世代 Cancelled 必須忽略");
+}
+
+static void TestPeriodicStrategyCountsQueueBeyondThirdLevel()
+{
+    DateTimeOffset start = new(2026, 9, 22, 2, 30, 0, TimeSpan.Zero);
+    (PeriodicQueueCycleStrategy strategy, MutableClock clock, List<PaperOrderRequest> orders) =
+        StartWorkingUpStrategy("third-level-queue", RepriceParameters(), start);
+    var cancels = new List<string>();
+    strategy.CancelOrderRequested += cancels.Add;
+
+    clock.Now = start.AddSeconds(2);
+    strategy.OnMarketEvent(new MarketEvent
+    {
+        Sequence = 3,
+        Timestamp = clock.Now,
+        Symbol = "225MC",
+        ProductId = "225MC",
+        Kind = MarketEventKind.Book,
+        BidPrices = new[] { 125m, 120m, 115m, 110m },
+        BidQuantities = new[] { 1, 1, 1, 100 },
+        AskPrices = new[] { 130m, 135m, 140m, 145m },
+        AskQuantities = new[] { 1, 1, 1, 100 }
+    });
+
+    Assert(orders.Count == 2 && cancels.Count == 1 && cancels[0] == orders.Single(x => x.Side == BuySell.Buy).ClientOrderId,
+        "第四檔的大量同價委託必須計入前方口數並觸發買單改掛，但不能在撤單確認前重送");
 }
 
 static void TestPeriodicStrategyIsNotOcoWhenOneSideFills()
@@ -925,11 +1135,21 @@ static void TestPeriodicStrategyHandlesRejectedAndCancelFailedLifecycle()
     rejected.CancelOrderRequested += rejectedCancels.Add;
     PaperOrderRequest rejectedBuy = rejectedOrders.Single(x => x.Side == BuySell.Buy);
     PaperOrderRequest rejectedSell = rejectedOrders.Single(x => x.Side == BuySell.Sell);
-    rejected.OnOrderLifecycle(Rejected(rejectedBuy.ClientOrderId, rejected.InstanceId, start.AddSeconds(2)));
+    rejected.OnOrderLifecycle(Rejected(rejectedBuy.ClientOrderId, rejected.InstanceId, start.AddSeconds(2))
+        with { ReasonDetail = "測試：商品送單被阻擋" });
     Assert(rejected.State == StrategyLifecycleState.Suspended &&
-           rejected.GetSnapshot().Reason == "ClosingBlocked" &&
+           rejected.GetSnapshot().Reason.StartsWith("ClosingBlocked", StringComparison.Ordinal) &&
            rejectedCancels.SequenceEqual(new[] { rejectedSell.ClientOrderId }, StringComparer.Ordinal),
         "任一完成單被拒絕時必須停止後續交易並定向撤銷另一側，但不得誤標 Faulted");
+    string blockedReason = rejected.GetSnapshot().Reason;
+    Assert(blockedReason.Contains(rejectedBuy.ClientOrderId, StringComparison.Ordinal) &&
+           blockedReason.Contains("Rejected", StringComparison.Ordinal) &&
+           blockedReason.Contains("測試：商品送單被阻擋", StringComparison.Ordinal),
+        "關閉封鎖必須揭露造成封鎖的委託與拒絕原因");
+    rejected.OnOrderLifecycle(Cancelled(rejectedSell.ClientOrderId, rejected.InstanceId, start.AddSeconds(3)));
+    rejected.OnHeartbeat(start.AddSeconds(4));
+    Assert(rejected.GetSnapshot().Reason == blockedReason,
+        "另一側撤單回報及心跳不得覆蓋原始封鎖原因");
 
     (PeriodicQueueCycleStrategy cancelFailed, MutableClock clock, List<PaperOrderRequest> orders) =
         StartWorkingUpStrategy("cancel-failed", RepriceParameters(), start.AddMinutes(1));
@@ -1075,7 +1295,7 @@ static void TestPeriodicStrategyPreservesReentrantInitialRejection()
         strategy.OnMarketEvent(StrategyBook(110m, 115m, 20, 10, 2, clock.Now));
 
         Assert(strategy.State == StrategyLifecycleState.Suspended &&
-               strategy.GetSnapshot().Reason == "ClosingBlocked",
+               strategy.GetSnapshot().Reason.StartsWith("ClosingBlocked", StringComparison.Ordinal),
             $"初始 {rejectedSide} 同步拒絕不得被 TryStart 覆寫為繼續工作或 Faulted");
         Assert(decisions.Count(x => x.Decision == StrategyDecision.Accept &&
                                     x.PrimaryReasonCode == "SignalAccepted") == 1 &&
@@ -1115,7 +1335,7 @@ static void TestPeriodicStrategyFaultsWhenExitCancellationFails()
     strategy.OnOrderLifecycle(CancelFailed(failedId, strategy.InstanceId, clock.Now));
 
     Assert(strategy.State == StrategyLifecycleState.Suspended &&
-           strategy.GetSnapshot().Reason == "ClosingBlocked" &&
+           strategy.GetSnapshot().Reason.StartsWith("ClosingBlocked", StringComparison.Ordinal) &&
            orders.Count == 2,
         "訊號反轉退出撤單失敗不得恢復工作或重掛，必須維持可重試的關閉封鎖");
 }
@@ -1136,7 +1356,7 @@ static void TestPeriodicStrategyPreservesSynchronousReplacementRejectionReason()
     strategy.OnOrderLifecycle(Cancelled(oldBuy, strategy.InstanceId, clock.Now));
 
     Assert(strategy.State == StrategyLifecycleState.Suspended &&
-           strategy.GetSnapshot().Reason == "ClosingBlocked",
+           strategy.GetSnapshot().Reason.StartsWith("ClosingBlocked", StringComparison.Ordinal),
         "替代單同步拒絕的終端原因不得被外層 ReplacementSubmitted 覆寫");
 }
 
@@ -1206,11 +1426,11 @@ static void TestPeriodicStrategyPreservesFaultDuringReentrantExitCancelFailure()
     }
 
     Assert(cancels.Count == 2 && strategy.State == StrategyLifecycleState.Suspended &&
-           strategy.GetSnapshot().Reason == "ClosingBlocked",
+           strategy.GetSnapshot().Reason.StartsWith("ClosingBlocked", StringComparison.Ordinal),
         "退出撤單第一腿同步 CancelFailed 時仍須盡力撤第二腿，且最後維持可重試的關閉封鎖");
     strategy.OnOrderLifecycle(CancelFailed(cancels[0], strategy.InstanceId, clock.Now));
     Assert(strategy.State == StrategyLifecycleState.Suspended &&
-           strategy.GetSnapshot().Reason == "ClosingBlocked",
+           strategy.GetSnapshot().Reason.StartsWith("ClosingBlocked", StringComparison.Ordinal),
         "重複 CancelFailed 不得解除 ClosingBlocked 或重掛委託");
 }
 
@@ -1260,6 +1480,26 @@ static void TestPeriodicStrategyStopsOnlyAfterOrdersAndPositionAreZero()
     held.OnOrderLifecycle(Cancelled(heldSell, held.InstanceId, heldClock.Now));
     Assert(held.State != StrategyLifecycleState.Stopped && heldPerformance.NetQuantity == 1,
         "即使工作單都終止，只要共用帳本部位不為零就不得宣告 Stopped");
+}
+
+static void TestPeriodicOperatorStopPreservesResidualPositionWithoutFlatten()
+{
+    DateTimeOffset start = new(2026, 9, 22, 20, 0, 0, TimeSpan.Zero);
+    var performance = new MutablePerformance();
+    (PeriodicQueueCycleStrategy strategy, MutableClock clock, List<PaperOrderRequest> orders) =
+        StartWorkingUpStrategy("operator-held", NoRepriceParameters(), start, performance);
+    PaperOrderRequest buy = orders.Single(x => x.Side == BuySell.Buy);
+    string sellId = orders.Single(x => x.Side == BuySell.Sell).ClientOrderId;
+    performance.NetQuantity = 1;
+    performance.AveragePrice = buy.Price;
+    strategy.OnExecution(Fill(buy.ClientOrderId, strategy.InstanceId, BuySell.Buy, buy.Price, clock.Now));
+    strategy.OnOrderLifecycle(Cancelled(sellId, strategy.InstanceId, clock.Now));
+    int before = orders.Count;
+
+    ((IStrategyOperatorStop)strategy).OperatorStop("使用者撤單關閉");
+
+    Assert(strategy.State == StrategyLifecycleState.Stopped && performance.NetQuantity == 1 && orders.Count == before,
+        "人工關閉須保留帳本部位、不得新增平倉委託，且在券商委託終態後停止");
 }
 
 static void TestPeriodicStrategySnapshotExposesFrozenCycleAndLegState()
@@ -1314,7 +1554,7 @@ static void TestPeriodicStrategyFaultsWhenRunnerCannotRouteTargetedCancel()
     StrategySnapshot snapshot = runner.GetSnapshot();
     Assert(broker.CancelledClientOrderIds.Count == 1 &&
            snapshot.State == StrategyLifecycleState.Suspended &&
-           snapshot.Reason == "ClosingBlocked",
+           snapshot.Reason.StartsWith("ClosingBlocked", StringComparison.Ordinal),
         "真實 Runner 收到 targeted cancel=false 時必須封鎖策略並等待可重試關閉，不得誤標 Faulted");
 }
 
@@ -1333,7 +1573,7 @@ static void TestPeriodicStrategyPreservesFaultDuringReentrantStopCancelFailure()
     strategy.Stop("同步失敗停止");
 
     Assert(cancels.Count == 2 && strategy.State == StrategyLifecycleState.Suspended &&
-           strategy.GetSnapshot().Reason == "ClosingBlocked",
+           strategy.GetSnapshot().Reason.StartsWith("ClosingBlocked", StringComparison.Ordinal),
         "Stop 第一腿同步撤單失敗時仍須嘗試第二腿，並維持可重試關閉封鎖");
 }
 
@@ -1350,7 +1590,7 @@ static void TestPeriodicStrategyRetriesClosingBlockedCancellation()
     string second = orders[1].ClientOrderId;
     strategy.OnOrderLifecycle(CancelFailed(first, strategy.InstanceId, clock.Now));
     Assert(strategy.State == StrategyLifecycleState.Suspended &&
-           strategy.GetSnapshot().Reason == "ClosingBlocked",
+           strategy.GetSnapshot().Reason.StartsWith("ClosingBlocked", StringComparison.Ordinal),
         "撤單失敗後必須停在 ClosingBlocked，而不是 Faulted");
 
     strategy.Stop("重試關閉");
@@ -1472,7 +1712,7 @@ static void TestPeriodicStrategyStopsRepriceEvaluationAfterFirstRouteFailure()
 
     StrategySnapshot snapshot = runner.GetSnapshot();
     Assert(broker.CancelAttempts.Count == 1 && snapshot.State == StrategyLifecycleState.Suspended &&
-           snapshot.Reason == "ClosingBlocked",
+           snapshot.Reason.StartsWith("ClosingBlocked", StringComparison.Ordinal),
         "第一腿 cancel=false 後必須立即停止評估第二腿，並轉為可重試的 ClosingBlocked");
 }
 
@@ -1593,7 +1833,7 @@ static void TestPeriodicFixedStopWaitsForFreshCounterpartyQuote()
         "下一筆健康行情到達後，固定停損必須以該筆最佳買價賣出");
 }
 
-static void TestPeriodicStrategyOneLegTimeoutHasExactBoundaryAndFlattens()
+static void TestPeriodicStrategyKeepsPeerWorkingAfterOneLegFills()
 {
     DateTimeOffset start = new(2026, 9, 23, 7, 0, 0, TimeSpan.Zero);
     var ledger = new KGIOptionPricing.StrategyFramework.Performance.PaperPortfolioLedger();
@@ -1615,22 +1855,14 @@ static void TestPeriodicStrategyOneLegTimeoutHasExactBoundaryAndFlattens()
 
     clock.Advance(clock.Now.AddSeconds(1));
     strategy.OnMarketEvent(StrategyBook(195m, 200m, 20, 10, 4, clock.Now));
-    string peerId = orders.Single(x => x.Side == BuySell.Sell).ClientOrderId;
-    Assert(cancels.SequenceEqual(new[] { peerId }, StringComparer.Ordinal),
-        "單邊成交滿 30 秒必須撤銷 peer");
-    Assert(orders.Count == 2, "逾時退出仍須等待 peer exact terminal");
-
-    strategy.OnOrderLifecycle(Cancelled(peerId, strategy.InstanceId, clock.Now));
-    PaperOrderRequest exit = orders.Single(x => x.Role == PaperOrderRole.Flatten);
-    Assert(exit.Side == BuySell.Sell && exit.Quantity == 1 &&
-           strategy.GetSnapshot().Reason.Contains("OneLegTimeout", StringComparison.Ordinal),
-        "逾時退出必須使用 Flatten/OneLegTimeout，不得誤標固定停損");
-    Assert(decisions.Any(x => x.Decision == StrategyDecision.Exit &&
-                              x.PrimaryReasonCode == "OneLegTimeout"),
-        "單邊逾時必須保留 Exit/OneLegTimeout 決策證據");
+    Assert(cancels.Count == 0 && orders.Count == 2 && orders.All(x => x.Role is PaperOrderRole.EntryLong or PaperOrderRole.EntryShort),
+        "單邊成交超過 MaxOneLegSeconds 後仍須保留原 peer 完成單，不得自動撤單或 Flatten");
+    Assert(decisions.Last().Decision == StrategyDecision.Hold &&
+           decisions.Last().PrimaryReasonCode == "OneLegFilled",
+        "單邊等待期間仍應維持 OneLegFilled，不應轉為自動退出");
 }
 
-static void TestPeriodicStrategyUnhealthyBookRecoversOrFlattensWithoutFalseStop()
+static void TestPeriodicStrategyUnhealthyBookDoesNotCancelPeerOrFlatten()
 {
     DateTimeOffset start = new(2026, 9, 23, 8, 0, 0, TimeSpan.Zero);
     var ledger = new KGIOptionPricing.StrategyFramework.Performance.PaperPortfolioLedger();
@@ -1643,32 +1875,21 @@ static void TestPeriodicStrategyUnhealthyBookRecoversOrFlattensWithoutFalseStop(
 
     clock.Advance(clock.Now.AddSeconds(1));
     strategy.OnMarketEvent(StrategyBook(150m, 165m, 20, 10, 3, clock.Now));
-    string peerId = orders.Single(x => x.Side == BuySell.Sell).ClientOrderId;
-    Assert(cancels.SequenceEqual(new[] { peerId }, StringComparer.Ordinal) &&
+    Assert(cancels.Count == 0 && orders.Count == 2 &&
            orders.All(x => x.Role != PaperOrderRole.StopLoss),
-        "不健康 Book 必須停止改掛並撤 peer，但不得用壞價誤觸 StopLoss");
-    strategy.OnOrderLifecycle(Cancelled(peerId, strategy.InstanceId, clock.Now));
+        "不健康 Book 不得撤 peer 或將壞行情誤作停損／平倉訊號");
 
     clock.Advance(clock.Now.AddSeconds(1));
     strategy.OnMarketEvent(StrategyBook(195m, 200m, 20, 10, 4, clock.Now));
-    Assert(orders.Count == 2, "行情在 2 秒期限內恢復且未達固定停損時不得立即平倉");
+    Assert(orders.Count == 2 && cancels.Count == 0, "行情恢復時 peer 委託仍應保留");
 
     clock.Advance(start.AddSeconds(10));
     strategy.OnMarketEvent(StrategyBook(150m, 165m, 20, 10, 5, clock.Now));
     clock.Advance(clock.Now.AddSeconds(2));
     strategy.OnMarketEvent(StrategyBook(150m, 165m, 20, 10, 6, clock.Now));
-    PaperOrderRequest exit = orders.Single(x => x.Role == PaperOrderRole.Flatten);
-    Assert(exit.Role == PaperOrderRole.Flatten &&
-           strategy.GetSnapshot().Reason.Contains("MarketDataRecoveryTimeout", StringComparison.Ordinal),
-        "單邊持倉失去健康行情時必須中性平倉，不得誤標固定停損");
-    ApplyFill(strategy, ledger, exit, 195m, clock.Now);
-    clock.Advance(clock.Now.AddSeconds(44));
-    strategy.OnMarketEvent(StrategyBook(195m, 200m, 20, 10, 7, clock.Now));
-    Assert(strategy.GetSnapshot().Reason == "CoolingDown", "行情異常平倉後 44 秒仍須處於 45 秒冷卻");
-    clock.Advance(clock.Now.AddSeconds(1));
-    strategy.OnMarketEvent(StrategyBook(200m, 205m, 20, 10, 8, clock.Now));
-    Assert(strategy.State == StrategyLifecycleState.WarmingUp,
-        "行情異常平倉 45 秒冷卻結束後必須重新暖機");
+    Assert(orders.Count == 2 && cancels.Count == 0 &&
+           orders.All(x => x.Role is PaperOrderRole.EntryLong or PaperOrderRole.EntryShort),
+        "行情健康恢復期限與冷卻設定不得撤銷另一側完成單或自動 Flatten");
 }
 
 static void TestPeriodicStrategyCancelFillRaceRereadsLedgerBeforeExit()
@@ -1815,7 +2036,7 @@ static void TestPeriodicStrategyIgnoresDuplicateBookForRiskTriggers()
         "重複或倒序 Book 必須直接忽略，不得當成行情中斷或拿其價格觸發停損");
 }
 
-static void TestPeriodicHeartbeatAdvancesTimeoutAndHealthRecoveryWithoutMarketEvents()
+static void TestPeriodicHeartbeatKeepsPeerWorkingWithoutMarketEvents()
 {
     DateTimeOffset start = new(2026, 9, 23, 15, 0, 0, TimeSpan.Zero);
     var timeoutLedger = new KGIOptionPricing.StrategyFramework.Performance.PaperPortfolioLedger();
@@ -1829,16 +2050,11 @@ static void TestPeriodicHeartbeatAdvancesTimeoutAndHealthRecoveryWithoutMarketEv
     ApplyFill(timeout, timeoutLedger, timeoutOrders.Single(x => x.Side == BuySell.Buy), 200m, clock.Now);
     clock.Advance(clock.Now.AddSeconds(29));
     ((IStrategyHeartbeat)timeout).OnHeartbeat(clock.Now);
-    Assert(timeoutCancels.Count == 0, "無新行情時 heartbeat 29 秒不得提前單邊逾時");
+    Assert(timeoutCancels.Count == 0, "無新行情時 heartbeat 29 秒不得撤 peer");
     clock.Advance(clock.Now.AddSeconds(1));
     ((IStrategyHeartbeat)timeout).OnHeartbeat(clock.Now);
-    string timeoutPeer = timeoutOrders.Single(x => x.Side == BuySell.Sell).ClientOrderId;
-    Assert(timeoutCancels.SequenceEqual(new[] { timeoutPeer }, StringComparer.Ordinal),
-        "無新行情時 heartbeat 滿 30 秒仍必須定向撤銷 peer");
-    timeout.OnOrderLifecycle(Cancelled(timeoutPeer, timeout.InstanceId, clock.Now));
-    Assert(timeoutOrders.Single(x => x.Role == PaperOrderRole.Flatten).Quantity == 1 &&
-           timeout.GetSnapshot().Reason.Contains("OneLegTimeout", StringComparison.Ordinal),
-        "heartbeat 單邊逾時必須送 Flatten/OneLegTimeout");
+    Assert(timeoutCancels.Count == 0 && timeoutOrders.Count == 2,
+        "無新行情時 heartbeat 超過 MaxOneLegSeconds 也必須保留 peer，不得自動 Flatten");
 
     DateTimeOffset healthStart = start.AddHours(1);
     var healthLedger = new KGIOptionPricing.StrategyFramework.Performance.PaperPortfolioLedger();
@@ -1853,15 +2069,12 @@ static void TestPeriodicHeartbeatAdvancesTimeoutAndHealthRecoveryWithoutMarketEv
     Assert(healthCancels.Count == 0, "最新健康報價年齡恰等於 QuoteFreshnessSeconds 時仍屬有效");
     healthClock.Advance(staleBoundary.AddMilliseconds(1));
     ((IStrategyHeartbeat)health).OnHeartbeat(healthClock.Now);
-    string healthPeer = healthOrders.Single(x => x.Side == BuySell.Sell).ClientOrderId;
-    Assert(healthCancels.SequenceEqual(new[] { healthPeer }, StringComparer.Ordinal),
-        "健康報價超過新鮮度後 heartbeat 必須立即撤 peer");
-    health.OnOrderLifecycle(Cancelled(healthPeer, health.InstanceId, healthClock.Now));
+    Assert(healthCancels.Count == 0 && healthOrders.Count == 2,
+        "健康報價超過新鮮度後 heartbeat 不得因行情失效撤銷 peer");
     healthClock.Advance(staleBoundary.AddSeconds(2));
     ((IStrategyHeartbeat)health).OnHeartbeat(healthClock.Now);
-    Assert(healthOrders.Single(x => x.Role == PaperOrderRole.Flatten).Quantity == 1 &&
-           health.GetSnapshot().Reason.Contains("MarketDataRecoveryTimeout", StringComparison.Ordinal),
-        "報價老化起算滿 MarketDataRecoverySeconds 後 heartbeat 必須中性平倉");
+    Assert(healthOrders.Count == 2 && healthCancels.Count == 0,
+        "報價老化超過 MarketDataRecoverySeconds 後仍不得自動撤銷 peer 或 Flatten");
 }
 
 static void TestPeriodicLifecycleFirstWaitsForAuthoritativeExecutions()
@@ -1984,7 +2197,7 @@ static void TestPeriodicExitCallbacksAreIdempotentOutOfOrder()
         "退出 execution/lifecycle 重複或亂序不得重複平倉或誤進 Faulted");
 }
 
-static void TestPeriodicHealthFlattenUsesNextTradePriceThroughRealPaperBroker()
+static void TestPeriodicHealthTimeoutKeepsPeerWorkingThroughRealPaperBroker()
 {
     DateTimeOffset start = new(2026, 9, 23, 21, 0, 0, TimeSpan.Zero);
     var clock = new MutableClock(start);
@@ -2024,19 +2237,10 @@ static void TestPeriodicHealthFlattenUsesNextTradePriceThroughRealPaperBroker()
     runner.Pulse(clock.Now);
     clock.Advance(start.AddSeconds(5));
     runner.Pulse(clock.Now);
-    Assert(broker.GetWorkingOrders(strategy.InstanceId).Single().Role == PaperOrderRole.Flatten,
-        "行情恢復逾時後真實 paper broker 必須持有一張 Market Flatten");
-
-    const decimal gapTrade = 70m;
-    clock.Advance(start.AddSeconds(6));
-    runner.OnMarketEvent(new MarketEvent
-    {
-        Sequence = 4, Timestamp = clock.Now, Symbol = "225MC", ProductId = "225MC",
-        Kind = MarketEventKind.Trade, LastPrice = gapTrade, TradeQuantity = 1
-    });
-    ExecutionEvent flatten = executions.Single(x => x.Role == PaperOrderRole.Flatten);
-    Assert(flatten.Price == gapTrade && ledger.GetPosition(strategy.InstanceId, "225MC").NetQuantity == 0,
-        "行情缺口後 Market Flatten 必須按當下 Trade 價成交並由共用帳本歸零");
+    Assert(broker.GetWorkingOrders(strategy.InstanceId).Single().Role is PaperOrderRole.EntryLong or PaperOrderRole.EntryShort &&
+           executions.All(x => x.Role is not PaperOrderRole.Flatten and not PaperOrderRole.StopLoss) &&
+           ledger.GetPosition(strategy.InstanceId, "225MC").NetQuantity == 1,
+        "行情恢復逾時不得撤銷 peer 或自動 Flatten，真實 paper broker 應繼續保留原完成單");
 }
 
 static IReadOnlyDictionary<string, string> RiskParameters() => Values(

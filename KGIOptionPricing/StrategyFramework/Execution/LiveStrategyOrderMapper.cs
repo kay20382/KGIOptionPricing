@@ -14,8 +14,12 @@ public interface ILiveStrategyOrderGateway
     event Action<OrderInfo, string>? CancelFailed;
     void PlaceOrder(OrderRequest request);
     void CancelOrder(string orderId);
-    void AppendOcoState(LiveStrategyOcoGroupState state) => throw new NotSupportedException("此 gateway 未支援持久化 OCO 狀態。");
+    void AppendOcoState(LiveStrategyOcoGroupState state) => throw new NotSupportedException("此 gateway 未支援 OCO 狀態追蹤。");
     IReadOnlyList<LiveStrategyOcoGroupState> GetOcoStates(string strategyInstanceId, long strategyRunGeneration) => Array.Empty<LiveStrategyOcoGroupState>();
+    void AppendRestingPairState(RestingPairSnapshot state) =>
+        throw new NotSupportedException("此 gateway 未支援雙側委託狀態追蹤。");
+    IReadOnlyList<RestingPairSnapshot> GetRestingPairStates(string strategyInstanceId,
+        long strategyRunGeneration) => Array.Empty<RestingPairSnapshot>();
 }
 
 internal sealed class OrderManagerLiveStrategyOrderGateway : ILiveStrategyOrderGateway
@@ -65,7 +69,8 @@ public static class LiveStrategyOrderMapper
         string brokerId,
         string account,
         string realOrderId,
-        int accountNetQuantity = 0)
+        int accountNetQuantity = 0,
+        StrategyExecutionCapabilities? capabilities = null)
     {
         ArgumentNullException.ThrowIfNull(request);
         ArgumentNullException.ThrowIfNull(instrument);
@@ -77,8 +82,7 @@ public static class LiveStrategyOrderMapper
             throw new ArgumentException("StrategyInstanceId 不得空白。", nameof(request));
         if (string.IsNullOrWhiteSpace(request.Symbol))
             throw new ArgumentException("商品代碼不得空白。", nameof(request));
-        if (request.Quantity != 1)
-            throw new ArgumentOutOfRangeException(nameof(request), request.Quantity, "實盤策略委託固定為一口。");
+        (capabilities ?? new()).Validate(request);
         if (request.Price <= 0m)
             throw new ArgumentOutOfRangeException(nameof(request), request.Price, "實盤限價必須為正數。");
         if (string.IsNullOrWhiteSpace(brokerId))
@@ -94,9 +98,11 @@ public static class LiveStrategyOrderMapper
             Instrument = instrument,
             BuySell = request.Side,
             Price = (double)request.Price,
-            Quantity = 1,
-            TimeInForce = TimeInForce.ROD,
-            PositionEffect = AccountPositionEffectResolver.Resolve(accountNetQuantity, request.Side, request.Quantity),
+            Quantity = request.Quantity,
+            TimeInForce = request.TimeInForce,
+            PositionEffect = request.RestingPairMode == RestingPairMode.OppositeLegIsExit
+                ? PositionEffect.Auto
+                : AccountPositionEffectResolver.Resolve(accountNetQuantity, request.Side, request.Quantity),
             BrokerId = brokerId,
             Account = account,
             StrategyRoute = new StrategyOrderRouteMetadata(
@@ -106,7 +112,9 @@ public static class LiveStrategyOrderMapper
                 request.CycleId,
                 request.Symbol,
                 request.Role.ToString(),
-                request.OcoGroupId)
+                request.OcoGroupId,
+                request.PairId,
+                request.RestingPairMode == RestingPairMode.OppositeLegIsExit)
         };
     }
 

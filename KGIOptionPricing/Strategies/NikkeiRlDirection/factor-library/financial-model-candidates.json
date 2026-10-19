@@ -1,0 +1,372 @@
+{
+  "schema": "nikkei-financial-model-candidates-v1",
+  "status": "ResearchEvaluatedNotDeployed",
+  "formalCsharpIntegrated": false,
+  "decisionSeconds": [
+    3,
+    5,
+    10
+  ],
+  "horizonSeconds": [
+    15,
+    30,
+    60
+  ],
+  "candidates": [
+    {
+      "candidateId": 74,
+      "name": "ARIMA(1,1,0)零漂移報酬預測",
+      "role": "Direction",
+      "formula": "sum(phi^k*r_t,k=1..H/3); r_t=(mid_t-mid_(t-3))/5",
+      "source": "https://www.statsmodels.org/stable/generated/statsmodels.tsa.arima.model.ARIMA.html",
+      "engineeringExtension": false,
+      "existingFamilyVariant": false,
+      "calibration": "Earlier native3s training dates only; no evaluation-date fitting",
+      "modelStepSeconds": 3,
+      "units": "Index ticks; 1tick=5points",
+      "availability": "Healthy causal received quote clock; gap reset;60s warm, HAR180s",
+      "deploymentEligible": false,
+      "directionPassedSettings": 0,
+      "volatilityPassedSettings": [],
+      "researchStatus": "TestedVersionDidNotPass"
+    },
+    {
+      "candidateId": 75,
+      "name": "ARIMA(1,1,1)條件平方誤差報酬預測",
+      "role": "Direction",
+      "formula": "(phi*r_t+theta*epsilon_t)*(1-phi^(H/3))/(1-phi); epsilon_t=r_t-phi*r_(t-3)-theta*epsilon_(t-3)",
+      "source": "https://www.statsmodels.org/stable/generated/statsmodels.tsa.arima.model.ARIMA.html",
+      "engineeringExtension": true,
+      "existingFamilyVariant": false,
+      "calibration": "Earlier native3s training dates only; no evaluation-date fitting",
+      "modelStepSeconds": 3,
+      "units": "Index ticks; 1tick=5points",
+      "availability": "Healthy causal received quote clock; gap reset;60s warm, HAR180s",
+      "deploymentEligible": false,
+      "directionPassedSettings": 0,
+      "volatilityPassedSettings": [],
+      "researchStatus": "TestedVersionDidNotPass"
+    },
+    {
+      "candidateId": 76,
+      "name": "GARCH(1,1)條件波動預測",
+      "role": "VolatilityRisk",
+      "formula": "sqrt(sum(E_t[h_(t+3k)],k=1..H/3)); h_next=omega+alpha*r_t^2+beta*h_t",
+      "source": "https://arch.readthedocs.io/en/latest/univariate/forecasting.html",
+      "engineeringExtension": false,
+      "existingFamilyVariant": false,
+      "calibration": "Earlier native3s training dates only; no evaluation-date fitting",
+      "modelStepSeconds": 3,
+      "units": "Index ticks; 1tick=5points",
+      "availability": "Healthy causal received quote clock; gap reset;60s warm, HAR180s",
+      "deploymentEligible": false,
+      "directionPassedSettings": 0,
+      "volatilityPassedSettings": [
+        {
+          "decisionSeconds": 3,
+          "horizonSeconds": 15,
+          "meanImprovement": 0.19393356943971898,
+          "qValue": 2.0428631436831717e-06,
+          "pooledQValue": 1.8960481080729864e-05,
+          "minDailyScoredSamples": 5373
+        },
+        {
+          "decisionSeconds": 5,
+          "horizonSeconds": 15,
+          "meanImprovement": 0.1920487858675423,
+          "qValue": 7.739161979124739e-06,
+          "pooledQValue": 7.182969389781904e-05,
+          "minDailyScoredSamples": 3216
+        },
+        {
+          "decisionSeconds": 10,
+          "horizonSeconds": 15,
+          "meanImprovement": 0.18543484407288718,
+          "qValue": 6.3060155417342384e-06,
+          "pooledQValue": 5.852819301359127e-05,
+          "minDailyScoredSamples": 1606
+        },
+        {
+          "decisionSeconds": 3,
+          "horizonSeconds": 30,
+          "meanImprovement": 0.1840718274762425,
+          "qValue": 2.2765586725606964e-06,
+          "pooledQValue": 2.112948572875766e-05,
+          "minDailyScoredSamples": 5013
+        },
+        {
+          "decisionSeconds": 5,
+          "horizonSeconds": 30,
+          "meanImprovement": 0.18276246764586315,
+          "qValue": 7.739161979124739e-06,
+          "pooledQValue": 7.182969389781904e-05,
+          "minDailyScoredSamples": 3002
+        },
+        {
+          "decisionSeconds": 10,
+          "horizonSeconds": 30,
+          "meanImprovement": 0.18107044700108427,
+          "qValue": 6.9267627254848185e-06,
+          "pooledQValue": 6.428955067957725e-05,
+          "minDailyScoredSamples": 1504
+        },
+        {
+          "decisionSeconds": 3,
+          "horizonSeconds": 60,
+          "meanImprovement": 0.16497600963538783,
+          "qValue": 2.0428631436831717e-06,
+          "pooledQValue": 1.8960481080729864e-05,
+          "minDailyScoredSamples": 4400
+        },
+        {
+          "decisionSeconds": 5,
+          "horizonSeconds": 60,
+          "meanImprovement": 0.16263063052077117,
+          "qValue": 6.3060155417342384e-06,
+          "pooledQValue": 5.852819301359127e-05,
+          "minDailyScoredSamples": 2636
+        },
+        {
+          "decisionSeconds": 10,
+          "horizonSeconds": 60,
+          "meanImprovement": 0.1611635456996525,
+          "qValue": 4.551589974004081e-06,
+          "pooledQValue": 4.224479542655476e-05,
+          "minDailyScoredSamples": 1321
+        }
+      ],
+      "researchStatus": "VolatilityEvidenceOnly"
+    },
+    {
+      "candidateId": 77,
+      "name": "EWMA60秒半衰期波動預測",
+      "role": "VolatilityRisk",
+      "formula": "sqrt((H/3)*v_t); v_t=lambda*v_previous+(1-lambda)*r_t^2; lambda=exp(-ln(2)*3/60)",
+      "source": "https://www.msci.com/documents/10199/5915b101-4206-4ba0-aee2-3449d5c7e95a",
+      "engineeringExtension": true,
+      "existingFamilyVariant": false,
+      "calibration": "Earlier native3s training dates only; no evaluation-date fitting",
+      "modelStepSeconds": 3,
+      "units": "Index ticks; 1tick=5points",
+      "availability": "Healthy causal received quote clock; gap reset;60s warm, HAR180s",
+      "deploymentEligible": false,
+      "directionPassedSettings": 0,
+      "volatilityPassedSettings": [
+        {
+          "decisionSeconds": 3,
+          "horizonSeconds": 15,
+          "meanImprovement": 0.19270135687493814,
+          "qValue": 2.327967177647944e-06,
+          "pooledQValue": 2.1606624880790127e-05,
+          "minDailyScoredSamples": 5373
+        },
+        {
+          "decisionSeconds": 5,
+          "horizonSeconds": 15,
+          "meanImprovement": 0.1905188552513366,
+          "qValue": 9.753409435542219e-06,
+          "pooledQValue": 9.052458342451312e-05,
+          "minDailyScoredSamples": 3216
+        },
+        {
+          "decisionSeconds": 10,
+          "horizonSeconds": 15,
+          "meanImprovement": 0.18402802160950196,
+          "qValue": 7.739161979124739e-06,
+          "pooledQValue": 7.182969389781904e-05,
+          "minDailyScoredSamples": 1606
+        },
+        {
+          "decisionSeconds": 3,
+          "horizonSeconds": 30,
+          "meanImprovement": 0.1828649538410387,
+          "qValue": 3.1734235800753414e-06,
+          "pooledQValue": 2.9453582310304916e-05,
+          "minDailyScoredSamples": 5013
+        },
+        {
+          "decisionSeconds": 5,
+          "horizonSeconds": 30,
+          "meanImprovement": 0.18110362108391315,
+          "qValue": 9.753409435542219e-06,
+          "pooledQValue": 9.052458342451312e-05,
+          "minDailyScoredSamples": 3002
+        },
+        {
+          "decisionSeconds": 10,
+          "horizonSeconds": 30,
+          "meanImprovement": 0.17929093542083355,
+          "qValue": 9.490436688208168e-06,
+          "pooledQValue": 8.808384733507288e-05,
+          "minDailyScoredSamples": 1504
+        },
+        {
+          "decisionSeconds": 3,
+          "horizonSeconds": 60,
+          "meanImprovement": 0.16293047877109404,
+          "qValue": 3.1734235800753414e-06,
+          "pooledQValue": 2.9453582310304916e-05,
+          "minDailyScoredSamples": 4400
+        },
+        {
+          "decisionSeconds": 5,
+          "horizonSeconds": 60,
+          "meanImprovement": 0.16008170767024504,
+          "qValue": 9.753409435542219e-06,
+          "pooledQValue": 9.052458342451312e-05,
+          "minDailyScoredSamples": 2636
+        },
+        {
+          "decisionSeconds": 10,
+          "horizonSeconds": 60,
+          "meanImprovement": 0.1583765203375959,
+          "qValue": 7.739161979124739e-06,
+          "pooledQValue": 7.182969389781904e-05,
+          "minDailyScoredSamples": 1321
+        }
+      ],
+      "researchStatus": "VolatilityEvidenceOnly"
+    },
+    {
+      "candidateId": 78,
+      "name": "RV60秒期限尺度化波動率",
+      "role": "VolatilityRisk",
+      "formula": "sqrt((H/3)*mean(last20 r^2))",
+      "source": "https://statmath.wu.ac.at/~hauser/LVs/FinEtricsQF/References/Corsi2009JFinEtrics_LMmodelRealizedVola.pdf",
+      "engineeringExtension": true,
+      "existingFamilyVariant": true,
+      "calibration": "Earlier native3s training dates only; no evaluation-date fitting",
+      "modelStepSeconds": 3,
+      "units": "Index ticks; 1tick=5points",
+      "availability": "Healthy causal received quote clock; gap reset;60s warm, HAR180s",
+      "deploymentEligible": false,
+      "directionPassedSettings": 0,
+      "volatilityPassedSettings": [
+        {
+          "decisionSeconds": 3,
+          "horizonSeconds": 15,
+          "meanImprovement": 0.12716338862598459,
+          "qValue": 0.006198522827882923,
+          "pooledQValue": 0.03687853716296469,
+          "minDailyScoredSamples": 5373
+        }
+      ],
+      "researchStatus": "VolatilityEvidenceOnly"
+    },
+    {
+      "candidateId": 79,
+      "name": "Parkinson60秒取樣區間波動率",
+      "role": "VolatilityRisk",
+      "formula": "(max(sampled mid/5)-min(sampled mid/5))/sqrt(4*ln(2))*sqrt(H/60); sampled over60s at3s",
+      "source": "https://www.cmegroup.com/trading/fx/files/michael_parkinson.pdf",
+      "engineeringExtension": true,
+      "existingFamilyVariant": false,
+      "calibration": "Earlier native3s training dates only; no evaluation-date fitting",
+      "modelStepSeconds": 3,
+      "units": "Index ticks; 1tick=5points",
+      "availability": "Healthy causal received quote clock; gap reset;60s warm, HAR180s",
+      "deploymentEligible": false,
+      "directionPassedSettings": 0,
+      "volatilityPassedSettings": [],
+      "researchStatus": "TestedVersionDidNotPass"
+    },
+    {
+      "candidateId": 80,
+      "name": "Kalman報酬局部水準預測",
+      "role": "Direction",
+      "formula": "(H/3)*filtered_return_mean; local-level Kalman Q/R calibrated using earlier training only",
+      "source": "https://www.statsmodels.org/stable/examples/notebooks/generated/statespace_local_linear_trend.html",
+      "engineeringExtension": true,
+      "existingFamilyVariant": false,
+      "calibration": "Earlier native3s training dates only; no evaluation-date fitting",
+      "modelStepSeconds": 3,
+      "units": "Index ticks; 1tick=5points",
+      "availability": "Healthy causal received quote clock; gap reset;60s warm, HAR180s",
+      "deploymentEligible": false,
+      "directionPassedSettings": 0,
+      "volatilityPassedSettings": [],
+      "researchStatus": "TestedVersionDidNotPass"
+    },
+    {
+      "candidateId": 81,
+      "name": "HAR型30/60/180秒盤中波動預測",
+      "role": "VolatilityRisk",
+      "formula": "sqrt((H/3)*exp(ridge(log RV30/log RV60/log RV180))); geometric log-variance prediction, no Jensen correction",
+      "source": "https://statmath.wu.ac.at/~hauser/LVs/FinEtricsQF/References/Corsi2009JFinEtrics_LMmodelRealizedVola.pdf",
+      "engineeringExtension": true,
+      "existingFamilyVariant": false,
+      "calibration": "Earlier native3s training dates only; no evaluation-date fitting",
+      "modelStepSeconds": 3,
+      "units": "Index ticks; 1tick=5points",
+      "availability": "Healthy causal received quote clock; gap reset;60s warm, HAR180s",
+      "deploymentEligible": false,
+      "directionPassedSettings": 0,
+      "volatilityPassedSettings": [
+        {
+          "decisionSeconds": 3,
+          "horizonSeconds": 30,
+          "meanImprovement": 0.11962534508724125,
+          "qValue": 2.0428631436831717e-06,
+          "pooledQValue": 1.8960481080729864e-05,
+          "minDailyScoredSamples": 3077
+        },
+        {
+          "decisionSeconds": 5,
+          "horizonSeconds": 30,
+          "meanImprovement": 0.11324693149527085,
+          "qValue": 3.449802622854486e-06,
+          "pooledQValue": 3.201874661312564e-05,
+          "minDailyScoredSamples": 1844
+        },
+        {
+          "decisionSeconds": 3,
+          "horizonSeconds": 60,
+          "meanImprovement": 0.11681730215797115,
+          "qValue": 1.3049359827534302e-06,
+          "pooledQValue": 1.2111537715615728e-05,
+          "minDailyScoredSamples": 2721
+        },
+        {
+          "decisionSeconds": 5,
+          "horizonSeconds": 60,
+          "meanImprovement": 0.11175987789777278,
+          "qValue": 1.3049359827534302e-06,
+          "pooledQValue": 1.2111537715615728e-05,
+          "minDailyScoredSamples": 1630
+        }
+      ],
+      "researchStatus": "VolatilityEvidenceOnly"
+    }
+  ],
+  "allPreviouslyInspected": true,
+  "trainingDates": [
+    "20260915",
+    "20260916",
+    "20260917",
+    "20260918",
+    "20260921",
+    "20260922",
+    "20260923",
+    "20260924"
+  ],
+  "evaluationDates": [
+    "20260929",
+    "20260930",
+    "20261006",
+    "20261007",
+    "20261008"
+  ],
+  "sourceCatalogPath": "C:\\Users\\user\\.codex\\visualizations\\2026\\10\\07\\01a1161a-64d8-7c81-9e7d-b725164d7ff5\\nikkei-financial-model-source-20261011\\candidate-library.json",
+  "sourceCatalogSHA256": "0fc312e21a2c97136621700b2e34104bea41e312433bff402344793ef2f9f0c1",
+  "verificationPath": "C:\\Users\\user\\.codex\\visualizations\\2026\\10\\07\\01a1161a-64d8-7c81-9e7d-b725164d7ff5\\nikkei-financial-model-validation-20261011\\verification.json",
+  "verificationSHA256": "bb2643329193865febde4755a201cae7cd9df926e1f5b68f7910305d63867933",
+  "reportPath": "C:\\Users\\user\\.codex\\visualizations\\2026\\10\\07\\01a1161a-64d8-7c81-9e7d-b725164d7ff5\\nikkei-financial-model-validation-20261011\\prediction-report.md",
+  "reportSHA256": "cbd9811368bc8e5db75639f42471dc8d794b6a4d2ebcc413d3ad218089b684a0",
+  "dailyPerformancePath": "C:\\Users\\user\\.codex\\visualizations\\2026\\10\\07\\01a1161a-64d8-7c81-9e7d-b725164d7ff5\\nikkei-financial-model-validation-20261011\\daily-prediction-performance.csv",
+  "auditPath": "C:\\Users\\user\\.codex\\visualizations\\2026\\10\\07\\01a1161a-64d8-7c81-9e7d-b725164d7ff5\\nikkei-financial-model-audit-20261011\\audit-result.json",
+  "auditSHA256": "1a7bc21c16ca03db697ea6b9ffb0dc76a7f8784c05a068963cc24d97e58508b2",
+  "hypotheses": 189,
+  "dailyRows": 945,
+  "rlRetrained": false,
+  "tradingBacktest": false
+}

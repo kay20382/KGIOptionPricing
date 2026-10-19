@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
@@ -51,6 +51,7 @@ public sealed class SimulationRunRecorder : IDisposable
     private readonly StreamWriter _trades;
     private readonly StreamWriter _experiments;
     private readonly TimeSpan _decisionHeartbeatInterval;
+    private readonly bool _summaryOnly;
     private readonly Dictionary<string, DecisionStamp> _lastDecisions = new(StringComparer.Ordinal);
     private readonly HashSet<string> _candidates = new(StringComparer.Ordinal);
     private readonly HashSet<string> _acceptedCandidates = new(StringComparer.Ordinal);
@@ -80,6 +81,8 @@ public sealed class SimulationRunRecorder : IDisposable
     private bool _summaryFinalized;
     private bool _disposed;
     private long _warmupObservations;
+    private long _qualityEvaluations;
+    private readonly HashSet<string> _sampleKeys = new(StringComparer.Ordinal);
     private long _candidateSignals;
     private long _acceptedSignals;
     private long _submittedOrders;
@@ -93,6 +96,7 @@ public sealed class SimulationRunRecorder : IDisposable
     private long _totalFillQuantity;
     private decimal _peakNetPnl;
     private decimal _maximumDrawdown;
+    private decimal _minimumNetPnl;
     private bool _hasSnapshot;
     private RunManifest? _manifest;
 
@@ -101,9 +105,10 @@ public sealed class SimulationRunRecorder : IDisposable
     internal bool SummaryFinalized { get { lock (_sync) return _summaryFinalized; } }
     internal bool IsDisposed { get { lock (_sync) return _disposed; } }
 
-    public SimulationRunRecorder(string directoryPath, TimeSpan? decisionHeartbeatInterval = null)
+    public SimulationRunRecorder(string directoryPath, TimeSpan? decisionHeartbeatInterval = null, bool summaryOnly = false)
     {
         DirectoryPath = Path.GetFullPath(directoryPath);
+        _summaryOnly = summaryOnly;
         Directory.CreateDirectory(DirectoryPath);
         _decisionHeartbeatInterval = decisionHeartbeatInterval ?? TimeSpan.FromSeconds(5);
         if (_decisionHeartbeatInterval < TimeSpan.Zero)
@@ -112,6 +117,7 @@ public sealed class SimulationRunRecorder : IDisposable
         var created = new List<string>();
         StreamWriter Open(string name)
         {
+            if (summaryOnly) return new StreamWriter(Stream.Null);
             string path = Path.Combine(DirectoryPath, name);
             bool existed = File.Exists(path);
             StreamWriter writer = Writer(name);
@@ -125,7 +131,7 @@ public sealed class SimulationRunRecorder : IDisposable
             lifecycle = Open("order-lifecycle.jsonl");
             experiments = Open("parameter-experiments.jsonl");
             trades = Open("executions.csv");
-            trades.WriteLine("timestamp,sequence,marketSequence,instanceId,cycleId,generation,clientOrderId,orderId,symbol,side,role,price,quantity,commission,triggerMarketPrice");
+            trades.WriteLine("timestamp,sequence,marketSequence,instanceId,cycleId,generation,clientOrderId,orderId,symbol,side,role,price,quantity,commission,triggerMarketPrice,pairId,originalOrderRole,effectiveRole,executionId,cumulativeFilledQuantity,strategyRunGeneration");
         }
         catch
         {
@@ -205,12 +211,24 @@ public sealed class SimulationRunRecorder : IDisposable
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
             _events.WriteLine(JsonSerializer.Serialize(snapshot, _json));
+            ObservePerformance(snapshot);
+        }
+    }
+
+    /// <summary>Observe each common-ledger mark without writing high-frequency snapshots.</summary>
+    public void ObservePerformance(StrategySnapshot snapshot)
+    {
+        ArgumentNullException.ThrowIfNull(snapshot);
+        lock (_sync)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
             string snapshotKey = string.Join("\u001f", snapshot.InstanceId, snapshot.TradableSymbol);
             _latestSnapshots[snapshotKey] = snapshot;
             _hasSnapshot = true;
             decimal aggregateNetPnl = _latestSnapshots.Values.Sum(item => item.NetPnl);
             _peakNetPnl = Math.Max(_peakNetPnl, aggregateNetPnl);
             _maximumDrawdown = Math.Max(_maximumDrawdown, _peakNetPnl - aggregateNetPnl);
+            _minimumNetPnl = Math.Min(_minimumNetPnl, aggregateNetPnl);
         }
     }
 
@@ -220,6 +238,13 @@ public sealed class SimulationRunRecorder : IDisposable
         lock (_sync)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
+            if (observation.Kind != StrategyObservationKind.Decision)
+            {
+                if (string.IsNullOrWhiteSpace(observation.SampleKey)) throw new ArgumentException("SampleKey required");
+                if (_sampleKeys.Add(observation.StrategyInstanceId + ":" + observation.Kind + ":" + observation.SampleKey))
+                    _decisions.WriteLine(JsonSerializer.Serialize(observation, _json));
+                return;
+            }
             string key = string.Join("\u001f", observation.StrategyInstanceId,
                 observation.CandidateId, observation.CycleId);
             string fingerprint = JsonSerializer.Serialize(
@@ -230,6 +255,7 @@ public sealed class SimulationRunRecorder : IDisposable
                 return;
 
             _decisions.WriteLine(JsonSerializer.Serialize(observation, _json));
+            if(observation.RequiredProductsPresent.HasValue)_qualityEvaluations++;
             _lastDecisions[key] = new DecisionStamp(fingerprint, observation.Timestamp);
             string factScope = string.Join("\u001f", observation.StrategyInstanceId,
                 observation.CandidateId, observation.CycleId);
@@ -325,6 +351,7 @@ public sealed class SimulationRunRecorder : IDisposable
                 StrategyInstanceId = orderEvent.StrategyInstanceId,
                 CycleId = cycleId,
                 ClientOrderId = orderEvent.ClientOrderId,
+                PairId = orderEvent.PairId,
                 OcoGroupId = orderEvent.OcoGroupId,
                 OrderId = orderEvent.OrderId,
                 BrokerOrderId = orderEvent.BrokerOrderId,
@@ -336,6 +363,7 @@ public sealed class SimulationRunRecorder : IDisposable
                 PreviousState = orderEvent.PreviousState,
                 State = orderEvent.State,
                 Price = orderEvent.Price,
+                TimeInForce = orderEvent.TimeInForce,
                 Quantity = orderEvent.Quantity,
                 FilledQuantity = orderEvent.FilledQuantity,
                 DeliveredFilledQuantity = orderEvent.DeliveredFilledQuantity,
@@ -357,7 +385,7 @@ public sealed class SimulationRunRecorder : IDisposable
                 observation.PreviousState, observation.State,
                 observation.Price.ToString(CultureInfo.InvariantCulture), observation.Quantity,
                 observation.FilledQuantity, observation.RemainingQuantity, observation.ReasonCode,
-                observation.CycleId, observation.OcoGroupId, observation.Symbol, observation.Side, observation.Role,
+                observation.CycleId, observation.PairId, observation.OcoGroupId, observation.Symbol, observation.Side, observation.Role,
                 observation.DeliveredFilledQuantity, observation.BrokerFinalCumulativeFilledQuantity,
                 observation.HasFinalCumulativeFillWatermark,
                 observation.Generation, observation.TriggerMarketSequence);
@@ -396,7 +424,11 @@ public sealed class SimulationRunRecorder : IDisposable
                 execution.Price.ToString(CultureInfo.InvariantCulture),
                 execution.Quantity.ToString(CultureInfo.InvariantCulture),
                 execution.Commission.ToString(CultureInfo.InvariantCulture),
-                execution.TriggerMarketPrice.ToString(CultureInfo.InvariantCulture)
+                execution.TriggerMarketPrice.ToString(CultureInfo.InvariantCulture),
+                Csv(execution.PairId), Csv(execution.OriginalOrderRole?.ToString() ?? string.Empty),
+                execution.Role.ToString(), Csv(execution.ExecutionId),
+                execution.CumulativeFilledQuantity.ToString(CultureInfo.InvariantCulture),
+                execution.StrategyRunGeneration.ToString(CultureInfo.InvariantCulture)
             }));
             _fills++;
             _totalCommission += execution.Commission;
@@ -595,6 +627,7 @@ public sealed class SimulationRunRecorder : IDisposable
                 unavailable["grossPnl"] = "PerformanceSnapshotNotObserved";
                 unavailable["netPnl"] = "PerformanceSnapshotNotObserved";
                 unavailable["maximumDrawdown"] = "EquityCurveNotObserved";
+                unavailable["maximumIntradayLoss"] = "EquityCurveNotObserved";
                 unavailable["completedTrades"] = "LedgerSnapshotNotObserved";
             }
             if (_fills == 0) unavailable["executionCosts"] = "ExecutionsNotObserved";
@@ -605,6 +638,7 @@ public sealed class SimulationRunRecorder : IDisposable
             decimal? holdingSeconds = null;
             if (_completedRoundTrips.Count == 0)
             {
+                unavailable["maximumTradeLoss"] = "NoCompletedTrades";
                 unavailable["winRate"] = "NoCompletedTrades";
                 unavailable["averageWinningPoints"] = "NoCompletedTrades";
                 unavailable["averageLosingPoints"] = "NoCompletedTrades";
@@ -630,11 +664,11 @@ public sealed class SimulationRunRecorder : IDisposable
             decimal? cancellationRate = _submittedOrders == 0 ? null : (decimal)_cancelledOrders / _submittedOrders;
             if (!fillRate.HasValue) unavailable["fillRate"] = "SubmittedOrdersNotObserved";
             if (!cancellationRate.HasValue) unavailable["cancellationRate"] = "SubmittedOrdersNotObserved";
-            decimal? roundTripGross = _completedRoundTrips.Count > 0
+            decimal? roundTripGross = _summaryOnly || _completedRoundTrips.Count > 0
                 ? _completedRoundTrips.Sum(x => x.GrossPnl) : null;
-            decimal? roundTripCosts = _completedRoundTrips.Count > 0
+            decimal? roundTripCosts = _summaryOnly || _completedRoundTrips.Count > 0
                 ? _completedRoundTrips.Sum(x => x.Commission) : null;
-            decimal? roundTripNet = _completedRoundTrips.Count > 0
+            decimal? roundTripNet = _summaryOnly || _completedRoundTrips.Count > 0
                 ? _completedRoundTrips.Sum(x => x.NetPnl) : null;
             long? ledgerCompletedTrades = _hasSnapshot
                 ? _latestSnapshots.Values.Sum(snapshot => (long)snapshot.CompletedTrades) : null;
@@ -659,6 +693,7 @@ public sealed class SimulationRunRecorder : IDisposable
             if (!adversePerTick.HasValue) unavailable["adverseSlippageStress"] = "ProductSpecificationOrExecutionsNotObserved";
             var summary = new RunSummary
             {
+                DataQualityEvaluations = _qualityEvaluations==0?null:_qualityEvaluations,
                 FinalizedAt = finalizedAt,
                 MarketEvents = null,
                 WarmupObservations = _warmupObservations,
@@ -684,6 +719,8 @@ public sealed class SimulationRunRecorder : IDisposable
                 AverageLosingPoints = averageLosing,
                 UserDefinedProfitFactor = userProfitFactor,
                 MaximumDrawdown = _hasSnapshot ? _maximumDrawdown : null,
+                MaximumIntradayLoss = _hasSnapshot ? -_minimumNetPnl : null,
+                MaximumTradeLoss = _completedRoundTrips.Count>0 ? Math.Max(0m,-_completedRoundTrips.Min(x=>x.NetPnl)) : null,
                 MfePoints = null,
                 MaePoints = null,
                 HoldingSeconds = holdingSeconds,

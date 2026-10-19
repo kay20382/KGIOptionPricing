@@ -4,7 +4,10 @@ namespace KGIOptionPricing.StrategyFramework.Execution;
 
 public sealed class BrokerReconciliationRequiredException : InvalidOperationException
 {
-    public BrokerReconciliationRequiredException(string message) : base(message) { }
+    public BrokerReconciliationRequiredException(string message, bool brokerCallMayHaveStarted = true) : base(message)
+        => BrokerCallMayHaveStarted = brokerCallMayHaveStarted;
+
+    public bool BrokerCallMayHaveStarted { get; }
 }
 
 /// <summary>
@@ -44,11 +47,13 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
     private sealed class BrokerMutationLease
     {
         public required long Id { get; init; }
+        public bool IsPlacement { get; init; }
         public bool Calling { get; set; }
     }
 
     private readonly object _sync = new();
     private readonly ILiveStrategyOrderGateway _gateway;
+    private readonly StrategyExecutionCapabilities _capabilities;
     private readonly string _instanceId;
     private readonly string _quoteSymbol;
     private readonly InstrumentKey _instrument;
@@ -61,12 +66,16 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
     private readonly Action? _afterBrokerMutationCommit;
     private readonly Action? _afterBrokerMutationTransition;
     private readonly Action? _beforeLocalConditionCommit;
+    private readonly Func<long, int>? _strategyNetPosition;
+    private readonly long _strategyRunGeneration;
     private readonly object _brokerMutationSync = new();
     private readonly Dictionary<long, BrokerMutationLease> _brokerMutationLeases = new();
     private readonly Dictionary<string, PaperOrder> _conditions = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, TrackedRealOrder> _realOrders = new(StringComparer.OrdinalIgnoreCase);
     private readonly ManagedStrategyOcoCoordinator _ocoCoordinator = new();
+    private readonly ManagedRestingPairCoordinator _restingPairs = new();
     private readonly Dictionary<LiveStrategyOcoKey, PaperOrder> _pendingOcoStops = new();
+    private readonly Dictionary<RestingPairKey, PaperOrder> _pendingPairedStops = new();
     private readonly HashSet<string> _ownedClientOrderIds = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _clientOrderReservations = new(StringComparer.OrdinalIgnoreCase);
     private long _localSequence;
@@ -79,6 +88,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
     private readonly Dictionary<int, int> _operationThreadDepth = new();
     private bool _protocolViolation;
     private bool _protocolGateRequested;
+    private bool _operatorCloseRequested;
     private long _brokerMutationSequence;
 
     public event Action<ExecutionEvent>? Filled;
@@ -127,6 +137,10 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
             }
         }
     }
+    public IReadOnlyList<RestingPairSnapshot> GetRestingPairStates() =>
+        _strategyRunGeneration > 0
+            ? _restingPairs.GetSnapshots(_instanceId, _strategyRunGeneration)
+            : Array.Empty<RestingPairSnapshot>();
     internal int ClientOrderRegistryCount
     {
         get { lock (_sync) return _ownedClientOrderIds.Count; }
@@ -134,6 +148,22 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
     internal bool ManualReconciliationRequired
     {
         get { lock (_brokerMutationSync) return _protocolGateRequested; }
+    }
+    public bool IsOperatorCloseRequested
+    {
+        get { lock (_brokerMutationSync) return _operatorCloseRequested; }
+    }
+    public bool HasInFlightCallbacks
+    {get {lock(_sync)return _inflightCallbacks>0 || _inflightOperations>0;}}
+
+    public void BeginOperatorClose()
+    {
+        lock (_brokerMutationSync)
+        {
+            _operatorCloseRequested = true;
+            while (_brokerMutationLeases.Values.Any(lease => lease.IsPlacement && lease.Calling))
+                Monitor.Wait(_brokerMutationSync);
+        }
     }
 
     public KgiLiveStrategyExecutionService(
@@ -161,9 +191,13 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         Action? beforeBrokerMutationCommit = null,
         Action? afterBrokerMutationCommit = null,
         Action? afterBrokerMutationTransition = null,
-        Action? beforeLocalConditionCommit = null)
+        Action? beforeLocalConditionCommit = null,
+        StrategyExecutionCapabilities? capabilities = null,
+        Func<long, int>? strategyNetPosition = null,
+        long strategyRunGeneration = 0)
     {
         _gateway = gateway ?? throw new ArgumentNullException(nameof(gateway));
+        _capabilities = capabilities ?? new();
         _instanceId = instanceId;
         _quoteSymbol = product.Symbol;
         _commission = Math.Max(0m, commissionPerContract);
@@ -175,7 +209,18 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         _afterBrokerMutationCommit = afterBrokerMutationCommit;
         _afterBrokerMutationTransition = afterBrokerMutationTransition;
         _beforeLocalConditionCommit = beforeLocalConditionCommit;
+        _strategyNetPosition = strategyNetPosition;
+        _strategyRunGeneration = strategyRunGeneration;
         _instrument = LiveStrategyOrderMapper.ToInstrument(contract);
+        if (strategyRunGeneration > 0)
+        {
+            RestingPairSnapshot[] recovered = _gateway.GetRestingPairStates(_instanceId,
+                strategyRunGeneration).ToArray();
+            foreach (RestingPairSnapshot snapshot in recovered)
+                _restingPairs.Restore(snapshot);
+            if (recovered.Any(snapshot => snapshot.Phase != RestingPairPhase.Settled))
+                RequestProtocolGateLocked();
+        }
         _gateway.OrderFilled += OnOrderFilled;
         _gateway.OrderFailed += OnOrderFailed;
         _gateway.CancelFailed += OnCancelFailed;
@@ -191,6 +236,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         {
             PurgeExpiredTerminalsLocked(_now());
             ThrowIfProtocolViolationLocked();
+            ThrowIfOperatorCloseRequested();
         }
         _beforeSubmitValidation?.Invoke();
         if (!_gateway.IsLoggedIn) throw new InvalidOperationException("交易服務尚未登入，禁止實盤送單。");
@@ -198,7 +244,8 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
             throw new InvalidOperationException("策略實例與實盤執行器不一致。");
         if (!string.Equals(request.Symbol, _quoteSymbol, StringComparison.OrdinalIgnoreCase))
             throw new InvalidOperationException("策略商品與實盤執行器不一致。");
-        if (request.Quantity != 1) throw new InvalidOperationException("實盤策略第一版固定每次 1 口。");
+        try { _capabilities.Validate(request); }
+        catch (ArgumentException ex) { throw new InvalidOperationException("委託超出此策略明確啟用的口數或效期能力。", ex); }
 
         bool ownsReservation = !string.IsNullOrWhiteSpace(request.ClientOrderId);
         if (ownsReservation && !TryReserveClientOrderIdCore(request.ClientOrderId))
@@ -210,6 +257,8 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
             : $"COND-{_instanceId}-{Interlocked.Increment(ref _localSequence)}";
         var order = new PaperOrder
         {
+            RestingPairMode = request.RestingPairMode,
+            PairId = request.PairId,
             OrderId = orderId,
             ClientOrderId = request.ClientOrderId,
             CycleId = request.CycleId,
@@ -220,6 +269,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
             Symbol = request.Symbol,
             Side = request.Side,
             Type = request.Type,
+            TimeInForce = request.TimeInForce,
             Role = request.Role,
             Price = request.Price,
             Quantity = request.Quantity,
@@ -239,8 +289,12 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
                 lock (_sync)
                 {
                     ThrowIfProtocolViolationLocked();
-                    _conditions[order.OrderId] = order;
-                    CommitClientOrderReservationLocked(order.ClientOrderId);
+                    lock (_brokerMutationSync)
+                    {
+                        ThrowIfOperatorCloseRequestedLocked();
+                        _conditions[order.OrderId] = order;
+                        CommitClientOrderReservationLocked(order.ClientOrderId);
+                    }
                 }
                 StateChanged?.Invoke();
             }
@@ -275,7 +329,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         }
         if (removedCondition != null)
         {
-            StateChanged?.Invoke();
+            PublishLifecycle(CreateLocalConditionCancellation(removedCondition));
             return true;
         }
         return !string.IsNullOrEmpty(realId) && RequestCancel(realId);
@@ -292,21 +346,37 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
             string.IsNullOrWhiteSpace(clientOrderId)) return false;
 
         string? realId;
+        PaperOrder? localCondition = null;
         lock (_sync)
         {
             ThrowIfClosingLocked();
             PurgeExpiredTerminalsLocked(_now());
             ThrowIfProtocolViolationLocked();
+            PaperOrder[] localMatches = _conditions.Values.Where(order =>
+                string.Equals(order.StrategyInstanceId, strategyInstanceId, StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(order.ClientOrderId, clientOrderId, StringComparison.OrdinalIgnoreCase)).ToArray();
+            if (localMatches.Length > 1) return false;
+            if (localMatches.Length == 1)
+            {
+                localCondition = localMatches[0];
+                _conditions.Remove(localCondition.OrderId);
+                RetireClientOrderIdLocked(localCondition.ClientOrderId);
+            }
             string[] matches = _realOrders
                 .Where(x => !x.Value.Terminal &&
                             string.Equals(x.Value.Order.StrategyInstanceId, strategyInstanceId, StringComparison.OrdinalIgnoreCase) &&
                             string.Equals(x.Value.Order.ClientOrderId, clientOrderId, StringComparison.OrdinalIgnoreCase))
                 .Select(x => x.Key)
                 .ToArray();
-            if (matches.Length != 1) return false;
-            realId = matches[0];
+            if (localCondition == null && matches.Length != 1) return false;
+            realId = matches.Length == 1 ? matches[0] : null;
         }
-        return RequestCancel(realId);
+        if (localCondition != null)
+        {
+            PublishLifecycle(CreateLocalConditionCancellation(localCondition));
+            return true;
+        }
+        return realId != null && RequestCancel(realId);
         }
         finally { ExitOperation(); }
     }
@@ -318,21 +388,22 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         {
         if (!string.Equals(strategyInstanceId, _instanceId, StringComparison.OrdinalIgnoreCase)) return 0;
         string[] realIds;
-        int conditionCount;
+        PaperOrder[] localConditions;
         lock (_sync)
         {
             ThrowIfClosingLocked();
             PurgeExpiredTerminalsLocked(_now());
             ThrowIfProtocolViolationLocked();
-            conditionCount = _conditions.Count;
-            foreach (PaperOrder condition in _conditions.Values)
+            localConditions = _conditions.Values.ToArray();
+            foreach (PaperOrder condition in localConditions)
                 RetireClientOrderIdLocked(condition.ClientOrderId);
             _conditions.Clear();
             realIds = _realOrders.Where(x => !x.Value.Terminal).Select(x => x.Key).ToArray();
         }
         foreach (string realId in realIds) RequestCancel(realId);
-        if (conditionCount > 0) StateChanged?.Invoke();
-        return conditionCount + realIds.Length;
+        foreach (PaperOrder condition in localConditions)
+            PublishLifecycle(CreateLocalConditionCancellation(condition));
+        return localConditions.Length + realIds.Length;
         }
         finally { ExitOperation(); }
     }
@@ -420,7 +491,23 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         }
         if (triggered != null)
         {
-            if (!string.IsNullOrWhiteSpace(triggered.OcoGroupId) && triggered.Role == PaperOrderRole.StopLoss)
+            if (!string.IsNullOrWhiteSpace(triggered.PairId) && triggered.Role == PaperOrderRole.StopLoss)
+            {
+                var key = new RestingPairKey(triggered.StrategyInstanceId,
+                    triggered.StrategyRunGeneration, triggered.CycleId, triggered.PairId);
+                lock (_sync) _pendingPairedStops[key] = triggered;
+                RestingPairDecision decision = _restingPairs.RequestFlatten(key, "StopLoss");
+                PersistRestingPair(key);
+                if (decision.Phase == RestingPairPhase.Quarantined)
+                {
+                    lock (_sync) RequestProtocolGateLocked();
+                    Failed?.Invoke("Paired stop could not identify its exact opposite limit order.");
+                }
+                foreach (RestingPairAction action in decision.Actions.Where(x =>
+                             x.Kind == RestingPairActionKind.CancelExactOpposite))
+                    RequestCancel(action.BrokerOrderId);
+            }
+            else if (!string.IsNullOrWhiteSpace(triggered.OcoGroupId) && triggered.Role == PaperOrderRole.StopLoss)
             {
                 var key = new LiveStrategyOcoKey(triggered.StrategyInstanceId, triggered.StrategyRunGeneration, triggered.OcoGroupId);
                 lock (_sync) _pendingOcoStops[key] = triggered;
@@ -461,6 +548,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         {
             ThrowIfClosingLocked();
             ThrowIfProtocolViolationLocked();
+            ThrowIfOperatorCloseRequested();
             if (!_ownedClientOrderIds.Add(clientOrderId)) return false;
             _clientOrderReservations.Add(clientOrderId);
             return true;
@@ -501,7 +589,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         EnterOperation();
         try
         {
-        lock (_sync) ThrowIfProtocolViolationLocked();
+        lock (_sync) { ThrowIfProtocolViolationLocked(); ThrowIfOperatorCloseRequested(); }
         if (netPosition == 0) return;
         if (Math.Abs(netPosition) != 1)
             throw new InvalidOperationException("實盤策略平倉硬閘固定每次 1 口；非一口部位必須人工核對。");
@@ -543,16 +631,17 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
 
     private void SendBrokerLimit(PaperOrderRequest request, PaperOrder order, DateTimeOffset now)
     {
-        bool ocoEntry = !string.IsNullOrWhiteSpace(request.OcoGroupId) &&
+        bool paired = request.RestingPairMode == RestingPairMode.OppositeLegIsExit;
+        bool ocoEntry = !paired && !string.IsNullOrWhiteSpace(request.OcoGroupId) &&
             request.Role is PaperOrderRole.EntryLong or PaperOrderRole.EntryShort;
-        bool ocoTakeProfit = !string.IsNullOrWhiteSpace(request.OcoGroupId) && request.Role == PaperOrderRole.TakeProfit;
+        bool ocoTakeProfit = !paired && !string.IsNullOrWhiteSpace(request.OcoGroupId) && request.Role == PaperOrderRole.TakeProfit;
         if (ocoTakeProfit)
             EnsureTakeProfitMayBeSubmitted(new ManagedStrategyOcoEvent(
                 new LiveStrategyOcoKey(request.StrategyInstanceId, request.StrategyRunGeneration, request.OcoGroupId),
                 ManagedStrategyOcoEventKind.TakeProfitSubmitted, request.ClientOrderId, string.Empty,
                 request.Role, 0, null, false, 0, now));
         OrderRequest brokerRequest = LiveStrategyOrderMapper.CreateBrokerLimit(
-            request, _instrument, _gateway.BrokerId, _gateway.Account, order.OrderId);
+            request, _instrument, _gateway.BrokerId, _gateway.Account, order.OrderId, capabilities: _capabilities);
         lock (_sync)
         {
             PurgeExpiredTerminalsLocked(_now());
@@ -560,6 +649,20 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
             if (_realOrders.Values.Any(x => string.Equals(
                     x.Order.ClientOrderId, request.ClientOrderId, StringComparison.OrdinalIgnoreCase)))
                 throw new InvalidOperationException($"ClientOrderId 已存在：{request.ClientOrderId}");
+            if (paired)
+            {
+                var key = new RestingPairKey(request.StrategyInstanceId,
+                    request.StrategyRunGeneration, request.CycleId, request.PairId);
+                RestingPairDecision registration = _restingPairs.RegisterLeg(key,
+                    order.ClientOrderId, order.OrderId, order.Side, order.Role, order.Quantity);
+                if (registration.Phase == RestingPairPhase.Quarantined)
+                {
+                    RequestProtocolGateLocked();
+                    throw new BrokerReconciliationRequiredException(
+                        "Paired limit registration failed after another leg may have filled.");
+                }
+                PersistRestingPair(key);
+            }
             _realOrders[order.OrderId] = new TrackedRealOrder
             {
                 Order = order,
@@ -580,7 +683,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
                     new LiveStrategyOcoKey(request.StrategyInstanceId, request.StrategyRunGeneration, request.OcoGroupId),
                     ManagedStrategyOcoEventKind.TakeProfitSubmitted, request.ClientOrderId, string.Empty,
                     request.Role, 0, null, false, 0, now));
-            mutation = CommitBrokerMutationLease();
+            mutation = CommitBrokerMutationLease(placement: true);
             TransitionBrokerMutationToCall(mutation);
             gatewayCallStarted = true;
             _gateway.PlaceOrder(brokerRequest);
@@ -590,9 +693,12 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
                     ManagedStrategyOcoEventKind.EntrySubmitted, request.ClientOrderId, string.Empty,
                     request.Role, 0, null, false, 0, now));
         }
-        catch (BrokerReconciliationRequiredException)
+        catch (BrokerReconciliationRequiredException exception)
         {
-            if (!gatewayCallStarted) RemoveNeverSubmittedOrder(order.OrderId);
+            if (gatewayCallStarted && !exception.BrokerCallMayHaveStarted)
+                RejectNeverSubmittedOrder(order.OrderId, exception.Message);
+            else if (!gatewayCallStarted)
+                RemoveNeverSubmittedOrder(order.OrderId);
             throw;
         }
         catch (Exception ex)
@@ -602,7 +708,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
                 RemoveNeverSubmittedOrder(order.OrderId);
                 throw;
             }
-            PublishTransition(order.OrderId, OrderLifecycleState.Rejected, null, "SubmitException", _now());
+            PublishTransition(order.OrderId, OrderLifecycleState.Rejected, null, "SubmitException", _now(), ex.GetBaseException().Message);
             PublishFailureOnce(order.OrderId, "實盤限價單送單例外：" + ex.GetBaseException().Message);
         }
         finally
@@ -635,7 +741,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         bool gatewayCallStarted = false;
         try
         {
-            mutation = CommitBrokerMutationLease();
+            mutation = CommitBrokerMutationLease(placement: true);
             TransitionBrokerMutationToCall(mutation);
             gatewayCallStarted = true;
             _gateway.PlaceOrder(new OrderRequest
@@ -656,17 +762,21 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
                     condition.CycleId,
                     condition.Symbol,
                     condition.Role.ToString(),
-                    condition.OcoGroupId)
+                    condition.OcoGroupId,
+                    condition.PairId,
+                    !string.IsNullOrWhiteSpace(condition.PairId))
             });
         }
-        catch (BrokerReconciliationRequiredException)
+        catch (BrokerReconciliationRequiredException exception)
         {
-            if (!gatewayCallStarted) RemoveNeverSubmittedOrder(realId);
+            if (gatewayCallStarted && !exception.BrokerCallMayHaveStarted)
+                RejectNeverSubmittedOrder(realId, exception.Message);
+            else if (!gatewayCallStarted) RemoveNeverSubmittedOrder(realId);
             throw;
         }
         catch (Exception ex)
         {
-            PublishTransition(realId, OrderLifecycleState.Rejected, null, "SubmitException", _now());
+            PublishTransition(realId, OrderLifecycleState.Rejected, null, "SubmitException", _now(), ex.GetBaseException().Message);
             PublishFailureOnce(realId, "實盤送單例外：" + ex.GetBaseException().Message);
         }
         finally
@@ -695,7 +805,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         BrokerMutationLease? mutation = null;
         try
         {
-            mutation = CommitBrokerMutationLease();
+            mutation = CommitBrokerMutationLease(placement: false);
             TransitionBrokerMutationToCall(mutation);
             _gateway.CancelOrder(realId);
             if (!managed) StateChanged?.Invoke();
@@ -747,16 +857,39 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
             int effectiveCumulative = Math.Clamp(reportedCumulative, 0, tracked.Order.Quantity);
             int delta = Math.Max(0, effectiveCumulative - tracked.DeliveredFilledQuantity);
             if (delta == 0) goto PublishOnly;
+            long executionSequence = Interlocked.Increment(ref _executionSequence);
+            string executionId = string.IsNullOrWhiteSpace(brokerOrder.Identity?.ExecID)
+                ? $"cumulative-{effectiveCumulative}" : brokerOrder.Identity.ExecID;
+            RestingPairDecision? pairedFill = null;
+            if (tracked.Order.RestingPairMode == RestingPairMode.OppositeLegIsExit)
+            {
+                var key = new RestingPairKey(_instanceId, tracked.Order.StrategyRunGeneration,
+                    tracked.Order.CycleId, tracked.Order.PairId);
+                pairedFill = _restingPairs.RecordFill(key, tracked.Order.ClientOrderId,
+                    tracked.Order.OrderId, executionId, effectiveCumulative, delta, executionSequence);
+                if (pairedFill.Phase == RestingPairPhase.Quarantined || pairedFill.EffectiveRole == null)
+                {
+                    tracked.ProtocolViolation = true;
+                    tracked.AwaitingSettlement = true;
+                    RequestProtocolGateLocked();
+                    protocolFailure = "Paired broker fill could not be uniquely attributed; cycle quarantined.";
+                    goto PublishOnly;
+                }
+                PersistRestingPair(key);
+            }
             tracked.DeliveredFilledQuantity += delta;
             tracked.FilledQuantity = Math.Max(tracked.FilledQuantity, effectiveCumulative);
             tracked.RemainingQuantity = Math.Max(0, tracked.Order.Quantity - effectiveCumulative);
 
             execution = new ExecutionEvent
             {
-                Sequence = Interlocked.Increment(ref _executionSequence),
-                ExecutionId = brokerOrder.Identity?.ExecID ?? string.Empty,
+                Sequence = executionSequence,
+                ExecutionId = tracked.Order.RestingPairMode == RestingPairMode.OppositeLegIsExit
+                    ? executionId : brokerOrder.Identity?.ExecID ?? string.Empty,
                 CumulativeFilledQuantity = effectiveCumulative,
                 Timestamp = _now(),
+                PairId = tracked.Order.PairId,
+                OriginalOrderRole = pairedFill == null ? null : tracked.Order.Role,
                 StrategyInstanceId = _instanceId,
                 ClientOrderId = tracked.Order.ClientOrderId,
                 CycleId = tracked.Order.CycleId,
@@ -765,7 +898,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
                 OrderId = brokerOrder.OrderId,
                 Symbol = _quoteSymbol,
                 Side = tracked.Order.Side,
-                Role = tracked.Order.Role,
+                Role = pairedFill?.EffectiveRole ?? tracked.Order.Role,
                 Price = (decimal)price,
                 Quantity = delta,
                 Commission = _commission * delta,
@@ -842,7 +975,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
                 failure = $"實盤委託失敗：{reason}";
             }
         }
-        if (lifecycle != null) { ApplyManagedOcoLifecycle(lifecycle); OrderLifecycleChanged?.Invoke(lifecycle); }
+        if (lifecycle != null) { lifecycle = lifecycle with { ReasonDetail = reason }; ApplyManagedOcoLifecycle(lifecycle); OrderLifecycleChanged?.Invoke(lifecycle); }
         if (failure != null) Failed?.Invoke(failure);
         if (lifecycle != null || legacyRemoved) StateChanged?.Invoke();
         }
@@ -864,7 +997,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
                 lifecycle = CreateTransitionLocked(tracked, OrderLifecycleState.Working, brokerOrder,
                     "CancelFailed", _now(), allowCancelFailureRecovery: true);
         }
-        if (lifecycle != null) { ApplyManagedOcoLifecycle(lifecycle); OrderLifecycleChanged?.Invoke(lifecycle); }
+        if (lifecycle != null) { lifecycle = lifecycle with { ReasonDetail = reason }; ApplyManagedOcoLifecycle(lifecycle); OrderLifecycleChanged?.Invoke(lifecycle); }
         if (owned) Failed?.Invoke($"實盤刪單失敗：{reason}");
         if (lifecycle != null) StateChanged?.Invoke();
         }
@@ -959,7 +1092,8 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         OrderLifecycleState state,
         OrderInfo? brokerOrder,
         string reasonCode,
-        DateTimeOffset timestamp)
+        DateTimeOffset timestamp,
+        string reasonDetail = "")
     {
         OrderLifecycleEvent? lifecycle;
         lock (_sync)
@@ -968,6 +1102,8 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
             if (!_realOrders.TryGetValue(realId, out TrackedRealOrder? tracked)) return;
             lifecycle = CreateTransitionLocked(tracked, state, brokerOrder, reasonCode, timestamp);
         }
+        if (lifecycle != null && !string.IsNullOrWhiteSpace(reasonDetail))
+            lifecycle = lifecycle with { ReasonDetail = reasonDetail };
         PublishLifecycle(lifecycle);
     }
 
@@ -1014,11 +1150,23 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         tracked.RemainingQuantity = remaining;
         tracked.Terminal = tracked.Terminal || terminal;
         if (terminal) tracked.TerminalAt = timestamp;
+        // A broker-confirmed zero-fill rejection has no fill left to settle.
+        // Keep the tombstone for late/contradictory reports, but do not block
+        // flat strategy closure. Submit exceptions and partial-fill rejections
+        // remain quarantined because their execution outcome is unresolved.
+        if (state == OrderLifecycleState.Rejected && brokerOrder?.Status == OrderStatus.Rejected &&
+            brokerOrder.FilledQty == 0 && filled == 0 && tracked.DeliveredFilledQuantity == 0 &&
+            !tracked.ProtocolViolation)
+        {
+            tracked.AwaitingSettlement = false;
+            tracked.RemainingQuantity = remaining = 0;
+        }
         if (state == OrderLifecycleState.Filled && !tracked.ProtocolViolation &&
             tracked.DeliveredFilledQuantity >= tracked.Order.Quantity && remaining == 0)
             tracked.AwaitingSettlement = false;
         return new OrderLifecycleEvent
         {
+            PairId = tracked.Order.PairId,
             Timestamp = timestamp,
             StrategyInstanceId = _instanceId,
             ClientOrderId = tracked.Order.ClientOrderId,
@@ -1034,6 +1182,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
             PreviousState = previous,
             State = state,
             Price = tracked.Order.Price,
+            TimeInForce = tracked.Order.TimeInForce,
             Quantity = tracked.Order.Quantity,
             FilledQuantity = filled,
             DeliveredFilledQuantity = tracked.DeliveredFilledQuantity,
@@ -1042,10 +1191,38 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
                     ? brokerOrder.FilledQty : null,
             RemainingQuantity = remaining,
             ReasonCode = reasonCode,
+            ReasonDetail = brokerOrder?.Message ?? string.Empty,
             HasFinalCumulativeFillWatermark = terminal && brokerOrder != null &&
                 brokerOrder.Status is OrderStatus.Filled or OrderStatus.Cancelled or OrderStatus.Rejected
         };
     }
+
+    private OrderLifecycleEvent CreateLocalConditionCancellation(PaperOrder condition) => new()
+    {
+        PairId = condition.PairId,
+        Timestamp = _now(),
+        StrategyInstanceId = condition.StrategyInstanceId,
+        ClientOrderId = condition.ClientOrderId,
+        CycleId = condition.CycleId,
+        OcoGroupId = condition.OcoGroupId,
+        StrategyRunGeneration = condition.StrategyRunGeneration,
+        Generation = condition.Generation,
+        OrderId = condition.OrderId,
+        Symbol = condition.Symbol,
+        Side = condition.Side,
+        Role = condition.Role,
+        PreviousState = OrderLifecycleState.Working,
+        State = OrderLifecycleState.Cancelled,
+        Price = condition.Price,
+        TimeInForce = condition.TimeInForce,
+        Quantity = condition.Quantity,
+        FilledQuantity = 0,
+        DeliveredFilledQuantity = 0,
+        BrokerFinalCumulativeFilledQuantity = 0,
+        RemainingQuantity = condition.Quantity,
+        HasFinalCumulativeFillWatermark = true,
+        ReasonCode = "LocalConditionCancelled"
+    };
 
     private void PublishLifecycle(OrderLifecycleEvent? lifecycle)
     {
@@ -1057,6 +1234,11 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
 
     private void ApplyManagedOcoLifecycle(OrderLifecycleEvent lifecycle)
     {
+        if (!string.IsNullOrWhiteSpace(lifecycle.PairId))
+        {
+            ApplyManagedRestingPairLifecycle(lifecycle);
+            return;
+        }
         if (string.IsNullOrWhiteSpace(lifecycle.OcoGroupId) || lifecycle.Role is null) return;
         var key = new LiveStrategyOcoKey(lifecycle.StrategyInstanceId, lifecycle.StrategyRunGeneration, lifecycle.OcoGroupId);
         LiveStrategyOcoGroupState? state = _ocoCoordinator.GetStates(lifecycle.StrategyInstanceId,
@@ -1103,6 +1285,93 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
                 lifecycle.ClientOrderId, lifecycle.BrokerOrderId, lifecycle.Role.Value, lifecycle.DeliveredFilledQuantity,
                 lifecycle.FilledQuantity, lifecycle.HasFinalCumulativeFillWatermark, lifecycle.TriggerMarketSequence,
                 lifecycle.Timestamp));
+        }
+    }
+
+    private void ApplyManagedRestingPairLifecycle(OrderLifecycleEvent lifecycle)
+    {
+        var key = new RestingPairKey(lifecycle.StrategyInstanceId,
+            lifecycle.StrategyRunGeneration, lifecycle.CycleId, lifecycle.PairId);
+        if (lifecycle.Role is PaperOrderRole.EntryLong or PaperOrderRole.EntryShort &&
+            lifecycle.State == OrderLifecycleState.Rejected)
+        {
+            RestingPairDecision failed = _restingPairs.SubmissionFailed(key,
+                lifecycle.ClientOrderId, lifecycle.OrderId);
+            PersistRestingPair(key);
+            foreach (RestingPairAction action in failed.Actions.Where(x =>
+                         x.Kind == RestingPairActionKind.CancelExactOpposite))
+                RequestCancel(action.BrokerOrderId);
+            lock (_sync) RequestProtocolGateLocked();
+            Failed?.Invoke("Paired submission rejected; accepted sibling cancellation requested, manual reconciliation required.");
+            return;
+        }
+        if (lifecycle.Role == PaperOrderRole.StopLoss &&
+            lifecycle.State is OrderLifecycleState.Filled or OrderLifecycleState.Cancelled or OrderLifecycleState.Rejected)
+        {
+            RestingPairDecision result = _restingPairs.ConfirmMarketResult(key, lifecycle.ClientOrderId,
+                lifecycle.State == OrderLifecycleState.Filled,
+                lifecycle.HasFinalCumulativeFillWatermark
+                    ? lifecycle.BrokerFinalCumulativeFilledQuantity : null);
+            PersistRestingPair(key);
+            if (result.Phase == RestingPairPhase.Quarantined)
+            {
+                lock (_sync) RequestProtocolGateLocked();
+                Failed?.Invoke("Paired stop market result requires manual reconciliation.");
+            }
+            return;
+        }
+        PaperOrder? stop;
+        lock (_sync) _pendingPairedStops.TryGetValue(key, out stop);
+        if (stop == null || lifecycle.Role is not (PaperOrderRole.EntryLong or PaperOrderRole.EntryShort))
+            return;
+        if (lifecycle.ReasonCode == "CancelFailed")
+        {
+            _restingPairs.CancelRejected(key, lifecycle.ClientOrderId, lifecycle.OrderId);
+            PersistRestingPair(key);
+            lock (_sync) RequestProtocolGateLocked();
+            Failed?.Invoke("Paired opposite limit cancellation was rejected.");
+            return;
+        }
+        if (lifecycle.State is not (OrderLifecycleState.Cancelled or OrderLifecycleState.Filled or OrderLifecycleState.Rejected))
+            return;
+        if (_strategyNetPosition == null)
+        {
+            lock (_sync) RequestProtocolGateLocked();
+            Failed?.Invoke("Paired stop cannot read the strategy-only ledger position.");
+            return;
+        }
+        RestingPairDecision decision = _restingPairs.ConfirmTerminal(key,
+            lifecycle.ClientOrderId, lifecycle.OrderId,
+            lifecycle.BrokerFinalCumulativeFilledQuantity,
+            lifecycle.DeliveredFilledQuantity,
+            Math.Abs(_strategyNetPosition(key.StrategyRunGeneration)),
+            lifecycle.HasFinalCumulativeFillWatermark);
+        PersistRestingPair(key);
+        if (decision.Phase == RestingPairPhase.Quarantined)
+        {
+            lock (_sync) RequestProtocolGateLocked();
+            Failed?.Invoke("Paired opposite limit terminal watermark differs from delivered fills or strategy position.");
+            return;
+        }
+        lock (_sync) _pendingPairedStops.Remove(key);
+        foreach (RestingPairAction action in decision.Actions.Where(x =>
+                     x.Kind == RestingPairActionKind.SubmitResidualMarketStop))
+            SendMarket(stop with { ClientOrderId = action.ClientOrderId,
+                Quantity = action.Quantity, RestingPairMode = RestingPairMode.None }, stop.Price);
+    }
+
+    private void PersistRestingPair(RestingPairKey key)
+    {
+        try
+        {
+            _gateway.AppendRestingPairState(_restingPairs.Snapshot(key));
+        }
+        catch (Exception exception)
+        {
+            lock (_sync) RequestProtocolGateLocked();
+            throw new BrokerReconciliationRequiredException(
+                "Paired state journal failed; broker mutations are blocked pending reconciliation: " +
+                exception.GetBaseException().Message);
         }
     }
 
@@ -1226,6 +1495,19 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         _ownedClientOrderIds.Remove(clientOrderId);
     }
 
+    private void RejectNeverSubmittedOrder(string realId, string reason)
+    {
+        OrderLifecycleEvent? lifecycle;
+        lock (_sync)
+        {
+            if (!_realOrders.TryGetValue(realId, out TrackedRealOrder? tracked)) return;
+            tracked.AwaitingSettlement = false;
+            lifecycle = CreateTransitionLocked(tracked, OrderLifecycleState.Rejected, null,
+                "PreBrokerRoutingBlocked", _now());
+        }
+        if (lifecycle != null) PublishLifecycle(lifecycle with { ReasonDetail = reason });
+    }
+
     private void RemoveNeverSubmittedOrder(string realId)
     {
         bool changed;
@@ -1237,7 +1519,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         if (changed) StateChanged?.Invoke();
     }
 
-    private BrokerMutationLease CommitBrokerMutationLease()
+    private BrokerMutationLease CommitBrokerMutationLease(bool placement)
     {
         _beforeBrokerMutationCommit?.Invoke();
         BrokerMutationLease lease;
@@ -1245,7 +1527,8 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
         {
             if (_protocolGateRequested)
                 throw new BrokerReconciliationRequiredException(ProtocolReconciliationMessage);
-            lease = new BrokerMutationLease { Id = ++_brokerMutationSequence };
+            if (placement) ThrowIfOperatorCloseRequestedLocked();
+            lease = new BrokerMutationLease { Id = ++_brokerMutationSequence, IsPlacement = placement };
             _brokerMutationLeases.Add(lease.Id, lease);
         }
         try
@@ -1268,6 +1551,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
                 throw new InvalidOperationException("實盤 broker mutation lease 已失效。");
             if (_protocolGateRequested)
                 throw new BrokerReconciliationRequiredException(ProtocolReconciliationMessage);
+            if (lease.IsPlacement) ThrowIfOperatorCloseRequestedLocked();
             lease.Calling = true;
         }
         _afterBrokerMutationTransition?.Invoke();
@@ -1275,7 +1559,22 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
 
     private void ReleaseBrokerMutationLease(BrokerMutationLease lease)
     {
-        lock (_brokerMutationSync) _brokerMutationLeases.Remove(lease.Id);
+        lock (_brokerMutationSync)
+        {
+            _brokerMutationLeases.Remove(lease.Id);
+            Monitor.PulseAll(_brokerMutationSync);
+        }
+    }
+
+    private void ThrowIfOperatorCloseRequested()
+    {
+        lock (_brokerMutationSync) ThrowIfOperatorCloseRequestedLocked();
+    }
+
+    private void ThrowIfOperatorCloseRequestedLocked()
+    {
+        if (_operatorCloseRequested)
+            throw new InvalidOperationException("策略正在由使用者關閉；禁止新增買賣委託。");
     }
 
     // Called while _sync is held. It never waits for a mutation already in the
@@ -1294,7 +1593,7 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
 
     public void Dispose() => DisposeIfSafe(() => true);
 
-    internal void DisposeIfSafe(Func<bool> isLedgerFlat)
+    internal void DisposeIfSafe(Func<bool> isLedgerFlat, bool allowRetired = false)
     {
         lock (_sync)
         {
@@ -1309,10 +1608,12 @@ public sealed class KgiLiveStrategyExecutionService : IManagedStrategyExecutionS
                 throw new InvalidOperationException($"仍有 {_inflightCallbacks} 個 callback／{_inflightOperations} 個操作尚未完成，禁止釋放執行器。");
             if (_clientOrderReservations.Count > 0)
                 throw new InvalidOperationException($"仍有 {_clientOrderReservations.Count} 個 ClientOrderId 保留尚未提交，禁止釋放執行器。");
+            if (allowRetired && (!_operatorCloseRequested || _conditions.Count > 0))
+                throw new InvalidOperationException("只有已進入使用者關閉且無本機條件的執行器可以退休。");
             int quarantined = _realOrders.Values.Count(x => x.Terminal && x.AwaitingSettlement);
-            if (quarantined > 0)
+            if (quarantined > 0 && !allowRetired)
                 throw new InvalidOperationException($"仍有 {quarantined} 張已撤委託等待 late-fill settlement，禁止釋放執行器。");
-            if (!isLedgerFlat())
+            if (!allowRetired && !isLedgerFlat())
                 throw new InvalidOperationException("策略 ledger 尚未歸零，禁止釋放執行器。");
             _disposing = true;
         }
