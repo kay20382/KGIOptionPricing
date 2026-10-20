@@ -1,4 +1,4 @@
-using KGIOptionPricing.OrderManagement.Core;
+﻿using KGIOptionPricing.OrderManagement.Core;
 using System.Collections.Concurrent;
 using KGIOptionPricing.Strategies.MeanReversionScalper;
 using KGIOptionPricing.Strategies.NikkeiMicrostructureAlpha;
@@ -213,8 +213,8 @@ public sealed class LiveStrategyService : IDisposable
         };
         _afterHostAddFailure = null;
         foreach (IStrategyFactory factory in CreateDefaultFactories()) _registry.Register(factory);
-        var archive = new Storage.MarketDataArchiveWriter(Path.Combine(AppContext.BaseDirectory,"StrategyLiveArchive"),"live-"+Guid.NewGuid().ToString("N"));
-        _liveArchivePath = archive.EventFilePath;
+        var archive = new Storage.MarketDataArchiveWriter(Path.Combine(AppContext.BaseDirectory,"StrategyLiveArchive"),"live-"+Guid.NewGuid().ToString("N"),enabled:false);
+        _liveArchivePath = archive.Enabled?archive.EventFilePath:null;
         _host = new StrategyHost(new Storage.RecordingMarketEventSource(new KgiStrategyMarketDataSource(quote),archive));
         _host.SnapshotChanged += OnSnapshot;
         _host.ExecutionOccurred += OnExecution;

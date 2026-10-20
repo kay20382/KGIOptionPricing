@@ -1,4 +1,4 @@
-using System.Globalization;
+﻿using System.Globalization;
 using KGIOptionPricing.Strategies.MeanReversionScalper;
 using KGIOptionPricing.Strategies.MiniLeadMicro;
 using KGIOptionPricing.Strategies.NikkeiMicrostructureAlpha;
@@ -27,7 +27,7 @@ public sealed partial class LiveStrategyCenterForm : Form
         _rlPanel.ConfigureLive(true);
         _r17Panel.ConfigureLive(true);
         var r17Tab=new TabPage("多因子均價回歸 R17（實盤）");r17Tab.Controls.Add(_r17Panel);strategyTabs.TabPages.Add(r17Tab);
-        var rlTab=new TabPage("日經RL（實盤）");rlTab.Controls.Add(_rlPanel);strategyTabs.TabPages.Add(rlTab);
+        var rlTab=new TabPage("日經模型 RL／Grid15（實盤）");rlTab.Controls.Add(_rlPanel);strategyTabs.TabPages.Add(rlTab);
         tradeFlowPanel.ConfigureLive(true);
         powerReversalPanel.ConfigureLive(true);
         AddSessionTimeControls();
@@ -231,7 +231,7 @@ public sealed partial class LiveStrategyCenterForm : Form
         if (definition.StrategyType == MeanReversionScalperFactory.TypeName)
             prompt += "\n\n警告：雙側 Auto 開平、快速雙向成交及重啟回補尚未經券商實際通道認證。可能發生未預期部位或無法自動保護的風險；此操作不代表已通過認證。";
         if(definition.StrategyType==Strategies.NikkeiRlDirection.NikkeiRlFactory.TypeName)
-            prompt+="\n\n日經RL模型及夜盤績效尚未通過驗收；啟用日夜盤，暖機至少210秒。本機穿價後送市價IOC，成交價依券商回報。";
+            prompt+=$"\n\n模型：{definition.Parameters.GetValueOrDefault("ModelId")}\n門檻JPY：{definition.Parameters.GetValueOrDefault("SelectionThresholdJPY")}\n夜盤：{definition.Parameters.GetValueOrDefault("EnableNightSession")}；實盤額外延遲0ms。\n績效尚未通過驗收。本機穿價後送市價IOC，成交價依券商回報。";
         if (MessageBox.Show(this, prompt, "最後確認：啟動實盤", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
         try { _service.Add(definition, fee, loss); _types[definition.InstanceId] = definition.StrategyType; id.Text = NewId(prefix, product.Text); confirm.Checked = false; status.Text = $"{definition.InstanceId} 已啟動真實委託"; }
         catch (Exception ex) { Warn(ex.Message); }

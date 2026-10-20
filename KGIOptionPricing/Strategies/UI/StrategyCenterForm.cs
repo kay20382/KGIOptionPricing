@@ -1,4 +1,4 @@
-using System.Globalization;
+﻿using System.Globalization;
 using System.IO;
 using KGIOptionPricing.Strategies.MeanReversionScalper;
 using KGIOptionPricing.Strategies.MiniLeadMicro;
@@ -29,7 +29,7 @@ public sealed partial class StrategyCenterForm : Form
     public StrategyCenterForm()
     {
         InitializeComponent();
-        var rlTab=new TabPage("日經RL（研究模擬）");rlTab.Controls.Add(rlPanel);strategyTabs.TabPages.Add(rlTab);
+        var rlTab=new TabPage("日經模型 RL／Grid15（模擬）");rlTab.Controls.Add(rlPanel);strategyTabs.TabPages.Add(rlTab);
         tradeFlowPanel.ConfigureLive(false);
         powerReversalPanel.ConfigureLive(false);
         r17Panel.ConfigureLive(false);

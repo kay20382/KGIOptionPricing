@@ -11,9 +11,10 @@ static class LiveLatencyTests
         Check(new NikkeiRlParameters().ToDictionary()["DecisionLatencyMs"]=="1","simulation must retain one millisecond");
         var start=new DateTimeOffset(2026,10,13,8,0,0,TimeSpan.FromHours(8));
         var universe=new ResolvedStrategyUniverse{Tradable=new(){ProductId="225MC",Symbol="MC",TickSize=5,ContractMultiplier=10},References=[new(){ProductId="225M",Symbol="M",TickSize=5,ContractMultiplier=100}]};
+        foreach(var variant in new[]{"earlier","grid15-positive-net","grid15-q90-research"})
         foreach(var scenario in new[]{(Action:1,Position:0),(Action:2,Position:0),(Action:2,Position:1),(Action:3,Position:1)}){
             var view=new View();var clock=new TestClock{Now=start};var policy=new ForcedPolicy();
-            var s=new NikkeiRlStrategy(new(){InstanceId="latency",Universe=new(){Tradable=new("225MC"),References=[new("225M")]},Parameters=new NikkeiRlParameters{LiveTradingEnabled=true}.ToDictionary()},_=>policy);
+            var s=new NikkeiRlStrategy(new(){InstanceId="latency",Universe=new(){Tradable=new("225MC"),References=[new("225M")]},Parameters=new NikkeiRlParameters{PolicyVariant=variant,EnableNightSession=variant=="earlier",LiveTradingEnabled=true}.ToDictionary()},_=>policy);
             s.Start(new(universe,clock,view,1));var orders=new List<PaperOrderRequest>();var cancelled=new List<string>();
             s.OrderRequested+=orders.Add;s.CancelOrderRequested+=cancelled.Add;
             for(int sec=0;sec<240;sec++){

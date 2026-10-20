@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -592,7 +592,7 @@ public sealed class StrategySimulationService : IDisposable
     {
         _root = Path.GetFullPath(rootDirectory);
         string archiveRunId = $"live-{DateTime.Now:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}";
-        _liveArchive = new MarketDataArchiveWriter(Path.Combine(_root, "MarketDataArchive"), archiveRunId);
+        _liveArchive = new MarketDataArchiveWriter(Path.Combine(_root, "MarketDataArchive"), archiveRunId, enabled:false);
         var source = new RecordingMarketEventSource(new KgiStrategyMarketDataSource(quote), _liveArchive);
         LiveArchivePath = _liveArchive.DirectoryPath;
         _liveHost = new StrategyHost(source);
@@ -619,8 +619,8 @@ public sealed class StrategySimulationService : IDisposable
             ResolvedStrategyUniverse universe = _resolver.Resolve(definition.Universe);
             ISimulationStrategy strategy = _registry.Get(definition.StrategyType).Create(definition);
             DateTimeOffset startedAt = DateTimeOffset.UtcNow;
-            InputArchiveBoundary inputBoundary = InputArchiveBoundaryCapture.Begin(
-                _liveArchive.CaptureBarrier(), startedAt);
+            InputArchiveBoundary? inputBoundary = _liveArchive.Enabled?InputArchiveBoundaryCapture.Begin(
+                _liveArchive.CaptureBarrier(), startedAt):null;
             string runId = $"live-{DateTime.Now:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}";
             bool rl = definition.StrategyType == Strategies.NikkeiRlDirection.NikkeiRlFactory.TypeName;
             if (rl && commissionPerContract != 36) throw new ArgumentException("凍結日經RL費用須為每邊36JPY");
@@ -634,7 +634,7 @@ public sealed class StrategySimulationService : IDisposable
             _liveRecorders.CommitReservation(definition.InstanceId, recorder, endedAt =>
                 CreateManifest(runId, StrategyRunMode.LiveShadow, definition, parameters, universe,
                     commissionPerContract, LiveArchivePath, startedAt, endedAt,
-                    InputArchiveBoundaryCapture.Complete(inputBoundary, CaptureLiveEndBarrier(), endedAt)));
+                    inputBoundary==null?new InputArchiveIdentity{AbsolutePath=LiveArchivePath,MissingFields=new[]{"ArchiveDisabledPerformanceOnly"}}:InputArchiveBoundaryCapture.Complete(inputBoundary, CaptureLiveEndBarrier(), endedAt)));
             recorder = null;
             StrategyInstanceRunner runner = _liveHost.Add(strategy, universe, commissionPerContract);
             _liveRecorders.Record(runner.GetSnapshot());
@@ -1022,7 +1022,7 @@ public sealed class StrategySimulationService : IDisposable
         try
         {
             _operationGate.BeginDispose();
-            _shutdownArchiveSnapshot ??= _liveArchive.CaptureBarrier();
+            if(_liveArchive.Enabled)_shutdownArchiveSnapshot ??= _liveArchive.CaptureBarrier();
             _heartbeat.Dispose();
             timerDrained = true;
             Exception? hostError = null;

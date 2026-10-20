@@ -5,7 +5,7 @@ from pathlib import Path
 def summarize(manifest,summary):
     if manifest.get('strategyType')!='NikkeiRlDirection':raise ValueError('策略類型不符')
     parameters=manifest.get('effectiveParameters',manifest.get('parameters',{}))
-    if parameters.get('ModelId') not in ('twelve-training-control-seed22','pruned-earlier-seed22'):raise ValueError('模型參數不符')
+    if parameters.get('ModelId') not in ('twelve-training-control-seed22','pruned-earlier-seed22','grid15-positive-net','grid15-q90-research'):raise ValueError('模型參數不符')
     for key in ('completedTrades','grossPnl','netPnl'):
         if not isinstance(summary.get(key),(int,float)) or not math.isfinite(summary[key]):raise ValueError('缺少績效欄位：'+key)
     n=summary['completedTrades']

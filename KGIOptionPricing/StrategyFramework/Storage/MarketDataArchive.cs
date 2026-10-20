@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -88,10 +88,12 @@ public sealed class MarketDataArchiveWriter : IDisposable
         Converters = { new JsonStringEnumConverter() }
     };
     private readonly Task _writer;
+    private readonly bool _enabled;
     private readonly Action? _beforeWrite;
     private long _written;
     private bool _disposed;
 
+    public bool Enabled=>_enabled;
     public string DirectoryPath { get; }
     public string EventFilePath { get; }
 
@@ -99,21 +101,23 @@ public sealed class MarketDataArchiveWriter : IDisposable
         string rootDirectory,
         string runId,
         int capacity = 200000,
-        Action? beforeWrite = null)
+        Action? beforeWrite = null,
+        bool enabled = true)
     {
         if (capacity <= 0) throw new ArgumentOutOfRangeException(nameof(capacity));
         DirectoryPath = Path.Combine(Path.GetFullPath(rootDirectory), DateTime.Now.ToString("yyyyMMdd"), runId);
-        Directory.CreateDirectory(DirectoryPath);
-        EventFilePath = Path.Combine(DirectoryPath, "market-events.jsonl");
+        _enabled=enabled;
+        if(enabled)Directory.CreateDirectory(DirectoryPath);
+        EventFilePath = enabled?Path.Combine(DirectoryPath, "market-events.jsonl"):"";
         _channel = Channel.CreateBounded<object>(
             new BoundedChannelOptions(capacity) { SingleReader = true, FullMode = BoundedChannelFullMode.Wait });
         _beforeWrite = beforeWrite;
-        _writer = Task.Run(WriteLoopAsync);
+        _writer = enabled?Task.Run(WriteLoopAsync):Task.CompletedTask;
     }
 
     public void Record(MarketEvent marketEvent)
     {
-        if (_disposed) return;
+        if (_disposed || !_enabled) return;
         try
         {
             // Raw research archives are authoritative. A bounded queue deliberately
@@ -129,6 +133,7 @@ public sealed class MarketDataArchiveWriter : IDisposable
     public ArchiveWriterSnapshot CaptureBarrier()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
+        if(!_enabled)throw new InvalidOperationException("績效專用版本未保存行情；請選擇既有行情檔進行歷史重播。");
         var completion = new TaskCompletionSource<ArchiveWriterSnapshot>(
             TaskCreationOptions.RunContinuationsAsynchronously);
         _channel.Writer.WriteAsync(new BarrierRequest(completion)).AsTask().GetAwaiter().GetResult();
@@ -170,6 +175,7 @@ public sealed class MarketDataArchiveWriter : IDisposable
         if (_disposed) return;
         _disposed = true;
         _channel.Writer.TryComplete();
+        if(!_enabled)return;
         try { _writer.Wait(TimeSpan.FromSeconds(10)); } catch { }
         var manifest = new
         {

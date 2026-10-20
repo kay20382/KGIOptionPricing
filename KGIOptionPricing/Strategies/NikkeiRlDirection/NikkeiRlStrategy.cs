@@ -1,4 +1,4 @@
-using KGIOptionPricing.StrategyFramework;
+﻿using KGIOptionPricing.StrategyFramework;
 using KGIOptionPricing.OrderManagement.Core;
 
 namespace KGIOptionPricing.Strategies.NikkeiRlDirection;
@@ -49,7 +49,7 @@ public sealed class NikkeiRlStrategy:ISimulationStrategy,IManagedOrderStrategy,I
     public NikkeiRlStrategy(StrategyDefinition definition,Func<NikkeiRlParameters,IRlMainPolicy>? factory=null)
     {
         if(definition.Universe.Tradable.ProductId!="225MC"||definition.Universe.References.Count!=1||definition.Universe.References[0].ProductId!="225M")throw new ArgumentException("日經RL只允許225MC及225M參考");
-        InstanceId=definition.InstanceId;parameters=NikkeiRlParameters.Parse(definition.Parameters);policyFactory=factory??(p=>new FrozenRlMainPolicy(p));
+        InstanceId=definition.InstanceId;parameters=NikkeiRlParameters.Parse(definition.Parameters);policyFactory=factory??(p=>p.IsGrid?new FrozenGrid15Policy(p):new FrozenRlMainPolicy(p));
     }
     public void Start(StrategyRuntimeContext value)
     {
@@ -119,7 +119,14 @@ public sealed class NikkeiRlStrategy:ISimulationStrategy,IManagedOrderStrategy,I
             for(int i=0;i<obs.Length;i++)features[$"Raw{i}"]=(decimal)obs[i];
             try
             {
+                if(actor is FrozenGrid15Policy grid)grid.SetContext(at,session.Open,frame.Valid);
                 var result=actor!.Predict(obs,mask);action=result.Action;inferenceMs=result.InferenceMs;
+                if(actor is FrozenGrid15Policy detail){
+                    features["EntryThresholdJPY"]=(decimal)detail.ThresholdJPY;
+                    features["LongNetScoreJPY"]=double.IsFinite(detail.LongNetJPY)?(decimal)detail.LongNetJPY:null;
+                    features["ShortNetScoreJPY"]=double.IsFinite(detail.ShortNetJPY)?(decimal)detail.ShortNetJPY:null;
+                    features["HoldingAdvantageJPY"]=detail.HoldingAdvantageJPY.HasValue?(decimal)detail.HoldingAdvantageJPY.Value:null;
+                }
                 if(action is <0 or >4||!mask[action])throw new InvalidDataException("模型動作不合法");
                 reason=frame.Valid?$"{session.Name}模型動作={action}，推論={inferenceMs:F4}ms":$"WARMUP {features["WarmupElapsedSeconds"]:F0}/210秒；兩商品／力道／研究特徵尚未全部就緒";
                 State=frame.Valid?StrategyLifecycleState.Running:StrategyLifecycleState.WarmingUp;
@@ -202,5 +209,5 @@ public sealed class NikkeiRlStrategy:ISimulationStrategy,IManagedOrderStrategy,I
             Decision=State==StrategyLifecycleState.WarmingUp?StrategyDecision.Warmup:closing||faulted?StrategyDecision.Halt:reason.StartsWith("SESSION_CLOSE")?StrategyDecision.Reject:pending!=null?StrategyDecision.Accept:StrategyDecision.Hold,
             PrimaryReasonCode=reason.Split('：',' ')[0],Features=s.Features});
     }
-    public StrategySnapshot GetSnapshot()=>new(){StrategyType=StrategyType,InstanceId=InstanceId,State=State,Reason=reason,ParameterSummary=string.Join(";",parameters.ToDictionary().Select(x=>$"{x.Key}={x.Value}")),TradableProductId="225MC",TradableSymbol=context?.Universe.Tradable.Symbol??"",ReferenceSummary="225M",StopPrice=stopPrice,UpdatedAt=observedAt==default?context?.Clock.Now??DateTimeOffset.MinValue:observedAt,Features=new Dictionary<string,decimal?>(features),Diagnostics=new Dictionary<string,string>{["ModelId"]=NikkeiRlParameters.ModelId,["Readiness"]=NikkeiRlParameters.ReadinessProfile,["Session"]=sessionName,["ActionLatencyMs"]=parameters.ActionLatencyMs.ToString(System.Globalization.CultureInfo.InvariantCulture),["InferenceMs"]=inferenceMs.ToString("F4",System.Globalization.CultureInfo.InvariantCulture),["SummaryOnly"]="true",["LiveTradingEnabled"]=parameters.LiveTradingEnabled.ToString(),["DeploymentEligible"]="false"}};
+    public StrategySnapshot GetSnapshot()=>new(){StrategyType=StrategyType,InstanceId=InstanceId,State=State,Reason=reason,ParameterSummary=string.Join(";",parameters.ToDictionary().Select(x=>$"{x.Key}={x.Value}")),TradableProductId="225MC",TradableSymbol=context?.Universe.Tradable.Symbol??"",ReferenceSummary="225M",StopPrice=stopPrice,UpdatedAt=observedAt==default?context?.Clock.Now??DateTimeOffset.MinValue:observedAt,Features=new Dictionary<string,decimal?>(features),Diagnostics=new Dictionary<string,string>{["ModelId"]=parameters.EffectiveModelId,["Readiness"]=NikkeiRlParameters.ReadinessProfile,["Session"]=sessionName,["ActionLatencyMs"]=parameters.ActionLatencyMs.ToString(System.Globalization.CultureInfo.InvariantCulture),["InferenceMs"]=inferenceMs.ToString("F4",System.Globalization.CultureInfo.InvariantCulture),["SummaryOnly"]="true",["LiveTradingEnabled"]=parameters.LiveTradingEnabled.ToString(),["DeploymentEligible"]="false"}};
 }
