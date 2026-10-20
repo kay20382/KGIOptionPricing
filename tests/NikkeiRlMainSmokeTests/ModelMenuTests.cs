@@ -15,14 +15,16 @@ static class ModelMenuTests
                 using var form = new StrategyCenterForm { ClientSize = new System.Drawing.Size(1500, 760), Opacity = 0, ShowInTaskbar = false };
                 var flags = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance;
                 var tabs = (TabControl)typeof(StrategyCenterForm).GetField("strategyTabs", flags)!.GetValue(form)!;
-                var panel = (NikkeiRlPanel)typeof(StrategyCenterForm).GetField("rlPanel", flags)!.GetValue(form)!;
-                tabs.SelectedTab = tabs.TabPages.Cast<TabPage>().Single(t => t.Text.Contains("RL／Grid15"));
-                ((ComboBox)typeof(NikkeiRlPanel).GetProperty("ModelSelector")!.GetValue(panel)!).SelectedIndex = 1;
+                tabs.SelectedTab = tabs.TabPages.Cast<TabPage>().Single(t => t.Name == "grid15PositiveTab");
                 form.Show();
                 Application.DoEvents();
                 using var bitmap = new System.Drawing.Bitmap(form.Width, form.Height);
                 form.DrawToBitmap(bitmap, new System.Drawing.Rectangle(0, 0, form.Width, form.Height));
                 bitmap.Save(output);
+                tabs.SelectedTab = tabs.TabPages.Cast<TabPage>().Single(t => t.Name == "grid15Q90Tab");
+                Application.DoEvents();
+                form.DrawToBitmap(bitmap, new System.Drawing.Rectangle(0, 0, form.Width, form.Height));
+                bitmap.Save(Path.Combine(Path.GetDirectoryName(output)!, Path.GetFileNameWithoutExtension(output)+"-q90.png"));
                 form.Close();
             }
             catch (Exception exception) { error = exception; }

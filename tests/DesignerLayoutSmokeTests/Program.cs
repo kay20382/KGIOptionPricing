@@ -46,7 +46,7 @@ internal static class Program
         }
         RequireField<TabControl>(typeof(StrategyCenterForm), "strategyTabs");
         RequireUiOnlyForm<StrategyCenterForm>();
-        RequireTabCount(typeof(StrategyCenterForm), "strategyTabs", 7);
+        RequireTabCount(typeof(StrategyCenterForm), "strategyTabs", 9);
         RequireField<PowerReversalPanel>(typeof(StrategyCenterForm), "powerReversalPanel");
         RequireField<TradeFlowTrendPanel>(typeof(StrategyCenterForm), "tradeFlowPanel");
         RequireGridColumnCount(typeof(StrategyCenterForm), "_mrGrid", 21);
@@ -55,7 +55,7 @@ internal static class Program
         RequireField<TabControl>(typeof(LiveStrategyCenterForm), "strategyTabs");
         RequireField<Label>(typeof(LiveStrategyCenterForm), "liveWarningBanner");
         RequireUiOnlyForm<LiveStrategyCenterForm>();
-        RequireTabCount(typeof(LiveStrategyCenterForm), "strategyTabs", 7);
+        RequireTabCount(typeof(LiveStrategyCenterForm), "strategyTabs", 9);
         RequireField<PowerReversalPanel>(typeof(LiveStrategyCenterForm), "powerReversalPanel");
         RequireField<TradeFlowTrendPanel>(typeof(LiveStrategyCenterForm), "tradeFlowPanel");
         RequireGridColumnCount(typeof(LiveStrategyCenterForm), "_mrGrid", 22);

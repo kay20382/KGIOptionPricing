@@ -1,4 +1,4 @@
-﻿using System.Globalization;
+using System.Globalization;
 using KGIOptionPricing.Strategies.MeanReversionScalper;
 using KGIOptionPricing.Strategies.MiniLeadMicro;
 using KGIOptionPricing.Strategies.NikkeiMicrostructureAlpha;
@@ -13,7 +13,7 @@ namespace KGIOptionPricing;
 public sealed partial class LiveStrategyCenterForm : Form
 {
     private readonly LiveStrategyService _service = null!;
-    private readonly NikkeiRlPanel _rlPanel=new();
+    private readonly Dictionary<string,NikkeiRlPanel> _rlInstancePanels=new(StringComparer.OrdinalIgnoreCase);
     private readonly MultiFactorMeanR17Panel _r17Panel=new();
     private readonly Dictionary<string, string> _types = new(StringComparer.OrdinalIgnoreCase);
     private readonly TextBox _mrDayStart = new() { Name = "mrDayStartTime", Text = "07:45", Width = 56, MaxLength = 5 };
@@ -24,10 +24,10 @@ public sealed partial class LiveStrategyCenterForm : Form
     public LiveStrategyCenterForm()
     {
         InitializeComponent();
-        _rlPanel.ConfigureLive(true);
+        InitializeRlTabs();
         _r17Panel.ConfigureLive(true);
         var r17Tab=new TabPage("多因子均價回歸 R17（實盤）");r17Tab.Controls.Add(_r17Panel);strategyTabs.TabPages.Add(r17Tab);
-        var rlTab=new TabPage("日經模型 RL／Grid15（實盤）");rlTab.Controls.Add(_rlPanel);strategyTabs.TabPages.Add(rlTab);
+
         tradeFlowPanel.ConfigureLive(true);
         powerReversalPanel.ConfigureLive(true);
         AddSessionTimeControls();
@@ -173,15 +173,21 @@ public sealed partial class LiveStrategyCenterForm : Form
             if(s.Position!=0 || s.ActiveBrokerOrders!=0 || s.QuarantinedBrokerOrders!=0 || s.LocalConditions!=0){Warn("請先關閉，待部位與委託歸零後刪除。");return;}
             Delete(_r17Panel.Instances,_r17Panel.Executions,_r17Panel.Status);
         };
-        _rlPanel.StartButton.Click+=(_,_)=>Start(_rlPanel.CreateDefinition(),36,_rlPanel.Loss.Value,_rlPanel.Confirm,_rlPanel.Instance,"LIVE-RL",_rlPanel.Product,_rlPanel.Status);
-        _rlPanel.PauseButton.Click+=(_,_)=>Toggle(_rlPanel.Instances,_rlPanel.Status);
-        _rlPanel.CloseButton.Click+=(_,_)=>CloseRl();
-        _rlPanel.DeleteButton.Click+=(_,_)=>{
-            if(!Selected(_rlPanel.Instances,out var id,out _))return;
-            var status=_service.GetCloseStatus(id);
-            if(status.Position!=0||status.ActiveBrokerOrders!=0||status.QuarantinedBrokerOrders!=0||status.LocalConditions!=0){Warn("請先關閉／平倉，待部位與委託歸零後刪除。");return;}
-            Delete(_rlPanel.Instances,_rlPanel.Executions,_rlPanel.Status);
-        };
+        foreach(var panel in RlPanels)
+        {
+            panel.StartButton.Click+=(_,_)=>{
+                var definition=panel.CreateDefinition();
+                Start(definition,36,panel.Loss.Value,panel.Confirm,panel.Instance,"LIVE-"+panel.InstancePrefix,panel.Product,panel.Status);
+            };
+            panel.PauseButton.Click+=(_,_)=>Toggle(panel.Instances,panel.Status);
+            panel.CloseButton.Click+=(_,_)=>CloseRl(panel);
+            panel.DeleteButton.Click+=(_,_)=>{
+                if(!Selected(panel.Instances,out var id,out _))return;
+                var status=_service.GetCloseStatus(id);
+                if(status.Position!=0||status.ActiveBrokerOrders!=0||status.QuarantinedBrokerOrders!=0||status.LocalConditions!=0){Warn("請先關閉／平倉，待部位與委託歸零後刪除。");return;}
+                Delete(panel.Instances,panel.Executions,panel.Status);
+            };
+        }
         tradeFlowPanel.StartButton.Click += (_,_) => tradeFlowPanel.Run(() => Start(tradeFlowPanel.CreateDefinition(),tradeFlowPanel.Commission.Value,tradeFlowPanel.Loss.Value,tradeFlowPanel.Confirm,tradeFlowPanel.Instance,"LIVE-TF",tradeFlowPanel.Product,tradeFlowPanel.Status));
         powerReversalPanel.StartButton.Click += (_,_) => powerReversalPanel.Run(() => Start(powerReversalPanel.CreateDefinition(),powerReversalPanel.Commission.Value,powerReversalPanel.Loss.Value,powerReversalPanel.Confirm,powerReversalPanel.Instance,"LIVE-POWER",powerReversalPanel.Product,powerReversalPanel.Status));
         powerReversalPanel.PauseButton.Click += (_,_) => Toggle(powerReversalPanel.Instances,powerReversalPanel.Status);
@@ -252,12 +258,12 @@ public sealed partial class LiveStrategyCenterForm : Form
         if(MessageBox.Show(this,$"關閉 {id}：停止新倉、撤進場單，依設定 IOC／ROD 規則平倉 {s.Position} 口。", "確認關閉與平倉",MessageBoxButtons.YesNo,MessageBoxIcon.Warning,MessageBoxDefaultButton.Button2)!=DialogResult.Yes)return;
         _service.RequestClose(id,true,out var message);tradeFlowPanel.Status.Text=message;
     }
-    private void CloseRl()
+    private void CloseRl(NikkeiRlPanel panel)
     {
-        if(!Selected(_rlPanel.Instances,out var id,out _))return;
+        if(!Selected(panel.Instances,out var id,out _))return;
         var status=_service.GetCloseStatus(id);
         if(MessageBox.Show(this,$"關閉 {id}：停止新倉、撤進場單，並平倉此策略 {status.Position} 口。","確認關閉與平倉",MessageBoxButtons.YesNo,MessageBoxIcon.Warning,MessageBoxDefaultButton.Button2)!=DialogResult.Yes)return;
-        _service.RequestClose(id,true,out var message);_rlPanel.Status.Text=message;
+        _service.RequestClose(id,true,out var message);panel.Status.Text=message;
     }
 
     private void Close(DataGridView grid, Label status)
@@ -371,7 +377,7 @@ public sealed partial class LiveStrategyCenterForm : Form
     {
         if (IsDisposed || !IsHandleCreated) return;
         if (InvokeRequired) { BeginInvoke(new Action(() => Retired(id))); return; }
-        foreach (DataGridView grid in new[] { _mrGrid, _wsGrid, _naGrid, _mlGrid, _obtGrid, _pqcGrid, tradeFlowPanel.Instances, powerReversalPanel.Instances,_rlPanel.Instances,_r17Panel.Instances })
+        foreach (DataGridView grid in new[] { _mrGrid, _wsGrid, _naGrid, _mlGrid, _obtGrid, _pqcGrid, tradeFlowPanel.Instances, powerReversalPanel.Instances,_rlPanel.Instances,_grid15PositivePanel.Instances,_grid15Q90Panel.Instances,_r17Panel.Instances })
         {
             DataGridViewRow? row = grid.Rows.Cast<DataGridViewRow>()
                 .FirstOrDefault(x => Equals(x.Cells["Instance"].Value, id));
@@ -382,7 +388,12 @@ public sealed partial class LiveStrategyCenterForm : Form
     private void Snapshot(StrategySnapshot s) { if (InvokeRequired) BeginInvoke(new Action(() => Upsert(s))); else Upsert(s); }
     private void Upsert(StrategySnapshot s)
     {
-        if(s.StrategyType==Strategies.NikkeiRlDirection.NikkeiRlFactory.TypeName){_types[s.InstanceId]=s.StrategyType;_rlPanel.ApplySnapshot(s);return;}
+        if(s.StrategyType==Strategies.NikkeiRlDirection.NikkeiRlFactory.TypeName){
+            _types[s.InstanceId]=s.StrategyType;
+            var model=s.Diagnostics.GetValueOrDefault("ModelId");
+            var panel=RlPanels.FirstOrDefault(p=>(p.SelectedPolicyVariant=="earlier"?"pruned-earlier-seed22":p.SelectedPolicyVariant)==model);
+            if(panel!=null){_rlInstancePanels[s.InstanceId]=panel;panel.ApplySnapshot(s);}return;
+        }
         if(s.StrategyType=="TradeFlowTrend"){_types[s.InstanceId]=s.StrategyType;tradeFlowPanel.ApplySnapshot(s);return;}
         if(s.StrategyType=="PowerReversal"){_types[s.InstanceId]=s.StrategyType;powerReversalPanel.ApplySnapshot(s);return;}
         if(s.StrategyType=="MultiFactorMeanR17"){_types[s.InstanceId]=s.StrategyType;_r17Panel.ApplySnapshot(s);return;}
@@ -398,7 +409,7 @@ public sealed partial class LiveStrategyCenterForm : Form
     private void Fill(ExecutionEvent e) { if (InvokeRequired) BeginInvoke(new Action(() => AddFill(e))); else AddFill(e); }
     private void AddFill(ExecutionEvent e)
     {
-        if(_types.GetValueOrDefault(e.StrategyInstanceId)==Strategies.NikkeiRlDirection.NikkeiRlFactory.TypeName){_rlPanel.AddExecution(e);return;}
+        if(_types.GetValueOrDefault(e.StrategyInstanceId)==Strategies.NikkeiRlDirection.NikkeiRlFactory.TypeName){if(_rlInstancePanels.TryGetValue(e.StrategyInstanceId,out var panel))panel.AddExecution(e);return;}
         if(_types.GetValueOrDefault(e.StrategyInstanceId)=="TradeFlowTrend"){tradeFlowPanel.AddExecution(e);return;}
         if(_types.GetValueOrDefault(e.StrategyInstanceId)=="PowerReversal"){powerReversalPanel.AddExecution(e);return;}
         if(_types.GetValueOrDefault(e.StrategyInstanceId)=="MultiFactorMeanR17"){_r17Panel.AddExecution(e);return;}

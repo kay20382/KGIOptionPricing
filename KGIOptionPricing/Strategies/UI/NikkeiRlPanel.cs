@@ -24,6 +24,19 @@ public sealed partial class NikkeiRlPanel:UserControl
         $"pruned-earlier RL／seed22｜exclude-flow｜225MC一口／225M參考；3秒判斷／15秒預測；{(live?"實盤0ms額外延遲":"模擬1ms延遲")}\n出場冷卻10秒；無最長持倉；固定150點停損；每邊36JPY；日夜盤\n本機strict-cross，實盤穿價後市價IOC；模型績效尚未通過驗收。":
         $"{SelectedPolicyVariant}｜LightGBM進場44欄／持倉47欄；120秒價值窗口，非強制平倉\n3秒判斷／15秒進場格點（開盤+3秒起）；{(live?"實盤0ms額外延遲":"模擬1ms延遲")}；出場冷卻10秒；150點停損；無最長持倉\n僅日盤07:45–14:45；14:39:50起停止進場並平倉；每邊36JPY\n進場門檻={(SelectedPolicyVariant=="grid15-q90-research"?"-29.203085902874 JPY（研究門檻，接受負淨期望）":"0 JPY")}；績效未合格。";
     bool liveMode;
+    string? fixedPolicyVariant;
+    public string InstancePrefix => SelectedPolicyVariant switch { "grid15-positive-net" => "G15-POS", "grid15-q90-research" => "G15-Q90", _ => "RL" };
+    static int PolicyIndex(string variant) => variant switch { "earlier" => 0, "grid15-positive-net" => 1, "grid15-q90-research" => 2, _ => throw new ArgumentException("未知模型版本", nameof(variant)) };
+    public void LockPolicyVariant(string variant)
+    {
+        int index = PolicyIndex(variant);
+        fixedPolicyVariant = variant;
+        ModelSelector.SelectedIndex = index;
+        ModelSelector.Enabled = false;
+        modelSelectionRow.Controls.OfType<Label>().First().Text = "固定模型";
+        Confirm.Checked = false;
+        parameterInfo.Text = ParameterText(liveMode);
+    }
     public NikkeiRlPanel()
     {
         Dock=DockStyle.Fill;

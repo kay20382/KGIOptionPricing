@@ -1,4 +1,4 @@
-﻿using System.Globalization;
+using System.Globalization;
 using System.IO;
 using KGIOptionPricing.Strategies.MeanReversionScalper;
 using KGIOptionPricing.Strategies.MiniLeadMicro;
@@ -16,7 +16,7 @@ namespace KGIOptionPricing;
 public sealed partial class StrategyCenterForm : Form
 {
     private readonly StrategySimulationService _service = null!;
-    private readonly NikkeiRlPanel rlPanel = new();
+    private readonly Dictionary<string, NikkeiRlPanel> _rlInstancePanels = new(StringComparer.OrdinalIgnoreCase);
     private readonly MultiFactorMeanR17Panel r17Panel = new();
     private readonly Dictionary<string, string> _strategyTypesByInstance = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, HistoricalReplayControl> _historicalReplays = new(StringComparer.OrdinalIgnoreCase);
@@ -29,7 +29,7 @@ public sealed partial class StrategyCenterForm : Form
     public StrategyCenterForm()
     {
         InitializeComponent();
-        var rlTab=new TabPage("日經模型 RL／Grid15（模擬）");rlTab.Controls.Add(rlPanel);strategyTabs.TabPages.Add(rlTab);
+        InitializeRlTabs();
         tradeFlowPanel.ConfigureLive(false);
         powerReversalPanel.ConfigureLive(false);
         r17Panel.ConfigureLive(false);
@@ -81,13 +81,22 @@ public sealed partial class StrategyCenterForm : Form
         r17Panel.ReplayButton.Click+=async(_,_)=>{try{await ReplayAsync(r17Panel.CreateDefinition("-BT-"+DateTime.Now.ToString("HHmmss")),r17Panel.Commission.Value,r17Panel.Status);}catch(Exception ex){r17Panel.Status.Text=ex.Message;}};
         r17Panel.ReplayPauseButton.Click+=(_,_)=>PauseReplay("MultiFactorMeanR17",r17Panel.Status);
         r17Panel.ReplayExportButton.Click+=(_,_)=>ExportBacktest("MultiFactorMeanR17",r17Panel.Status);
-        rlPanel.StartButton.Click+=(_,_)=>AddLive(rlPanel.CreateDefinition(),36,rlPanel.Instance,"RL",rlPanel.Product,rlPanel.Status);
-        rlPanel.PauseButton.Click+=(_,_)=>TogglePauseSelected(rlPanel.Instances,rlPanel.Status);
-        rlPanel.CloseButton.Click+=(_,_)=>CloseSelected(rlPanel.Instances,rlPanel.Status);
-        rlPanel.DeleteButton.Click+=(_,_)=>DeleteSelected(rlPanel.Instances,rlPanel.Executions,rlPanel.Status);
-        rlPanel.ReplayButton.Click+=async(_,_)=>{try{await ReplayAsync(rlPanel.CreateDefinition("-BT-"+DateTime.Now.ToString("HHmmss")),36,rlPanel.Status);}catch(Exception ex){rlPanel.Status.Text=ex.Message;}};
-        rlPanel.ReplayPauseButton.Click+=(_,_)=>PauseReplay("NikkeiRlDirection",rlPanel.Status);
-        rlPanel.ReplayExportButton.Click+=(_,_)=>ExportBacktest("NikkeiRlDirection",rlPanel.Status);
+        foreach (var panel in RlPanels)
+        {
+            panel.StartButton.Click+=(_,_)=>{
+                var definition=panel.CreateDefinition();
+                AddLive(definition,36,panel.Instance,panel.InstancePrefix,panel.Product,panel.Status);
+            };
+            panel.PauseButton.Click+=(_,_)=>TogglePauseSelected(panel.Instances,panel.Status);
+            panel.CloseButton.Click+=(_,_)=>CloseSelected(panel.Instances,panel.Status);
+            panel.DeleteButton.Click+=(_,_)=>DeleteSelected(panel.Instances,panel.Executions,panel.Status);
+            panel.ReplayButton.Click+=async(_,_)=>{try{
+                var definition=panel.CreateDefinition("-BT-"+DateTime.Now.ToString("HHmmssfff"));
+                await ReplayAsync(definition,36,panel.Status);
+            }catch(Exception ex){panel.Status.Text=ex.Message;}};
+            panel.ReplayPauseButton.Click+=(_,_)=>PauseReplay(ReplayKey(panel.CreateDefinition()),panel.Status);
+            panel.ReplayExportButton.Click+=(_,_)=>ExportBacktest(ReplayKey(panel.CreateDefinition()),panel.Status);
+        }
         tradeFlowPanel.StartButton.Click += (_,_) => tradeFlowPanel.Run(() => AddLive(tradeFlowPanel.CreateDefinition(),tradeFlowPanel.Commission.Value,tradeFlowPanel.Instance,"TF",tradeFlowPanel.Product,tradeFlowPanel.Status));
         tradeFlowPanel.PauseButton.Click += (_,_) => TogglePauseSelected(tradeFlowPanel.Instances,tradeFlowPanel.Status);
         tradeFlowPanel.CloseButton.Click += (_,_) => CloseSelected(tradeFlowPanel.Instances,tradeFlowPanel.Status);
@@ -267,7 +276,8 @@ public sealed partial class StrategyCenterForm : Form
 
     private async Task ReplayAsync(StrategyDefinition definition, decimal commission, Label status)
     {
-        if (_historicalReplays.TryGetValue(definition.StrategyType, out HistoricalReplayControl? existing))
+        string replayKey=ReplayKey(definition);
+        if (_historicalReplays.TryGetValue(replayKey, out HistoricalReplayControl? existing))
         {
             if (existing.Resume()) status.Text = "歷史回測已繼續";
             else status.Text = "歷史回測執行中";
@@ -276,14 +286,14 @@ public sealed partial class StrategyCenterForm : Form
         using var dialog = new OpenFileDialog { Filter = "行情事件|market-events.jsonl|JSON Lines|*.jsonl|所有檔案|*.*" };
         if (dialog.ShowDialog(this) != DialogResult.OK) return;
         var replayControl = new HistoricalReplayControl();
-        _historicalReplays[definition.StrategyType] = replayControl;
+        _historicalReplays[replayKey] = replayControl;
         try
         {
             _strategyTypesByInstance[definition.InstanceId] = definition.StrategyType;
             status.Text = "歷史重播執行中…";
             string output = await _service.RunBacktestAsync(dialog.FileName, definition, commission,
                 replayControl: replayControl);
-            _historicalBacktestOutputs[definition.StrategyType] = output;
+            _historicalBacktestOutputs[replayKey] = output;
             status.Text = $"回測完成：{output}";
         }
         catch (Exception ex)
@@ -293,12 +303,22 @@ public sealed partial class StrategyCenterForm : Form
         }
         finally
         {
-            if (_historicalReplays.TryGetValue(definition.StrategyType, out HistoricalReplayControl? current) &&
+            if (_historicalReplays.TryGetValue(replayKey, out HistoricalReplayControl? current) &&
                 ReferenceEquals(current, replayControl))
-                _historicalReplays.Remove(definition.StrategyType);
+                _historicalReplays.Remove(replayKey);
         }
     }
 
+    private static string ReplayKey(StrategyDefinition definition) => definition.StrategyType=="NikkeiRlDirection"
+        ? definition.StrategyType+":"+definition.Parameters.GetValueOrDefault("PolicyVariant","earlier") : definition.StrategyType;
+    private bool IsRlGrid(DataGridView grid) => RlPanels.Any(panel=>panel.Instances==grid);
+    private void ApplyRlSnapshot(StrategySnapshot snapshot)
+    {
+        var model=snapshot.Diagnostics.GetValueOrDefault("ModelId");
+        var panel=RlPanels.FirstOrDefault(p=>(p.SelectedPolicyVariant=="earlier"?"pruned-earlier-seed22":p.SelectedPolicyVariant)==model);
+        if(panel==null)return;
+        _rlInstancePanels[snapshot.InstanceId]=panel;panel.ApplySnapshot(snapshot);
+    }
     private void PauseReplay(string strategyType, Label status)
     {
         if (_historicalReplays.TryGetValue(strategyType, out HistoricalReplayControl? replay) && replay.Pause())
@@ -317,26 +337,27 @@ public sealed partial class StrategyCenterForm : Form
             return;
         }
 
-        string source = Path.Combine(outputDirectory, "executions.csv");
+        bool performanceOnly=strategyType.StartsWith("NikkeiRlDirection:",StringComparison.Ordinal);
+        string source = Path.Combine(outputDirectory, performanceOnly?"run-summary.json":"executions.csv");
         if (!File.Exists(source))
         {
-            status.Text = "找不到回測成交明細 executions.csv";
+            status.Text = performanceOnly?"找不到回測績效 run-summary.json":"找不到回測成交明細 executions.csv";
             return;
         }
 
         using var dialog = new SaveFileDialog
         {
-            Filter = "CSV 交易明細 (*.csv)|*.csv",
-            DefaultExt = "csv",
+            Filter = performanceOnly?"JSON 績效結果 (*.json)|*.json":"CSV 交易明細 (*.csv)|*.csv",
+            DefaultExt = performanceOnly?"json":"csv",
             AddExtension = true,
-            FileName = $"{Path.GetFileName(outputDirectory)}-executions.csv",
+            FileName = $"{Path.GetFileName(outputDirectory)}-"+(performanceOnly?"performance.json":"executions.csv"),
             OverwritePrompt = true
         };
         if (dialog.ShowDialog(this) != DialogResult.OK) return;
         try
         {
             File.Copy(source, dialog.FileName, overwrite: true);
-            status.Text = $"成交明細已匯出：{dialog.FileName}";
+            status.Text = $"{(performanceOnly?"績效結果":"成交明細")}已匯出：{dialog.FileName}";
         }
         catch (Exception ex)
         {
@@ -349,7 +370,7 @@ public sealed partial class StrategyCenterForm : Form
     {
         if (!TryGetSelected(grid, out string id, out DataGridViewRow row)) return;
         bool paused = Equals(row.Cells["State"].Value?.ToString(), StrategyLifecycleState.Suspended.ToString()) &&
-                      (grid==rlPanel.Instances || grid==tradeFlowPanel.Instances || grid==powerReversalPanel.Instances || row.Cells["Reason"].Value?.ToString()?.StartsWith("使用者暫停", StringComparison.Ordinal) == true);
+                      (IsRlGrid(grid) || grid==tradeFlowPanel.Instances || grid==powerReversalPanel.Instances || row.Cells["Reason"].Value?.ToString()?.StartsWith("使用者暫停", StringComparison.Ordinal) == true);
         bool changed = paused ? _service.Resume(id) : _service.Pause(id);
         status.Text = changed
             ? paused ? $"{id} 已繼續模擬" : $"{id} 已暫停；停止處理新行情"
@@ -359,22 +380,22 @@ public sealed partial class StrategyCenterForm : Form
     private void CloseSelected(DataGridView grid, Label status)
     {
         if (!TryGetSelected(grid, out string id, out _)) return;
-        status.Text = _service.Stop(id) ? grid==rlPanel.Instances || grid==tradeFlowPanel.Instances || grid==powerReversalPanel.Instances ? $"{id} 已要求收尾，部位與委託歸零後才完成關閉" : $"{id} 已關閉；紀錄保留" : $"{id} 不是可關閉的即時實例";
+        status.Text = _service.Stop(id) ? IsRlGrid(grid) || grid==tradeFlowPanel.Instances || grid==powerReversalPanel.Instances ? $"{id} 已要求收尾，部位與委託歸零後才完成關閉" : $"{id} 已關閉；紀錄保留" : $"{id} 不是可關閉的即時實例";
     }
 
     private void DeleteSelected(DataGridView grid, DataGridView executions, Label status)
     {
         if (!TryGetSelected(grid, out string id, out DataGridViewRow row)) return;
-        if ((grid==powerReversalPanel.Instances || grid==rlPanel.Instances) && !_service.Remove(id))
+        if ((grid==powerReversalPanel.Instances || IsRlGrid(grid)) && !_service.Remove(id))
         {
             status.Text=$"{id} 尚未完成收尾，請先關閉並等待部位與委託歸零";
             return;
         }
-        if (grid!=powerReversalPanel.Instances && grid!=rlPanel.Instances) _service.Remove(id);
+        if (grid!=powerReversalPanel.Instances && !IsRlGrid(grid)) _service.Remove(id);
         grid.Rows.Remove(row);
         for (int index = executions.Rows.Count - 1; index >= 0; index--)
         {
-            if (string.Equals(executions.Rows[index].Cells["Instance"].Value?.ToString(), id, StringComparison.OrdinalIgnoreCase))
+            if (string.Equals(executions.Rows[index].Cells[executions.Columns.Contains("Instance")?"Instance":"實例"].Value?.ToString(), id, StringComparison.OrdinalIgnoreCase))
                 executions.Rows.RemoveAt(index);
         }
         _strategyTypesByInstance.Remove(id);
@@ -399,7 +420,7 @@ public sealed partial class StrategyCenterForm : Form
     private void Upsert(StrategySnapshot s)
     {
         _strategyTypesByInstance[s.InstanceId] = s.StrategyType;
-        if(s.StrategyType=="NikkeiRlDirection"){rlPanel.ApplySnapshot(s);return;}
+        if(s.StrategyType=="NikkeiRlDirection"){ApplyRlSnapshot(s);return;}
         if(s.StrategyType=="TradeFlowTrend"){tradeFlowPanel.ApplySnapshot(s);return;}
         if(s.StrategyType=="PowerReversal"){powerReversalPanel.ApplySnapshot(s);return;}
         if(s.StrategyType=="MultiFactorMeanR17"){r17Panel.ApplySnapshot(s);return;}
@@ -424,7 +445,7 @@ public sealed partial class StrategyCenterForm : Form
 
     private void AddExecution(ExecutionEvent e)
     {
-        if(_strategyTypesByInstance.GetValueOrDefault(e.StrategyInstanceId)=="NikkeiRlDirection")return;
+        if(_strategyTypesByInstance.GetValueOrDefault(e.StrategyInstanceId)=="NikkeiRlDirection"){if(_rlInstancePanels.TryGetValue(e.StrategyInstanceId,out var panel))panel.AddExecution(e);return;}
         if(_strategyTypesByInstance.GetValueOrDefault(e.StrategyInstanceId)=="TradeFlowTrend"){tradeFlowPanel.AddExecution(e);return;}
         if(_strategyTypesByInstance.GetValueOrDefault(e.StrategyInstanceId)=="PowerReversal"){powerReversalPanel.AddExecution(e);return;}
         if(_strategyTypesByInstance.GetValueOrDefault(e.StrategyInstanceId)=="MultiFactorMeanR17"){r17Panel.AddExecution(e);return;}

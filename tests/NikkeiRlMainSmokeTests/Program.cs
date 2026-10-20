@@ -2,10 +2,12 @@
 using KGIOptionPricing.StrategyFramework;
 
 try {
+if(args.Contains("--independent-tabs")){IndependentGridTabsTests.Run();return;}
 if(args.Length==2&&args[0]=="--render-model-menu"){ModelMenuTests.Render(args[1]);return;}
 if(args.Contains("--model-menu")){ModelMenuTests.Run();return;}
 if(args.Contains("--grid15")){Grid15IntegrationTests.Run();return;}
 ModelMenuTests.Run();
+IndependentGridTabsTests.Run();
 Grid15IntegrationTests.Run();
 if(args.Contains("--performance-output")){SessionLiveTests.Run();return;}
 if(args.Contains("--live-latency")){LiveLatencyTests.Run();return;}
